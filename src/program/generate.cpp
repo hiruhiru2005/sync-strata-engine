@@ -17565,6 +17565,9 @@ int main(int argc, char** argv) {
         if (ps.experts_direct > 0)
             std::fprintf(stderr, "strata generate: prompt MMQ read %lld of the %lld resident experts in their slots "
                                  "(STRATA_MMQ_DIRECT)\n", (long long) ps.experts_direct, (long long) ps.experts_resident);
+        if (ps.ql_mixed_groups > 0)   // QuantLab: the per-expert K layers' class groups the prompt read with MMQ
+            std::fprintf(stderr, "strata generate: QuantLab mixed MMQ groups %lld (STRATA_QL_MMQ_MIXED)\n",
+                         (long long) ps.ql_mixed_groups);
     }
 
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches

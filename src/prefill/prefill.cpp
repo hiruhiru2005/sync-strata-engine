@@ -1381,7 +1381,8 @@ const MmqPlan& mmq_plan() {
             // when every class's formats have a tile (no Hadamard fold, no NVFP4 tail: the classes are trellis rates)
             if (lay.native && lay.layer_mixed(l)) {
                 const auto& cls = lay.cls_fmt[(size_t) l];
-                bool ok = ql_mmq_mixed() && !cls.empty() && !lay.fmt[(size_t) l].had_gu && !lay.fmt[(size_t) l].had_d;
+                // (a Hadamard fold is taken as the groups below take it: x rotated before Xq, H before its q8_1)
+                bool ok = ql_mmq_mixed() && !cls.empty();
                 size_t gu = 0, dn = 0;
                 for (const auto& c : cls) {
                     ok = ok && c.tail_off == 0 && mmq::fits(c.gu_type, 1280) && mmq::fits(c.d_type, N) &&
@@ -4250,6 +4251,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool no_peer = !core::peer_portable();
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
+                                           !mixed_mmq &&   // QuantLab: a mixed layer's class groups, not one type
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
@@ -4747,7 +4749,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             });
                         }
                         // pf_wmma: this layer's groups on the FP16 tensor-core tiles (single GPU, native pack, Q2_0 / IQ4_NL down)
-                        const bool wmma_l = use_mmq && pf_wmma() && !fused_l && on_peer.empty() && lay.native &&
+                        const bool wmma_l = use_mmq && pf_wmma() && !fused_l && on_peer.empty() && lay.native && !mixed_mmq &&
                                             (mmq_dt == 42 || mmq_dt == 20) && !lay.fmt[(size_t) l].tail_off &&
                                             strata::kernels::iq_row_bytes(mmq_gt, N) > 0;
                         if (use_mmq && mmq_plan().wmma_only[(size_t) l] && !wmma_l) {
@@ -4816,7 +4818,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             static const bool ws_dbg = std::getenv("STRATA_DBG_NAN") != nullptr;
                             const double ws_u = n > 0 ? (double) rows_local / (double) n : 0.0;
                             if (ws::mode() != 0 && m.xoff_dev != nullptr && m.ws_chunks != nullptr && n > 0 && !ws_dbg &&
-                                lay.native && m.cache != nullptr && m.host_res != nullptr && !wmma_l &&
+                                lay.native && m.cache != nullptr && m.host_res != nullptr && !wmma_l && !mixed_mmq &&
                                 !mmq_plan().direct[(size_t) l] && lay.fmt[(size_t) l].up_off == mmq_gub / 2 &&
                                 order_peer.empty() && rows_cpu == 0 && rows_local == T * K && !m.fused_bufs &&
                                 (!stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]) && !had_gu && !had_d &&
@@ -5355,8 +5357,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                                 m.mmq_ctx->run(gu, m.cs);
                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, false, m.cs);
+                                if (had_d)   // APR: a Hadamard-folded down takes H rotated, as the groups below
+                                    strata::kernels::hadamard_rows(m.H + r0 * 640, m.H + r0 * 640, nr, 640, had_block, had_sh, m.cs);
                                 pt.mark(kPfGemmD, cs);
                                 mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, fe.d_type, 640, 640, nr, m.cs, m.Hscale);
+                                ++stats_.ql_mixed_groups;
                                 mmq::Product dn;
                                 dn.w = bd; dn.type = fe.d_type; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = db;
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + (size_t) gi * (MMQ_GROUP + 1);
