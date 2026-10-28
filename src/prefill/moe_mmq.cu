@@ -21,13 +21,25 @@ namespace strata::prefill::mmq {
 namespace {
 // The Gyro trellis types (ids 144-146) are outside the type table of an upstream ggml (indexed by the id): their block
 // geometry is known here (128 weights; 34 / 26 / 30 bytes), everything else asks ggml.
-inline bool is_tq(int t) { return t >= 144 && t <= 149; }   // 144-146 TQ/TQK, 147-149 the pair trellis (Gyro-L)
+// QuantLab: the Sync-S per-expert trellis rates (the overlay's QLK types): 150 = K 5, 151 = K 4, 160 + K for K 2, 3, 9..14;
+// TQK blocks of 2 + 4K bytes
+inline int qlk_k(int t) {
+    if (t == 150) return 5;
+    if (t == 151) return 4;
+    const int k = t - 160;
+    return (k == 2 || k == 3 || (k >= 9 && k <= 14)) ? k : 0;
+}
+inline bool is_tq(int t) { return (t >= 144 && t <= 149) || qlk_k(t) > 0; }   // 144-146 TQ/TQK, 147-149 the pair trellis (Gyro-L)
 inline int64_t type_blck(int t) { return is_tq(t) ? 128 : (int64_t) ggml_blck_size((ggml_type) t); }
 inline size_t type_bytes(int t) {
+    if (qlk_k(t) > 0) return (size_t) (2 + 4 * qlk_k(t));
     return t == 144 ? 34 : t == 145 ? 26 : t == 146 ? 30 : t == 147 ? 42 : t == 148 ? 50 : t == 149 ? 58
                                                                                      : ggml_type_size((ggml_type) t);
 }
 inline const char* type_label(int t) {
+    static const char* const qlk[15] = {"", "", "qlk2", "qlk3", "qlk4", "qlk5", "", "", "", "qlk9", "qlk10", "qlk11",
+                                        "qlk12", "qlk13", "qlk14"};
+    if (qlk_k(t) > 0) return qlk[qlk_k(t)];
     return t == 144 ? "tq2_t" : t == 145 ? "tqk6" : t == 146 ? "tqk7"
          : t == 147 ? "tqp5" : t == 148 ? "tqp6" : t == 149 ? "tqp7" : ggml_type_name((ggml_type) t);
 }
@@ -331,6 +343,10 @@ bool supported(int t) {
 #ifdef STRATA_MMQ_TQP   // a ggml with the pair-trellis types (the overlay, or an agention tree that has their instances)
         case GGML_TYPE_TQP5: case GGML_TYPE_TQP6: case GGML_TYPE_TQP7:     // Gyro-L pair trellis (types 147-149)
 #endif
+#if defined(STRATA_MMQ_TQ) && defined(STRATA_GGML_QLK)   // QuantLab: the Sync-S rates (the overlay's QLK types)
+        case GGML_TYPE_QLK2: case GGML_TYPE_QLK3: case GGML_TYPE_QLK4: case GGML_TYPE_QLK5: case GGML_TYPE_QLK9:
+        case GGML_TYPE_QLK10: case GGML_TYPE_QLK11: case GGML_TYPE_QLK12: case GGML_TYPE_QLK13: case GGML_TYPE_QLK14:
+#endif
             return true;
 #ifdef STRATA_MMQ_KQUANTS
         // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
@@ -521,6 +537,18 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_TQP5: mul_mat_q_case<GGML_TYPE_TQP5>(ctx, a, s); break;
         case GGML_TYPE_TQP6: mul_mat_q_case<GGML_TYPE_TQP6>(ctx, a, s); break;
         case GGML_TYPE_TQP7: mul_mat_q_case<GGML_TYPE_TQP7>(ctx, a, s); break;
+#endif
+#if defined(STRATA_MMQ_TQ) && defined(STRATA_GGML_QLK)   // QuantLab: the Sync-S rates
+        case GGML_TYPE_QLK2: mul_mat_q_case<GGML_TYPE_QLK2>(ctx, a, s); break;
+        case GGML_TYPE_QLK3: mul_mat_q_case<GGML_TYPE_QLK3>(ctx, a, s); break;
+        case GGML_TYPE_QLK4: mul_mat_q_case<GGML_TYPE_QLK4>(ctx, a, s); break;
+        case GGML_TYPE_QLK5: mul_mat_q_case<GGML_TYPE_QLK5>(ctx, a, s); break;
+        case GGML_TYPE_QLK9: mul_mat_q_case<GGML_TYPE_QLK9>(ctx, a, s); break;
+        case GGML_TYPE_QLK10: mul_mat_q_case<GGML_TYPE_QLK10>(ctx, a, s); break;
+        case GGML_TYPE_QLK11: mul_mat_q_case<GGML_TYPE_QLK11>(ctx, a, s); break;
+        case GGML_TYPE_QLK12: mul_mat_q_case<GGML_TYPE_QLK12>(ctx, a, s); break;
+        case GGML_TYPE_QLK13: mul_mat_q_case<GGML_TYPE_QLK13>(ctx, a, s); break;
+        case GGML_TYPE_QLK14: mul_mat_q_case<GGML_TYPE_QLK14>(ctx, a, s); break;
 #endif
 #if defined(STRATA_MMQ_KQUANTS) && defined(STRATA_KQ_DSO)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q5_1: {

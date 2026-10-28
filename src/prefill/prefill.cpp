@@ -1320,7 +1320,25 @@ struct MmqPlan {
     // STRATA_MMQ_GROUP_SORT=1 (without STRATA_MMQ_RESIDENT_SORT_NE): per MMQ layer, whether both products' 16-expert
     // launches run whole tiles on every visible GPU (mmq::whole_tiles), so its full groups may be taken in row-count order
     std::vector<char> group_sort;
+    // QuantLab (STRATA_QL_MMQ_MIXED=1): per layer, a per-expert K (mixed) layer whose classes MMQ all covers - its experts
+    // go to MMQ in groups of one class (MixedGroups); classes_max is the most classes any such layer has (each class
+    // has its own group slot in grp_gu / grp_d while its group fills)
+    std::vector<char> mixed;
+    int classes_max = 1;
 };
+// QuantLab: the group buffers and the bounds table hold one 16-expert group per class of a mixed MMQ layer; each class's
+// region keeps its own MMQ_TAIL (a group's zeroed tail must not reach the next class's gathered experts)
+inline size_t grp_gu_region(const MmqPlan& mp) { return ((MMQ_GROUP * mp.gu_max + MMQ_TAIL) + 255) & ~(size_t) 255; }
+inline size_t grp_d_region(const MmqPlan& mp) { return ((MMQ_GROUP * mp.d_max + MMQ_TAIL) + 255) & ~(size_t) 255; }
+inline size_t grp_gu_bytes(const MmqPlan& mp) { return (size_t) mp.classes_max * grp_gu_region(mp); }
+inline size_t grp_d_bytes(const MmqPlan& mp) { return (size_t) mp.classes_max * grp_d_region(mp); }
+inline size_t bounds_ints(int64_t n_expert, const MmqPlan& mp) {
+    return (size_t) (2 * (n_expert + n_expert / MMQ_GROUP + 2)) + (size_t) (mp.classes_max + 1) * (MMQ_GROUP + 1);
+}
+bool ql_mmq_mixed() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_MMQ_MIXED"); return v && std::atoi(v) != 0; }();
+    return on;
+}
 // Volta (sm_70): MMQ runs on dp4a there (no int8 tensor cores).  pf_wmma(): the layers MMQ would take, and the IQ1_M
 // ones the FP16 path would, run as one launch per expert group on FP16 tensor-core tiles instead
 // (strata::kernels::gemm_iq_f16_grouped: each weight superblock dequantized once into shared memory by the FP16 path's
@@ -1356,10 +1374,31 @@ const MmqPlan& mmq_plan() {
         p.fo.assign(p.layer.size(), 0);
         p.wmma_only.assign(p.layer.size(), 0);
         p.fallback = !on || layers <= 0;
+        p.mixed.assign(p.layer.size(), 0);
         for (int64_t l = 0; on && l < layers; ++l) {
             // QuantLab v6: a per-expert K layer's MMQ group would take one type for experts of several - the FP16
-            // path, which dequantizes each expert by its own format
-            if (lay.native && lay.layer_mixed(l)) { p.fallback = true; continue; }
+            // path, which dequantizes each expert by its own format.  STRATA_QL_MMQ_MIXED=1: MMQ in groups of one class
+            // when every class's formats have a tile (no Hadamard fold, no NVFP4 tail: the classes are trellis rates)
+            if (lay.native && lay.layer_mixed(l)) {
+                const auto& cls = lay.cls_fmt[(size_t) l];
+                bool ok = ql_mmq_mixed() && !cls.empty() && !lay.fmt[(size_t) l].had_gu && !lay.fmt[(size_t) l].had_d;
+                size_t gu = 0, dn = 0;
+                for (const auto& c : cls) {
+                    ok = ok && c.tail_off == 0 && mmq::fits(c.gu_type, 1280) && mmq::fits(c.d_type, N) &&
+                         c.up_off == mmq::matrix_bytes(c.gu_type, 1280, N) / 2 &&
+                         c.bytes - c.down_off == mmq::matrix_bytes(c.d_type, N, 640);
+                    gu = std::max(gu, mmq::matrix_bytes(c.gu_type, 1280, N));
+                    dn = std::max(dn, mmq::matrix_bytes(c.d_type, N, 640));
+                }
+                if (!ok) { p.fallback = true; continue; }
+                p.layer[(size_t) l] = 1;
+                p.mixed[(size_t) l] = 1;
+                p.any = true;
+                p.gu_max = std::max(p.gu_max, gu);
+                p.d_max = std::max(p.d_max, dn);
+                p.classes_max = std::max(p.classes_max, (int) cls.size());
+                continue;
+            }
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
             if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
@@ -1390,7 +1429,7 @@ const MmqPlan& mmq_plan() {
         if (on && lay.native && mmq::direct_mode() == 1) {
             int64_t nd = 0;
             for (int64_t l = 0; l < layers; ++l) {
-                if (!p.layer[(size_t) l]) continue;
+                if (!p.layer[(size_t) l] || p.mixed[(size_t) l]) continue;   // QuantLab: a mixed layer gathers every expert
                 const auto& f = lay.fmt[(size_t) l];
                 const int gt = f.gu_type, dt = f.d_type;
                 if (!mmq::tab_fits(gt, 1280) || !mmq::tab_fits(dt, N)) continue;
@@ -1409,7 +1448,7 @@ const MmqPlan& mmq_plan() {
         if (on && detail::mmq_group_sort_requested() && !detail::mmq_resident_sort_requested()) {
             int64_t ns = 0;
             for (int64_t l = 0; l < layers; ++l) {
-                if (!p.layer[(size_t) l]) continue;
+                if (!p.layer[(size_t) l] || p.mixed[(size_t) l]) continue;   // QuantLab: a mixed layer keeps its class order
                 const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                 p.group_sort[(size_t) l] = mmq::whole_tiles(gt, 1280, MMQ_GROUP) && mmq::whole_tiles(dt, N, MMQ_GROUP);
                 ns += p.group_sort[(size_t) l];
@@ -1665,7 +1704,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     {
         // the routing tables, the MMQ group bounds; STRATA_MMQ_WS: the in-place offsets (n_expert int64) and the
         // weight-stationary layers' chunks (4 int32 each, 16-byte aligned)
-        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)) +
+        const size_t need = 3 * T * K + bounds_ints(m.g->n_expert, mmq_plan()) +   // QuantLab: + the mixed layers' groups
                             (ws::mode() != 0 ? 2 * (size_t) m.g->n_expert + 4 * ws::max_chunks((int64_t) T * K, m.g->n_expert) + 3 : 0);
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
@@ -1839,9 +1878,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
-        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
-        m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        m.bounds_dev = o.take<int32_t>(bounds_ints(m.g->n_expert, mp), ok);   // QuantLab: one group per class (mixed)
+        m.grp_gu = o.take<uint8_t>(grp_gu_bytes(mp), ok);
+        m.grp_d = o.take<uint8_t>(grp_d_bytes(mp), ok);
         if (ws::mode() != 0) {   // STRATA_MMQ_WS: the offsets and chunks (bytes_needed_impl takes the same)
             m.xoff_dev = o.take<int64_t>((size_t) m.g->n_expert, ok);
             m.ws_chunks = (ws::Chunk*) o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, m.g->n_expert), ok);
@@ -2356,9 +2395,9 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     }
     pp->src = (int32_t*) take((size_t) Rt * 4);
     pp->ident = (int32_t*) take((size_t) Rt * 4);
-    pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
-    pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
-    pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
+    pp->bounds = (int32_t*) take(bounds_ints(NE, mp) * 4);   // QuantLab: the same sizes as the primary's
+    pp->grp_gu = (uint8_t*) take(grp_gu_bytes(mp));
+    pp->grp_d = (uint8_t*) take(grp_d_bytes(mp));
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         pp->run_ctx = pp->ctx.get();
@@ -2579,9 +2618,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
-        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        o.take<int32_t>(bounds_ints(g.n_expert, mp), ok);   // QuantLab: as carve takes them
+        o.take<uint8_t>(grp_gu_bytes(mp), ok);
+        o.take<uint8_t>(grp_d_bytes(mp), ok);
         if (ws::mode() != 0) {   // carve's STRATA_MMQ_WS offsets and chunks
             o.take<int64_t>((size_t) g.n_expert, ok);
             o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, g.n_expert), ok);
@@ -4191,6 +4230,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
                     const bool had_d = lay.native && lay.fmt[(size_t) l].had_d;
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
+                    // QuantLab (STRATA_QL_MMQ_MIXED=1): a per-expert K layer through MMQ, its experts in groups of one class
+                    // (detail::MixedGroups: rows in class order, a group launched once all its experts are gathered)
+                    const bool mixed_mmq = use_mmq && lay.native && !mmq_plan().mixed.empty() && mmq_plan().mixed[(size_t) l];
+                    detail::MixedGroups mx;
                     // STRATA_EXPERT_NIBBLE=1: a layer whose gate/up experts are 4-bit codes in their slots is gathered
                     // for MMQ as the GGUF blocks rebuilt from them (core::nibble::gather_gguf); every other expert path
                     // reads GGUF blocks in the slot, so it stops there instead (never a wrong answer)
@@ -4548,7 +4591,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool sort_all = detail::mmq_resident_sort_requested();
                         const bool sort_full = !sort_all && use_mmq && mmq_plan().group_sort[(size_t) l] &&
                                                order.size() >= (size_t) MMQ_GROUP;
-                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
+                        if (mixed_mmq) {   // QuantLab: the rows in class order and the class groups (order stays in id order)
+                            const bool cpu_any = std::any_of(on_cpu.begin(), on_cpu.end(), [](auto v) { return v != 0; });
+                            const bool peer_any = std::any_of(on_peer.begin(), on_peer.end(), [](auto v) { return v != 0; });
+                            if (cpu_any || peer_any || !order_peer.empty()) {
+                                err = "prefill: STRATA_QL_MMQ_MIXED takes no CPU or peer share of a mixed layer";
+                                return false;
+                            }
+                            detail::mmq_class_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order,
+                                                   lay.ecls.data() + lay.eidx(l, 0), slot_h, src_h, MMQ_GROUP, mx);
+                        } else if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
@@ -4730,14 +4782,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
-                            const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
+                            // QuantLab: a mixed MMQ layer's rows are in class order (mx.corder) and its groups are mx's,
+                            // each group's relative bounds still at n + 1 + g * (MMQ_GROUP + 1)
+                            const size_t n = order.size(), ng = mixed_mmq ? mx.gstart.size() : (n + MMQ_GROUP - 1) / MMQ_GROUP;
                             m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
-                            for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
+                            for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) (mixed_mmq ? mx.corder[j] : order[j])];
                             m.bounds_host[n] = (int32_t) rows_local;
-                            for (size_t g = 0; g < ng; ++g)
+                            for (size_t g = 0; g < ng; ++g) {
+                                const size_t s0 = mixed_mmq ? (size_t) mx.gstart[g] : g * MMQ_GROUP;
+                                const size_t s1 = mixed_mmq ? s0 + (size_t) mx.gsize[g] : n;
                                 for (size_t i = 0; i <= MMQ_GROUP; ++i)
                                     m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
-                                        m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                                        m.bounds_host[std::min(s1, s0 + i)] - m.bounds_host[s0];
+                            }
                             if (grp_mapped) {
                                 int32_t* bh = m.grp_host + 3 * m.grp_tk;
                                 std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
@@ -4785,7 +4842,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     }
                                     // the offsets after the bounds in the mapped table, the chunks after them (16-byte
                                     // aligned); or the host copies through pinned slots
-                                    const size_t xo = 3 * m.grp_tk + 2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2);
+                                    const size_t xo = 3 * m.grp_tk + bounds_ints(m.g->n_expert, mmq_plan());   // QuantLab: as `need`
                                     ws::Chunk* ch = nullptr;
                                     if (grp_mapped) {
                                         int32_t* xh = m.grp_host + xo;
@@ -5115,13 +5172,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
                             return v == nullptr || std::atoi(v) != 0;
                         }();
-                        const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
+                        // (QuantLab: a mixed MMQ layer gathers each expert into its class's group itself, one wait each)
+                        const bool group_gather = group_env && stream_all && use_mmq && lay.native && !mixed_mmq &&
                                                   MMQ_GROUP <= mmq::kGatherGroupMax;
                         // The staged walk (a short prompt) groups too, resident and staged experts alike: its ring is
                         // then STAGE_GRP slots, two groups, and it stages no further ahead than the open group allows,
                         // so a group's staged slots stay unread-over until its flush (one wait on the last copy, one
                         // event releasing them all, as in the streamed walk).
-                        const bool group_resident = group_env && !stream_all && use_mmq && lay.native &&
+                        const bool group_resident = group_env && !stream_all && use_mmq && lay.native && !mixed_mmq &&
                                                     MMQ_GROUP <= mmq::kGatherGroupMax;
                         const bool gg_now = group_gather || group_resident;
                         const int stage_n = group_resident ? STAGE_GRP : STAGE;
@@ -5267,6 +5325,46 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 : "the MMQ group buffers are not the blob's [gate | up] and down");
 #endif
                             pt.mark(kPfDequant, cs);
+                            if (mixed_mmq) {
+                                // QuantLab: the expert into its class group's slot (its own [gate | up] and down, at its
+                                // class's sizes; the class's region of grp_gu / grp_d); the group launches once complete -
+                                // gate/up of the group's class, SwiGLU, its H to q8_1, down - as the groups below do
+                                const int32_t p = mx.pos[(size_t) e];
+                                const int32_t gi = mx.group_of[(size_t) p];
+                                const size_t q = (size_t) (p - mx.gstart[(size_t) gi]);
+                                const int c = mx.gclass[(size_t) gi];
+                                const auto& fe = lay.fmt_of(l, e);
+                                const size_t gub = mmq::matrix_bytes(fe.gu_type, 1280, N), db = mmq::matrix_bytes(fe.d_type, N, 640);
+                                uint8_t* bgu = m.grp_gu + (size_t) c * grp_gu_region(mmq_plan());
+                                uint8_t* bd = m.grp_d + (size_t) c * grp_d_region(mmq_plan());
+                                const bool last = (int32_t) q + 1 == mx.gsize[(size_t) gi];
+                                mmq::gather_native(blob_dev, blob_dev + fe.up_off, gub / 2, blob_dev + fe.down_off, db,
+                                                   bgu + q * gub, bd + q * db, m.cs, nullptr, nullptr, last ? MMQ_TAIL : 0);
+                                if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                if (++mx.gfill[(size_t) gi] < mx.gsize[(size_t) gi]) return true;
+                                const size_t j0 = (size_t) mx.gstart[(size_t) gi], n = mx.corder.size();
+                                const int ngx = mx.gsize[(size_t) gi];
+                                const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j0 + (size_t) ngx] - r0;
+                                int64_t maxr = 0;
+                                for (size_t i = j0; i < j0 + (size_t) ngx; ++i)
+                                    maxr = std::max<int64_t>(maxr, m.cnt[(size_t) mx.corder[i]]);
+                                pt.mark(kPfGemmGU, cs);
+                                mmq::Product gu;
+                                gu.w = bgu; gu.type = fe.gu_type; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = gub;
+                                gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
+                                gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                m.mmq_ctx->run(gu, m.cs);
+                                mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, false, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, fe.d_type, 640, 640, nr, m.cs, m.Hscale);
+                                mmq::Product dn;
+                                dn.w = bd; dn.type = fe.d_type; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = db;
+                                dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + (size_t) gi * (MMQ_GROUP + 1);
+                                dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
+                                dn.ld_dst = N;
+                                m.mmq_ctx->run(dn, m.cs);
+                                return true;
+                            }
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;

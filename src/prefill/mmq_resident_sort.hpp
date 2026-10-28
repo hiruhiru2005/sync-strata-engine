@@ -78,4 +78,58 @@ inline void mmq_resident_sort_rows(const int32_t* ids, int64_t routes, int32_t k
     }
 }
 
+// QuantLab (STRATA_QL_MMQ_MIXED=1): a per-expert K (mixed) layer's MMQ groups.  MMQ takes one type per launch, so the
+// routed experts are taken in (class, id) order - `corder`, the order their rows are laid out in - and cut into groups
+// of one class and at most `group` experts.  The walk still meets the experts in id order (its stream plan is in id
+// order): each one is gathered into its group's slot, and a group launches once all of its experts are in.  Within a
+// class the experts come in id order too, so a class has at most one group filling at a time (its slot region).
+struct MixedGroups {
+    std::vector<int32_t> corder;                    // the routed experts by (class, id)
+    std::vector<int32_t> pos;                       // expert -> its position in corder (-1: not routed in this chunk)
+    std::vector<int32_t> group_of;                  // corder position -> its group
+    std::vector<int32_t> gstart, gsize, gclass;     // group g: corder[gstart, gstart + gsize), all of class gclass
+    std::vector<int32_t> gfill;                     // the experts gathered into group g so far
+};
+// Preconditions as mmq_resident_sort_rows': order holds each positive-count expert once (every routed expert: no CPU
+// or peer share), off has count.size() + 1 entries, slot / src hold `routes` entries.  cls[e] is expert e's class.
+inline void mmq_class_rows(const int32_t* ids, int64_t routes, int32_t k, const std::vector<int32_t>& count,
+                           std::vector<int32_t>& off, const std::vector<int32_t>& order, const uint8_t* cls, int32_t* slot,
+                           int32_t* src, int group, MixedGroups& mg) {
+    mg.corder = order;
+    std::stable_sort(mg.corder.begin(), mg.corder.end(), [&](int32_t a, int32_t b) {
+        return cls[a] != cls[b] ? cls[a] < cls[b] : a < b;
+    });
+    std::fill(off.begin(), off.end(), 0);
+    int32_t cursor = 0;
+    for (int32_t e : mg.corder) {
+        off[(size_t) e] = cursor;
+        cursor += count[(size_t) e];
+    }
+    off.back() = cursor;
+    std::vector<int32_t> fill(off.begin(), off.end() - 1);
+    for (int64_t i = 0; i < routes; ++i) {   // token-major, rank-major: the within-expert row order is unchanged
+        const int32_t e = ids[(size_t) i];
+        const int32_t p = fill[(size_t) e]++;
+        slot[(size_t) i] = p;
+        src[(size_t) p] = (int32_t) (i / k);
+    }
+    mg.pos.assign(count.size(), -1);
+    mg.group_of.clear();
+    mg.gstart.clear();
+    mg.gsize.clear();
+    mg.gclass.clear();
+    for (size_t p = 0; p < mg.corder.size(); ++p) {
+        const int32_t e = mg.corder[p];
+        mg.pos[(size_t) e] = (int32_t) p;
+        if (mg.gstart.empty() || mg.gclass.back() != (int32_t) cls[e] || mg.gsize.back() == group) {
+            mg.gstart.push_back((int32_t) p);
+            mg.gsize.push_back(0);
+            mg.gclass.push_back((int32_t) cls[e]);
+        }
+        ++mg.gsize.back();
+        mg.group_of.push_back((int32_t) mg.gstart.size() - 1);
+    }
+    mg.gfill.assign(mg.gstart.size(), 0);
+}
+
 }  // namespace strata::prefill::detail

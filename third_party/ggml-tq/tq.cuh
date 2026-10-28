@@ -61,8 +61,38 @@ static constexpr __host__ __device__ bool ggml_cuda_type_is_tqp(ggml_type type) 
     return type == GGML_TYPE_TQP5 || type == GGML_TYPE_TQP6 || type == GGML_TYPE_TQP7;
 }
 
+// QuantLab (STRATA_GGML_QLK: the overlay's ggml.h names them): the per-expert trellis rates of Sync-S packs - the TQK
+// block (fp16 d, 32 steps of K bits, 2 + 4K bytes) at K 5 / 4 (ids 150 / 151) and 2, 3, 9..14 (ids 160 + K).  K 8, 6
+// and 7 are TQ2_T, TQK6 and TQK7 above.
+#if defined(STRATA_GGML_QLK)
+template <int K> struct block_qlk { uint16_t d; uint8_t qs[4 * K]; };
+#define STRATA_QLK_TRAITS(T, K)                                                                                             \
+    template <> struct ggml_cuda_type_traits<T> {                                                                          \
+        static constexpr int qk = QK_TQK; static constexpr int qr = QR_TQ; static constexpr int qi = QI_TQ;               \
+        static constexpr int bs = sizeof(block_qlk<K>); };
+STRATA_QLK_TRAITS(GGML_TYPE_QLK2, 2)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK3, 3)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK4, 4)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK5, 5)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK9, 9)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK10, 10)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK11, 11)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK12, 12)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK13, 13)
+STRATA_QLK_TRAITS(GGML_TYPE_QLK14, 14)
+#undef STRATA_QLK_TRAITS
+static constexpr __host__ __device__ bool ggml_cuda_type_is_qlk(ggml_type type) {
+    return type == GGML_TYPE_QLK2 || type == GGML_TYPE_QLK3 || type == GGML_TYPE_QLK4 || type == GGML_TYPE_QLK5 ||
+           type == GGML_TYPE_QLK9 || type == GGML_TYPE_QLK10 || type == GGML_TYPE_QLK11 || type == GGML_TYPE_QLK12 ||
+           type == GGML_TYPE_QLK13 || type == GGML_TYPE_QLK14;
+}
+#else
+static constexpr __host__ __device__ bool ggml_cuda_type_is_qlk(ggml_type) { return false; }
+#endif
+
 static constexpr __host__ __device__ bool ggml_cuda_type_is_tq(ggml_type type) {
-    return type == GGML_TYPE_TQ2_T || type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQK7 || ggml_cuda_type_is_tqp(type);
+    return type == GGML_TYPE_TQ2_T || type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQK7 || ggml_cuda_type_is_tqp(type) ||
+           ggml_cuda_type_is_qlk(type);
 }
 
 template <ggml_type type> struct tq_block_info;
@@ -72,6 +102,18 @@ template <> struct tq_block_info<GGML_TYPE_TQK7>  { typedef block_tqk7  block_t;
 template <> struct tq_block_info<GGML_TYPE_TQP5>  { typedef block_tqp5  block_t; static constexpr int K = 5; };
 template <> struct tq_block_info<GGML_TYPE_TQP6>  { typedef block_tqp6  block_t; static constexpr int K = 6; };
 template <> struct tq_block_info<GGML_TYPE_TQP7>  { typedef block_tqp7  block_t; static constexpr int K = 7; };
+#if defined(STRATA_GGML_QLK)
+template <> struct tq_block_info<GGML_TYPE_QLK2>  { typedef block_qlk<2>  block_t; static constexpr int K = 2; };
+template <> struct tq_block_info<GGML_TYPE_QLK3>  { typedef block_qlk<3>  block_t; static constexpr int K = 3; };
+template <> struct tq_block_info<GGML_TYPE_QLK4>  { typedef block_qlk<4>  block_t; static constexpr int K = 4; };
+template <> struct tq_block_info<GGML_TYPE_QLK5>  { typedef block_qlk<5>  block_t; static constexpr int K = 5; };
+template <> struct tq_block_info<GGML_TYPE_QLK9>  { typedef block_qlk<9>  block_t; static constexpr int K = 9; };
+template <> struct tq_block_info<GGML_TYPE_QLK10> { typedef block_qlk<10> block_t; static constexpr int K = 10; };
+template <> struct tq_block_info<GGML_TYPE_QLK11> { typedef block_qlk<11> block_t; static constexpr int K = 11; };
+template <> struct tq_block_info<GGML_TYPE_QLK12> { typedef block_qlk<12> block_t; static constexpr int K = 12; };
+template <> struct tq_block_info<GGML_TYPE_QLK13> { typedef block_qlk<13> block_t; static constexpr int K = 13; };
+template <> struct tq_block_info<GGML_TYPE_QLK14> { typedef block_qlk<14> block_t; static constexpr int K = 14; };
+#endif
 static_assert(QK_TQP == QK_TQK, "trellis block sizes differ");
 
 // States of steps 4l..4l+3 of one block. qs is the block's qs array, 2-byte aligned
@@ -94,6 +136,16 @@ static __device__ __forceinline__ void tq_states4(const uint8_t * qs, const int 
         // Steps 4l..4l+3 all lie in the four words from wb = off3 >> 4, off3 = (28 - 4l)*K.
         constexpr int K      = tq_block_info<type>::K;
         constexpr int nwords = 2*K;
+        if constexpr (K > 12) {
+            // QuantLab K 13 / 14: four steps can need r + 3K + 16 > 64 bits - each step's 16 bits from its own two
+            // words (as src/kernels/cuda/iq_kernels.cu's decode kernels read them); K <= 12 fits the window below
+#pragma unroll
+            for (int i = 0; i < TQ_STEPS_LANE; ++i) {
+                const int off = (31 - (4*l + i))*K, w0 = off >> 4, w1 = w0 + 1 >= nwords ? w0 + 1 - nwords : w0 + 1;
+                s[i] = (uint32_t) ((((uint32_t) qs16[w0]) | ((uint32_t) qs16[w1] << 16)) >> (off & 15)) & 0xFFFFu;
+            }
+            return;
+        }
         const int off3 = (28 - 4*l)*K;
         const int wb   = off3 >> 4;
         const int r    = off3 & 15;

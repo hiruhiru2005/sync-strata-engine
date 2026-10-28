@@ -82,8 +82,32 @@ function(strata_ggml_tq_overlay LLAMA OUT)
         GGML_TYPE_TQP5    = 147, // Gyro-L pair trellis (the same fork's 147-149)
         GGML_TYPE_TQP6    = 148,
         GGML_TYPE_TQP7    = 149,
+        GGML_TYPE_QLK5    = 150, // QuantLab: Sync-S per-expert trellis rates (TQK blocks; ids 150 / 151 / 160 + K)
+        GGML_TYPE_QLK4    = 151,
+        GGML_TYPE_QLK2    = 162,
+        GGML_TYPE_QLK3    = 163,
+        GGML_TYPE_QLK9    = 169,
+        GGML_TYPE_QLK10   = 170,
+        GGML_TYPE_QLK11   = 171,
+        GGML_TYPE_QLK12   = 172,
+        GGML_TYPE_QLK13   = 173,
+        GGML_TYPE_QLK14   = 174,
+#define STRATA_GGML_QLK 1
 ")
   file(WRITE "${OUT}/include/ggml.h" "${_h}")
+
+  # QuantLab: the Sync-S rates ride every list below after the pair trellis (the same tile layout, dot kernels and configs)
+  set(_qlk_types QLK2 QLK3 QLK4 QLK5 QLK9 QLK10 QLK11 QLK12 QLK13 QLK14)
+  set(_qlk_c8 "")
+  set(_qlk_c12 "")
+  set(_qlk_txs "")
+  set(_qlk_decl "")
+  foreach(_q IN LISTS _qlk_types)
+    string(APPEND _qlk_c8 "        case GGML_TYPE_${_q}:\n")
+    string(APPEND _qlk_c12 "            case GGML_TYPE_${_q}:\n")
+    string(APPEND _qlk_txs "        case GGML_TYPE_${_q}: return MMQ_DP4A_TXS_Q8_0_16;\n")
+    string(APPEND _qlk_decl "extern DECL_MMQ_CASE(GGML_TYPE_${_q});\n")
+  endforeach()
 
   # ---- mmq.cuh: routing of the trellis types as IQ2_XS ----------------------------------------------------------------
   _tq_read(_m "${_cu}/mmq.cuh")
@@ -102,15 +126,15 @@ function(strata_ggml_tq_overlay LLAMA OUT)
     set(_tq_fail "the MMQ helper signatures of this ggml-cuda are not the ones the overlay knows (ggml_cuda_mmq_get_nthreads)")
   endif()
   _tq_edit(_m AFTER "        case GGML_TYPE_IQ2_XXS:\n        case GGML_TYPE_IQ2_XS:\n"
-    "        case GGML_TYPE_TQ2_T:\n        case GGML_TYPE_TQK6:\n        case GGML_TYPE_TQK7:\n        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n")
+    "        case GGML_TYPE_TQ2_T:\n        case GGML_TYPE_TQK6:\n        case GGML_TYPE_TQK7:\n        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n${_qlk_c8}")
   _tq_edit(_m AFTER "        case GGML_TYPE_IQ2_XS:  return MMQ_DP4A_TXS_Q8_0_16;\n"
-    "        case GGML_TYPE_TQ2_T:   return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQK6:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQK7:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQP5:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQP6:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQP7:    return MMQ_DP4A_TXS_Q8_0_16;\n")
+    "        case GGML_TYPE_TQ2_T:   return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQK6:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQK7:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQP5:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQP6:    return MMQ_DP4A_TXS_Q8_0_16;\n        case GGML_TYPE_TQP7:    return MMQ_DP4A_TXS_Q8_0_16;\n${_qlk_txs}")
   _tq_edit(_m BEFORE "            case GGML_TYPE_IQ3_XXS:\n                return ggml_cuda_mmq_util_funcs(\n                    VDR_IQ3_XXS_Q8_1_MMQ,"
-    "            case GGML_TYPE_TQ2_T:\n            case GGML_TYPE_TQK6:\n            case GGML_TYPE_TQK7:\n            case GGML_TYPE_TQP5:\n            case GGML_TYPE_TQP6:\n            case GGML_TYPE_TQP7:\n                return ggml_cuda_mmq_util_funcs(\n                    VDR_IQ2_XS_Q8_1_MMQ,\n                    ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,\n                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback${_ps}>);\n")
+    "            case GGML_TYPE_TQ2_T:\n            case GGML_TYPE_TQK6:\n            case GGML_TYPE_TQK7:\n            case GGML_TYPE_TQP5:\n            case GGML_TYPE_TQP6:\n            case GGML_TYPE_TQP7:\n${_qlk_c12}                return ggml_cuda_mmq_util_funcs(\n                    VDR_IQ2_XS_Q8_1_MMQ,\n                    ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,\n                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback${_ps}>);\n")
   _tq_edit(_m BEFORE "        case GGML_TYPE_IQ3_XXS:\n            return ggml_cuda_mmq_util_funcs(\n                -1,\n                ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback>,"
-    "        case GGML_TYPE_TQ2_T:\n        case GGML_TYPE_TQK6:\n        case GGML_TYPE_TQK7:\n        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n            return ggml_cuda_mmq_util_funcs(\n                -1,\n                ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback${_ps}>,\n                ggml_cuda_mmq_write_back_mma<type, J, fallback${_ps}>);\n")
+    "        case GGML_TYPE_TQ2_T:\n        case GGML_TYPE_TQK6:\n        case GGML_TYPE_TQK7:\n        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n${_qlk_c8}            return ggml_cuda_mmq_util_funcs(\n                -1,\n                ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback${_ps}>,\n                ggml_cuda_mmq_write_back_mma<type, J, fallback${_ps}>);\n")
   _tq_edit(_m AFTER "extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);\n"
-    "extern DECL_MMQ_CASE(GGML_TYPE_TQ2_T);\nextern DECL_MMQ_CASE(GGML_TYPE_TQK6);\nextern DECL_MMQ_CASE(GGML_TYPE_TQK7);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP5);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP6);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP7);\n")
+    "extern DECL_MMQ_CASE(GGML_TYPE_TQ2_T);\nextern DECL_MMQ_CASE(GGML_TYPE_TQK6);\nextern DECL_MMQ_CASE(GGML_TYPE_TQK7);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP5);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP6);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP7);\n${_qlk_decl}")
   file(WRITE "${OUT}/mmq.cuh" "${_m}")
 
   # ---- mmq-load-tiles.cuh: the loader, at the end -------------------------------------------------------------------
@@ -134,7 +158,7 @@ function(strata_ggml_tq_overlay LLAMA OUT)
     list(REMOVE_DUPLICATES _lines)
     foreach(_ln IN LISTS _lines)
       set(_add "")
-      foreach(_ty TQ2_T TQK6 TQK7 TQP5 TQP6 TQP7)
+      foreach(_ty TQ2_T TQK6 TQK7 TQP5 TQP6 TQP7 ${_qlk_types})
         string(REPLACE "GGML_TYPE_IQ2_XS," "GGML_TYPE_${_ty}," _x "${_ln}")
         string(APPEND _add "${_x}")
       endforeach()
@@ -145,7 +169,7 @@ function(strata_ggml_tq_overlay LLAMA OUT)
   endforeach()
 
   # ---- template instances -------------------------------------------------------------------------------------------
-  foreach(_ty tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
+  foreach(_ty tq2_t tqk6 tqk7 tqp5 tqp6 tqp7 qlk2 qlk3 qlk4 qlk5 qlk9 qlk10 qlk11 qlk12 qlk13 qlk14)
     string(TOUPPER "${_ty}" _TY)
     file(WRITE "${OUT}/template-instances/mmq-instance-${_ty}.cu"
          "// Strata trellis overlay (cmake/strata_ggml_tq_overlay.cmake)\n\n#include \"../mmq.cuh\"\n\nDECL_MMQ_CASE(GGML_TYPE_${_TY});\n")
