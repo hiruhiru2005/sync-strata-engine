@@ -1687,7 +1687,7 @@ void FileExpertSource::close() {
 bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint8_t* b = blob(layer, expert);
     if (b == nullptr || dst == nullptr) return false;
-    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().expert_bytes(layer, expert));   // QuantLab: own size
     return true;
 }
 
@@ -3393,7 +3393,9 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
+    // QuantLab: the expert's own size (a packed RAM copy holds no more; the layer's largest read past it, and past the
+    // copy's end for its last expert)
+    const uint64_t bytes = blob_len(layer, expert);
     if (complement_ready_) {
         const uint8_t* held =
             resident_blob(index);
@@ -3430,7 +3432,7 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
             continue;
         }
         fills.push_back({0, l, e, dst[i]});
-        bytes += layer_blob_bytes_[(size_t) l];
+        bytes += blob_len(l, e);   // QuantLab: own size
     }
     if (fills.empty()) return true;
     const auto t0 = std::chrono::steady_clock::now();
@@ -3543,13 +3545,17 @@ bool FileExpertSource::pin_cache_complement(
     std::vector<uint64_t> slot_bytes((size_t) std::max<int64_t>(n_slots, 0), 0);
     primary_gpu_pairs.reserve((size_t) cache.resident());
     pair_slot.reserve((size_t) cache.resident());
+    // QuantLab: the lend region's keep counts what each kept expert takes in the RAM copy - its own size when the copy
+    // is packed (fes_pack), the layer's largest otherwise (each place then strides the largest)
+    const bool own_sized = fes_pack(n_layers_);
     for (int64_t layer = 0; layer < n_layers_; ++layer) {
         for (int64_t expert = 0; expert < n_expert_; ++expert) {
             const int32_t slot = cache.slot_of(layer, expert);
             if (slot == kNotResident) continue;
             primary_gpu_pairs.emplace_back((int32_t) layer, (int32_t) expert);
             pair_slot.push_back(slot);
-            if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
+            if (slot >= 0 && slot < n_slots)
+                slot_bytes[(size_t) slot] = own_sized ? blob_len(layer, expert) : layer_blob_bytes_[(size_t) layer];
         }
     }
     // QuantLab (10/27): the packed RAM copy (fes_pack) takes each expert at its own size

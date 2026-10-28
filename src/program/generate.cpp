@@ -6678,7 +6678,7 @@ int main(int argc, char** argv) {
             uint64_t cand_b = 0, pin_b = 0;
             for (size_t ci = 0; ci < pin_nonres; ++ci) {
                 const auto& pr = pin_cand[ci];
-                const uint64_t b = pl.blob_bytes(pr.first);
+                const uint64_t b = pl.expert_bytes(pr.first, pr.second);   // QuantLab: own size
                 cand_b += b;
                 if (arena_src.pinned(pr.first, pr.second)) pin_b += b;
             }
@@ -7265,7 +7265,8 @@ int main(int argc, char** argv) {
                              (long long) i, err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            fill_bytes += strata::kernels::cpu::expert_layout().expert_bytes(profile[(size_t) i].first,
+                                                                              profile[(size_t) i].second);   // QuantLab: own size
             ++prefilled;
         }
         if (nib_x.active() && !nib_x.finish(err)) {
@@ -7312,7 +7313,7 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (const int32_t s = xcache.slot_of(l, e); s >= 0)
-                        sl.emplace_back(s, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+                        sl.emplace_back(s, (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(l, e));   // QuantLab: own size
             std::sort(sl.begin(), sl.end());
             std::vector<uint64_t> sh(sl.size(), 0);
             std::atomic<size_t> next_slot{0};
@@ -8396,7 +8397,7 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
-                const uint64_t b = lay.blob_bytes(l);
+                const uint64_t b = lay.expert_bytes(l, e);   // QuantLab: own size
                 total += b;
                 if (srcp->pinned(l, e)) pinned += b;
             }
@@ -8646,7 +8647,7 @@ int main(int argc, char** argv) {
             return chunk;
         const auto& lay = strata::kernels::cpu::expert_layout();
         uint64_t total = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l) total += (uint64_t) lay.blob_bytes(l) * (uint64_t) g.n_expert;
+        for (int64_t l = 0; l < g.n_layers; ++l) total += lay.layer_bytes(l);   // QuantLab: a mixed layer's own sizes
         if (total == 0 || gpu_cache_bytes >= total) return chunk;   // the GPU holds every expert: no file tier
         const auto hm = strata::core::sample_host_memory();
         if (!hm) return chunk;
@@ -8805,9 +8806,10 @@ int main(int argc, char** argv) {
                     vi = cold.back().second;
                     const int32_t vs = host_res[(size_t) vi];
                     nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
-                    if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
+                    const uint64_t own = lay.expert_bytes(layer, oi % g.n_expert);   // QuantLab: the moved expert's own size
+                    if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < own ||
                         cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
-                                   (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToDevice) != cudaSuccess)
+                                   (size_t) own, cudaMemcpyDeviceToDevice) != cudaSuccess)
                         vi = -1;
                     else {
                         cold.pop_back();
@@ -8910,11 +8912,11 @@ int main(int argc, char** argv) {
             for (; pi < profile.size(); ++pi) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
-                if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                if (host_res[i] >= 0 || lay.expert_bytes(l, e) > room) continue;   // QuantLab: own size
                 const uint8_t* b = srcp->blob_stable(l, e);
                 if (b == nullptr) continue;
                 nib::guard_raw(l, "the elastic K/V's refill (kvg_trim)");
-                cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
+                cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.expert_bytes(l, e), cudaMemcpyHostToDevice,
                                 nullptr);
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
@@ -9247,7 +9249,7 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (xcache.slot_of(l, e) < 0 && src.resident_blob(l, e) == nullptr && !src.transient(l, e))
-                        sm.inplace_bytes += (uint64_t) lay.blob_bytes(l);
+                        sm.inplace_bytes += (uint64_t) lay.expert_bytes(l, e);   // QuantLab: own size
         }
         const auto v = strata::prefill::share_rules::default_share_memory_verdict(sm);
         if (v.arm) return true;
@@ -11096,7 +11098,7 @@ int main(int argc, char** argv) {
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
-            for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
+            for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.layer_bytes(l) / (double) g.n_expert;   // QuantLab: the mean own size
             pcie_auto.on = true;
             pcie_auto.link_gbps = o.pcie_probe_gbps;
             pcie_auto.blob_bytes = g.n_layers > 0 ? sum / (double) g.n_layers : 0.0;
