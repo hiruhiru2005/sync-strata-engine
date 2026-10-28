@@ -826,6 +826,13 @@ public:
     /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer
     /// a demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
     bool replace_resident_staged(int64_t layer, int64_t in, int64_t out);
+    /// QuantLab (10/29), the elastic K/V beside the resident RAM mode (STRATA_QL_KV_GROW_RESIDENT=1): `in`, an expert the GPU
+    /// cache gives up to the K/V (its blob read back from its slot: `src_bytes` bytes at `src`), takes the place of `out`,
+    /// an expert of the same layer that only this copy holds (of the same own size when the copy is packed by size), which
+    /// is then read from the file.  The copy does not grow; pinned() and device_alias() follow the place.  Nothing may read
+    /// either expert meanwhile and no exchange may be staged (the caller's device and tiers are quiet).  False, and nothing
+    /// changed, when that does not hold.
+    bool ql_take_into_ram(int64_t layer, int64_t in, int64_t out, const uint8_t* src, uint64_t src_bytes);
     int64_t ram_adapts() const { return ram_adapts_; }
     int64_t ram_staged() const { return ram_staged_; }   ///< of ram_adapts(): copied out of a stage buffer
     // ---- 149-prefetch (STRATA_RAM_ADAPT2): the same promotion, staged.  `ram_stage` queues the read of `in` on an I/O thread

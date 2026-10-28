@@ -4546,6 +4546,36 @@ bool FileExpertSource::install_resident(int64_t layer, int64_t in, int64_t out, 
     return true;
 }
 
+// QuantLab (10/29), STRATA_QL_KV_GROW_RESIDENT: install_resident's move for an expert the GPU cache gave to the elastic K/V.
+// Unlike install_resident it also runs on a copy packed by own size (fes_pack), where `in` and `out` must then be one size;
+// every check is made before the place is written, so a refusal leaves the copy as it was.
+bool FileExpertSource::ql_take_into_ram(int64_t layer, int64_t in, int64_t out, const uint8_t* src, uint64_t src_bytes) {
+    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
+        layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out || src == nullptr)
+        return false;
+    const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
+    const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
+    if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
+    if (!soft_in_.empty() && (soft_in_[i_in] != SIZE_MAX || soft_in_[i_out] != SIZE_MAX)) return false;
+    // the place of `out`: its own size when the copy is packed by size, else the layer's largest blob
+    const bool packed = fes_pack(n_layers_);
+    const uint64_t bytes = blob_len(layer, in);
+    const uint64_t room = packed ? blob_len(layer, out) : layer_blob_bytes_[(size_t) layer];
+    if ((packed && bytes != room) || bytes > room || bytes > src_bytes) return false;
+    const uint64_t at = complement_offsets_[i_out];
+    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
+        room > complement_bytes_ - at)
+        return false;
+    // #2134: a Foresight slot may be copying out of `out`'s place; it is dropped (never served) before the place is rewritten
+    ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
+    if (fs != nullptr) fs->hold(layer, (int32_t) out);
+    std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) bytes);
+    const bool moved = detail::exchange_cache_complement(complement_offsets_, i_out, i_in);   // (checked above: true)
+    if (fs != nullptr) fs->unhold(layer, (int32_t) out);
+    return moved;
+}
+
 // ---- 149-prefetch: staged promotions.  The read of `in` runs on this source's own thread (one at a time: the drive's
 // queue stays the decode's first); the install is the decode thread's (ram_install, at a window boundary).
 bool FileExpertSource::ram_stage(int64_t layer, int64_t in, int64_t out) {
