@@ -251,7 +251,9 @@ std::string session_free_space_dir(const std::string& path, bool windows_rules);
 // ---- QuantLab (10/29): streamed session files (STRATA_QL_SESSION_STREAM=1, opt-in) ------------------------------
 // A save or a restore that moves the state between the device and the file in 16 MiB blocks with bounded RAM: no
 // whole copy of the K/V, of the live GDN rows or of a checkpoint is made in RAM.  Format v1 is unchanged - a streamed
-// save writes the bytes session_file_write writes for the same state, and either reader reads either file.
+// save writes the bytes session_file_write writes for the same state, and either reader reads either file.  (The
+// engine's identity is another matter: with the switch on, its config fingerprint also takes the QuantLab switches
+// and the pack's files, so an engine with it on refuses files saved with it off, and the reverse.)
 
 // STRATA_QL_SESSION_STREAM=1 (read once).
 bool session_stream_requested();
@@ -339,8 +341,8 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-// What pass 1 asks `limits.admit` for: the 16 MiB block, 1 MiB for the small vectors and the token lists the limits
-// allow (the live state's and each checkpoint's), at most the file.
+// What pass 1 asks `limits.admit` for: the 16 MiB block, 1 MiB for the small vectors and the token and picture lists
+// the limits allow (the live state's and each checkpoint's, 4 + 16 bytes a token), at most the file.
 uint64_t session_stream_read_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);
 // What pass 2 adds: the block again (pass 1's is gone), the live state's small arrays and every checkpoint's running
 // state but the first `reused` ones' (their storage is the dropped chain's).

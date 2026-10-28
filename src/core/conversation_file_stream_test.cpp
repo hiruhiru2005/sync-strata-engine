@@ -311,7 +311,8 @@ int main() {
         Streamed s;
         check(!stream_read(good, id, s, error, l, {}, &st) && st.error == SessionError::memory, "admit: a refusal is 'memory'");
         check(asked == session_stream_read_peak_bytes(image.size(), l) &&
-              asked == (16u << 20) + (1u << 20) + 3u * 1000u * 4u, "admit: asked for the block, 1 MiB and three token lists");
+              asked == (16u << 20) + (1u << 20) + 3u * 1000u * 20u,
+              "admit: asked for the block, 1 MiB and three token and picture lists (4 + 16 bytes a token)");
         check(session_stream_read_peak_bytes(image.size(), SessionReadLimits{}) == (16u << 20) + (1u << 20) + image.size(),
               "admit: open limits ask for the file at most");
         bool admitted = false;

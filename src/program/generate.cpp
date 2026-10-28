@@ -13847,9 +13847,12 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         const double check_ms = ms();
+                        // every answer below closes the file first: a client may replace or delete it on the answer, and
+                        // the handle (Windows: reads shared only) would refuse that
                         // the whole layout against this engine, still without any device write
                         blocking("validate", bytes);
                         if (!strata::core::conversation_stream_validate(layout, ss, g, mtp.kv_state(), err)) {
+                            file.close();
                             refuse(err);
                             continue;
                         }
@@ -13859,12 +13862,14 @@ int main(int argc, char** argv) {
                             need2 = strata::core::session_stream_restore_peak_bytes(layout, reusable);
                             std::string why;
                             if (!admit_text(need2, why)) {
+                                file.close();
                                 refuse("session file: " + why, strata::core::SessionError::memory);
                                 continue;
                             }
                         }
                         // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                         if (!kvg_ensure((int64_t) layout.live.ids.size() + 256, adapt_quiesce)) {
+                            file.close();
                             refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                             continue;
                         }
@@ -13874,7 +13879,8 @@ int main(int argc, char** argv) {
                         live_ok = false;
                         std::vector<ConvCheckpoint> storage = std::move(checks);
                         checks.clear();
-                        if (storage.empty() && ckpt_pool.on()) {   // (STRATA_CKPT_POOL: a dropped checkpoint's vectors)
+                        // (STRATA_CKPT_POOL: a dropped checkpoint's vectors, when the file keeps a checkpoint the chain cannot hold)
+                        if (storage.empty() && !layout.checkpoints.empty() && ckpt_pool.on()) {
                             ConvCheckpoint spare = ckpt_pool.take();
                             if (!spare.gdn.empty()) storage.push_back(std::move(spare));
                         }
@@ -13884,12 +13890,17 @@ int main(int argc, char** argv) {
                         try {
                             strata::core::conversation_stream_storage(layout, storage, live_state, restored);
                         } catch (const std::bad_alloc&) {
-                            // nothing reached the device: the live session stays, with what is left of its chain
+                            // nothing reached the device: the live session stays with what is left of its chain (a pool
+                            // spare taken above holds no checkpoint - no tokens - and goes)
+                            storage.erase(std::remove_if(storage.begin(), storage.end(),
+                                                         [](const ConvCheckpoint& c) { return c.ids.empty(); }),
+                                          storage.end());
                             checks = std::move(storage);
                             if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
                                     return int64_t(c.ids.size()) == tail_ckpt_len;
                                 })) tail_ckpt_len = -1;
                             live_ok = was_ok;
+                            file.close();
                             refuse("not enough RAM to read the session", strata::core::SessionError::memory);
                             continue;
                         }
@@ -13897,11 +13908,21 @@ int main(int argc, char** argv) {
                         storage.shrink_to_fit();
                         blocking("transfer", bytes);
                         const double t2 = ms();
-                        if (strata::core::conversation_stream_restore(file, layout, ss, g, mtp.kv_state(), live_state,
-                                                                      restored, err) !=
-                            strata::core::ConversationRestore::restored) {
+                        const strata::core::ConversationRestore result = strata::core::conversation_stream_restore(
+                            file, layout, ss, g, mtp.kv_state(), live_state, restored, err);
+                        if (result == strata::core::ConversationRestore::invalid) {
+                            // refused before any device write (the layout was checked above, so an engine-side mismatch):
+                            // the live session stays as it was, without its chain (that storage was taken)
+                            file.close();
+                            tail_ckpt_len = -1;
+                            live_ok = was_ok;
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        if (result != strata::core::ConversationRestore::restored) {
                             // the device state may be partial: never decode from it.  The session is dropped instead of
                             // the engine (the next request reads its prompt from token 0: session_zero)
+                            file.close();
                             live.clear();
                             live_imgs.clear();
                             checks.clear();

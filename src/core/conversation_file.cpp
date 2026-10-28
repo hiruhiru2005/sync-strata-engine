@@ -275,6 +275,7 @@ public:
     // unbuffered).  ReOpenFile gives a handle on the same file without a new name lookup, at offset 0; the handle stays
     // buffered where the volume's sectors do not fit the 4 KiB-aligned blocks or the reopen is refused.
     bool go_direct() {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
         if (h_ == INVALID_HANDLE_VALUE || direct_ || !sectors_fit(h_)) return direct_;
         const HANDLE d = ReOpenFile(h_, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN);
         if (d == INVALID_HANDLE_VALUE) return false;
@@ -282,9 +283,13 @@ public:
         h_ = d;
         direct_ = true;
         return true;
+#else
+        return direct_;   // (sectors_fit: never unbuffered for an older Windows target)
+#endif
     }
     // QuantLab (10/29): back to buffered reads at the same offset (an unbuffered read the volume refused)
     bool leave_direct() {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
         LARGE_INTEGER zero{}, at{};
         if (!SetFilePointerEx(h_, zero, &at, FILE_CURRENT)) return false;
         const HANDLE b = ReOpenFile(h_, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_SEQUENTIAL_SCAN);
@@ -294,6 +299,9 @@ public:
         h_ = b;
         direct_ = false;
         return true;
+#else
+        return false;
+#endif
     }
     // QuantLab (10/29): back to the file's start (the streamed restore's second pass)
     bool rewind() {
@@ -314,6 +322,7 @@ public:
         return true;
     }
     bool truncate(uint64_t n) {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
         if (direct_) {
             // QuantLab (10/29): an unbuffered handle cannot move its file pointer to an unaligned offset
             // (ERROR_INVALID_PARAMETER), so the padded last block is cut back by the end-of-file information instead
@@ -323,6 +332,7 @@ public:
             { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
             return false;
         }
+#endif
         LARGE_INTEGER at{};
         at.QuadPart = (LONGLONG) n;
         if (SetFilePointerEx(h_, at, nullptr, FILE_BEGIN) && SetEndOfFile(h_)) return true;
@@ -1543,8 +1553,10 @@ bool session_stream_requested() {
 }
 
 uint64_t session_stream_read_peak_bytes(uint64_t file_bytes, const SessionReadLimits& l) {
-    // the token lists the limits allow: the live state's and each checkpoint's, 4 bytes a token, at most the file
-    const uint64_t lists = sat_mul(sat_add(l.max_checkpoints, 1), sat_mul(l.max_tokens, sizeof(int32_t)));
+    // the token and picture lists the limits allow (the live state's and each checkpoint's; max_tokens bounds both, 4 +
+    // 16 bytes each, as session_read_max_file_bytes counts them), at most the file
+    const uint64_t per_token = sizeof(int32_t) + sizeof(ConversationImageKey);
+    const uint64_t lists = sat_mul(sat_add(l.max_checkpoints, 1), sat_mul(l.max_tokens, per_token));
     return sat_add(sat_add(kBlock, uint64_t(1) << 20), std::min(lists, file_bytes));
 }
 
