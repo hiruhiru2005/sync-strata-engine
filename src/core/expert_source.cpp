@@ -4005,6 +4005,7 @@ bool FileExpertSource::pin_cache_complement(
 #endif
                 } else if (budget_bytes > 0 && partial_on) {
                     const uint64_t step = 2ull << 30;
+                    uint64_t ql_fail_above = 0;   // QuantLab (STRATA_QL_PIN_BISECT): the size refused just before the success
                     for (uint64_t want = std::min(bytes, pin_cap); want >= step; want = want > step ? want - step : 0) {
                         // cut at an expert boundary: a blob that started inside the registered range and ran past it
                         // would be taken as page-locked by a cudaMemcpyAsync and refused ("adaptive refill failed")
@@ -4028,7 +4029,68 @@ bool FileExpertSource::pin_cache_complement(
                             break;
                         }
                         (void) cudaGetLastError();
+                        ql_fail_above = w;
                         if (want <= step) break;
+                    }
+                    // QuantLab (10/29, STRATA_QL_PIN_BISECT=1): bisect between the registered prefix and the size refused just
+                    // before it (256 MiB, at most 6 tries; each try registers the whole prefix again).  If the driver now refuses
+                    // the size it took a moment ago, step down 512 MiB at a time.
+                    static const bool ql_bisect = [] {
+                        const char* v = std::getenv("STRATA_QL_PIN_BISECT");
+                        return v != nullptr && std::atoi(v) != 0;
+                    }();
+                    if (ql_bisect && partial_pin > 0 && ql_fail_above > partial_pin) {
+                        auto cut_at = [&](uint64_t want) -> uint64_t {   // the expert boundary at or below `want`
+                            for (size_t i = 0; i < offsets.size(); ++i) {
+                                if (offsets[i] == kNoComplement) continue;
+                                const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
+                                if (offsets[i] < want && offsets[i] + b > want) return offsets[i];
+                            }
+                            return want;
+                        };
+                        auto reg = [&](uint64_t w) -> bool {
+                            if (cudaHostRegister(arena, (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                return false;
+                            }
+                            void* alias = nullptr;
+                            if (cudaHostGetDevicePointer(&alias, arena, 0) != cudaSuccess || alias == nullptr) {
+                                (void) cudaGetLastError();
+                                (void) cudaHostUnregister(arena);
+                                return false;
+                            }
+                            device = (const uint8_t*) alias;
+                            return true;
+                        };
+                        const auto tb0 = std::chrono::steady_clock::now();
+                        const uint64_t lo0 = partial_pin, hi0 = ql_fail_above;
+                        uint64_t lo = partial_pin, hi = ql_fail_above;
+                        int tries = 0;
+                        const char* how = "converged";
+                        while (hi - lo > (256ull << 20) && tries < 6) {
+                            const uint64_t mid = cut_at(lo + (hi - lo) / 2);
+                            if (mid <= lo) break;
+                            ++tries;
+                            (void) cudaHostUnregister(arena);
+                            if (reg(mid)) { lo = mid; continue; }
+                            hi = mid;
+                            if (!reg(lo)) {
+                                how = "the size taken before was refused; stepped down";
+                                uint64_t w = lo;
+                                lo = 0;
+                                while (w > (512ull << 20)) {
+                                    w = cut_at(w - (512ull << 20));
+                                    if (reg(w)) { lo = w; break; }
+                                }
+                                break;
+                            }
+                        }
+                        partial_pin = lo;
+                        if (lo == 0) device = nullptr;
+                        std::fprintf(stderr, "FileExpertSource: QuantLab: pin bisect %.2f -> %.2f GiB (refused at %.2f; %d tries, "
+                                             "%.1f s, %s; STRATA_QL_PIN_BISECT=1)\n",
+                                     (double) lo0 / 1073741824.0, (double) lo / 1073741824.0, (double) hi0 / 1073741824.0, tries,
+                                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tb0).count(), how);
                     }
                     char msg[160];
                     std::snprintf(msg, sizeof msg, "%.2f GiB of it registered for the GPU (the hottest)",
