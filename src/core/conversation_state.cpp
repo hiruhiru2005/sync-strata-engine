@@ -770,4 +770,257 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
         return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
+
+// ---- QuantLab (10/29): streamed session files (STRATA_QL_SESSION_STREAM=1; conversation_file.hpp) -------------------
+namespace {
+#if defined(STRATA_GPU_METAL)
+constexpr const char* kStreamMetal = "streamed session files need the CUDA / HIP running state (not the Metal decode window)";
+#endif
+
+// one of a checkpoint's five running-state arrays, in the file's order (gdn, ple, tails, dead, block_pos)
+std::vector<uint8_t>& state_array(ConversationCheckpoint& c, size_t part) {
+    switch (part) {
+        case 0: return c.gdn;
+        case 1: return c.ple;
+        case 2: return c.tails;
+        case 3: return c.dead;
+        default: return c.block_pos;
+    }
+}
+
+// view_validate's test of one checkpoint against the live tokens and pictures
+bool checkpoint_on_view(const ConversationCheckpoint& c, const ConversationView& view, const SessionState& ss,
+                        const ModelGeometry& g, std::string& error) {
+    if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > view.ids.size() ||
+        !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
+        return fail(error, "checkpoint is not a live token prefix");
+    if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
+    size_t image = 0;
+    for (const auto& key : view.images) {
+        if ((uint64_t) key.start >= c.ids.size()) break;
+        if (image >= c.imgs.size() || !(c.imgs[image++] == key)) return fail(error, "checkpoint image identity differs");
+    }
+    if (image != c.imgs.size()) return fail(error, "checkpoint image prefix differs");
+    return true;
+}
+
+// conversation_checkpoint_validate on a checkpoint the file's first pass located (its arrays' sizes)
+bool stream_state_validate(const SessionFileCheckpoint& c, const SessionState& ss, const ModelGeometry& g,
+                           std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    if (c.state[0].bytes != z.gdn || c.state[1].bytes != (ss.ple_hist ? z.ple : 0) ||
+        c.state[2].bytes != layers * z.tail || c.state[3].bytes != layers * z.dead ||
+        c.state[4].bytes != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
+        return fail(error, "invalid checkpoint running-state payload");
+    return true;
+}
+
+// checkpoint_save's small arrays - the PLE history and each owned QSA layer's indexer tail, dead row and block
+// position - without the GDN rows (the streamed save reads those from the device straight into the file's block)
+bool save_small(ConversationCheckpoint& c, const SessionState& ss, const ConversationStateSizes& z,
+                std::string& error) {
+    const size_t layers = owned_qsa(ss);
+    c.ple.resize(ss.ple_hist ? z.ple : 0);
+    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    if (!copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    for (size_t j = 0; j < layers; ++j) {
+        const auto& st = owned(ss, j);
+        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+    }
+    return true;
+}
+
+// conversation_checkpoint_restore without the GDN rows (the streamed restore wrote them as the file went by)
+bool restore_small(const ConversationCheckpoint& c, SessionState& ss, const ModelGeometry& g, std::string& error) {
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
+    if (!sync(error)) return false;   // the residency refreshes queued on the legacy stream land first
+    if (!copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    for (size_t j = 0; j < owned_qsa(ss); ++j) {
+        const auto& st = owned(ss, j);
+        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
+            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
+            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!c.ids.empty()) {
+            const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+        }
+    }
+    const size_t tokens = c.ids.size();
+    ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
+    ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
+    return sync(error);
+}
+}  // namespace
+
+bool conversation_snapshot_stream_sources(SavedConversation& meta, SessionKvSource& live_gdn,
+                                          std::vector<SessionKvSource>& sources, const ConversationView& view,
+                                          const ConversationCheckpoint* checkpoint, const SessionState& ss,
+                                          const ModelGeometry& g, const QsaState& draft, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    return fail(error, kStreamMetal);
+#endif
+    if (!view.checkpoints.empty()) return fail(error, "a streamed save takes its checkpoint apart from the view");
+    if (!view_validate(view, ss, g, error)) return false;
+    if (checkpoint != nullptr) {
+        conversation_checkpoint_join(checkpoint->gdn.data());   // (STRATA_CKPT_ASYNC: its GDN bytes have landed)
+        if (!checkpoint_on_view(*checkpoint, view, ss, g, error)) return false;
+    }
+    if (!sync(error)) return false;
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+    captured.live.ids = view.ids; captured.live.imgs = view.images;
+    captured.cvec = view.cvec;
+    if (!save_small(captured.live, ss, z, error)) return false;
+    // the live GDN rows: from the device into the file's block, piece by piece (no host copy of them)
+    SessionKvSource gdn;
+    gdn.sizes = {z.gdn, 0, 0, 0, 0};
+    const uint8_t* rows = reinterpret_cast<const uint8_t*>(ss.gdn_state);
+    const size_t rows_bytes = z.gdn;
+    auto why = std::make_shared<std::string>();
+    gdn.read = [rows, rows_bytes, why](size_t part, size_t offset, void* dst, size_t n) {
+        if (part != 0 || offset > rows_bytes || n > rows_bytes - offset) { *why = "live GDN rows read out of range"; return false; }
+        return copy(dst, rows + offset, n, *why);
+    };
+    gdn.error = [why] { return *why; };
+    const int64_t upto = (int64_t) view.ids.size();
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSource> out(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    meta = std::move(captured);
+    live_gdn = std::move(gdn);
+    sources = std::move(out);
+    return true;
+}
+
+bool conversation_stream_validate(const SessionFileLayout& f, const SessionState& ss, const ModelGeometry& g,
+                                  const QsaState& draft, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    return fail(error, kStreamMetal);
+#endif
+    if (f.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    // an image holds exactly one carve's running state and K/V: same layer range or nothing
+    if (f.layer_lo != ss.layer_lo || f.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    // view_validate on the live tokens and pictures, then each checkpoint against them
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, f.live.ids.size(), z, error)) return false;
+    if (f.live.ids.empty() || !image_keys(f.live.imgs, f.live.ids.size()) ||
+        std::any_of(f.live.ids.begin(), f.live.ids.end(), [](int32_t id) { return id < 0; }))
+        return fail(error, "invalid live token/image metadata");
+    for (const auto& c : f.checkpoints) {
+        if (c.ids.empty() || c.ids.size() > f.live.ids.size() ||
+            !std::equal(c.ids.begin(), c.ids.end(), f.live.ids.begin()))
+            return fail(error, "checkpoint is not a live token prefix");
+        if (!stream_state_validate(c, ss, g, error)) return false;
+        size_t image = 0;
+        for (const auto& key : f.live.imgs) {
+            if ((uint64_t) key.start >= c.ids.size()) break;
+            if (image >= c.imgs.size() || !(c.imgs[image++] == key)) return fail(error, "checkpoint image identity differs");
+        }
+        if (image != c.imgs.size()) return fail(error, "checkpoint image prefix differs");
+    }
+    if (!stream_state_validate(f.live, ss, g, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    if (f.kv.size() != layers + 1) return fail(error, "invalid K/V layer count");
+    const int64_t upto = (int64_t) f.live.ids.size();
+    std::array<void*, 5> dst{};
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_stream_target(f.kv[j], owned(ss, j), g, upto, true, dst, error)) return false;
+    return conversation_kv_stream_target(f.kv.back(), draft, g, upto, false, dst, error);
+}
+
+void conversation_stream_storage(const SessionFileLayout& f, std::vector<ConversationCheckpoint>& storage,
+                                 ConversationCheckpoint& live, std::vector<ConversationCheckpoint>& checkpoints) {
+    ConversationCheckpoint lv;
+    for (size_t part = 1; part < 5; ++part) state_array(lv, part).resize((size_t) f.live.state[part].bytes);
+    std::vector<ConversationCheckpoint> out(f.checkpoints.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        ConversationCheckpoint& c = out[i];
+        if (!storage.empty()) {   // a dropped checkpoint: its vectors have these sizes and their pages are in
+            conversation_checkpoint_join(storage.back().gdn.data());
+            c = std::move(storage.back());
+            storage.pop_back();
+        }
+        c.ids.clear(); c.imgs.clear(); c.used = 0; c.dev_tag = 0; c.pinned = false; c.plan = {}; c.stage_parts.clear();
+        for (size_t part = 0; part < 5; ++part)
+            state_array(c, part).resize((size_t) f.checkpoints[i].state[part].bytes);
+    }
+    live = std::move(lv);
+    checkpoints = std::move(out);
+}
+
+ConversationRestore conversation_stream_restore(SessionFileStream& file, SessionFileLayout& f, SessionState& ss,
+                                                const ModelGeometry& g, const QsaState& draft,
+                                                ConversationCheckpoint& live,
+                                                std::vector<ConversationCheckpoint>& checkpoints, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    fail(error, kStreamMetal);
+    return ConversationRestore::invalid;
+#endif
+    if (!conversation_stream_validate(f, ss, g, draft, error)) return ConversationRestore::invalid;
+    bool sized = checkpoints.size() == f.checkpoints.size();
+    for (size_t part = 1; sized && part < 5; ++part) sized = state_array(live, part).size() == f.live.state[part].bytes;
+    for (size_t i = 0; sized && i < checkpoints.size(); ++i)
+        for (size_t part = 0; sized && part < 5; ++part)
+            sized = state_array(checkpoints[i], part).size() == f.checkpoints[i].state[part].bytes;
+    if (!sized) {
+        fail(error, "the streamed restore's host storage does not match the file");
+        return ConversationRestore::invalid;
+    }
+    const int64_t upto = (int64_t) f.live.ids.size();
+    const size_t layers = owned_qsa(ss);
+    std::vector<std::array<void*, 5>> kv_dst(layers + 1);
+    for (size_t j = 0; j <= layers; ++j)
+        if (!conversation_kv_stream_target(f.kv[j], j < layers ? owned(ss, j) : draft, g, upto, j < layers,
+                                           kv_dst[j], error)) return ConversationRestore::invalid;
+    if (!sync(error)) return ConversationRestore::transfer_failed;   // the copies below do not ride the legacy stream
+    uint8_t* const rows = reinterpret_cast<uint8_t*>(ss.gdn_state);
+    const uint64_t rows_bytes = f.live.state[0].bytes;
+    const SessionStreamSink sink = [&](const SessionStreamPiece& p, const uint8_t* data, size_t n) -> bool {
+        if (p.part >= 5) return fail(error, "streamed restore: an unknown array");
+        if (p.kind == 0 && p.part == 0) {   // the live GDN rows: straight to the device
+            if (p.at > rows_bytes || n > rows_bytes - p.at) return fail(error, "streamed restore: GDN rows out of range");
+            return copy(rows + p.at, data, n, error);
+        }
+        if (p.kind == 0 || p.kind == 1) {   // the live small arrays, the checkpoints' running state: host memory
+            if (p.kind == 1 && p.index >= checkpoints.size()) return fail(error, "streamed restore: an unknown checkpoint");
+            std::vector<uint8_t>& v = state_array(p.kind == 0 ? live : checkpoints[p.index], p.part);
+            if (p.at > v.size() || n > v.size() - p.at) return fail(error, "streamed restore: running state out of range");
+            if (n) std::memcpy(v.data() + p.at, data, n);
+            return true;
+        }
+        if (p.kind == 2 && p.index < kv_dst.size()) {   // a K/V part: the device pool (or the authoritative host pool)
+            const uint64_t size = f.kv[p.index].parts[p.part].bytes;
+            if (p.at > size || n > size - p.at) return fail(error, "streamed restore: K/V out of range");
+            if (n == 0) return true;
+            return copy(static_cast<uint8_t*>(kv_dst[p.index][p.part]) + p.at, data, n, error);
+        }
+        return fail(error, "streamed restore: an unknown piece");
+    };
+    if (!file.deliver(sink, error)) return ConversationRestore::transfer_failed;
+    // as conversation_kv_restore ends: the streamed and ring states' resident pages hold the outgoing conversation
+    for (size_t j = 0; j <= layers; ++j)
+        if (!conversation_kv_stream_finish(j < layers ? owned(ss, j) : draft, g, upto, error))
+            return ConversationRestore::transfer_failed;
+    live.ids = std::move(f.live.ids);
+    live.imgs = std::move(f.live.imgs);
+    live.used = f.live.used;
+    if (!restore_small(live, ss, g, error)) return ConversationRestore::transfer_failed;
+    for (size_t i = 0; i < checkpoints.size(); ++i) {
+        checkpoints[i].ids = std::move(f.checkpoints[i].ids);
+        checkpoints[i].imgs = std::move(f.checkpoints[i].imgs);
+        checkpoints[i].used = f.checkpoints[i].used;
+    }
+    return ConversationRestore::restored;
+}
 } // namespace strata::core

@@ -197,6 +197,68 @@ void full_session(int fmt, int mode, int experts) {
         const ConversationView none{empty_ids,images,checkpoints,true};
         check(!conversation_snapshot_sources(meta,sources,none,ss,g,draft.state,err),"empty session refused");
     }
+    {
+        // QuantLab (10/29), STRATA_QL_SESSION_STREAM: the bounded-RAM save (the checkpoint written from the chain, the
+        // live GDN rows and the K/V through the file's block) gives the captured image's bytes, and the two-pass restore
+        // (the state straight to the device) puts B back over another conversation, the draft's ring included
+        namespace fs=std::filesystem;
+        const fs::path dir=fs::temp_directory_path()/("strata-snap-stream-"+std::to_string(experts)+"-"+
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::create_directories(dir);
+        const std::string pc=(dir/"captured.bin").string(), ps=(dir/"streamed.bin").string();
+        auto slurp=[](const std::string& p){ std::ifstream f(p,std::ios::binary);
+            return std::vector<char>((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>()); };
+        const SessionFileIdentity id{3,4};
+        size_t nc=0,ns=0;
+        check(session_file_write(pc,b,id,nc,err),"stream: captured write");
+        const std::vector<ConversationCheckpoint> no_checks;
+        const ConversationView live_view{ids,images,no_checks,true};
+        const ConversationCheckpoint* deepest=session_deepest_checkpoint(checkpoints);
+        SavedConversation meta;
+        SessionKvSource gdn;
+        std::vector<SessionKvSource> sources;
+        check(conversation_snapshot_stream_sources(meta,gdn,sources,live_view,deepest,ss,g,draft.state,err),"stream: sources");
+        check(meta.checkpoints.empty() && meta.kv.empty() && meta.live.gdn.empty() && gdn.sizes[0]==b.live.gdn.size() &&
+              meta.live.dead==b.live.dead && sources.size()==b.kv.size(),"stream: no checkpoint, K/V or GDN copy in RAM");
+        check(!conversation_snapshot_stream_sources(meta,gdn,sources,view,deepest,ss,g,draft.state,err),
+              "stream: a view with its own checkpoints refused");
+        const std::vector<const ConversationCheckpoint*> disk{deepest};
+        SessionWriteOptions wo;
+        wo.unbuffered=true;
+        check(session_file_write_streamed(ps,meta,disk,gdn,sources,id,ns,err,wo),"stream: streamed write");
+        check(ns==nc && slurp(ps)==slurp(pc),"stream: the streamed save is byte-identical to the captured image's file");
+        fill(201);   // another conversation in the session
+        SessionReadLimits limits;
+        check(conversation_session_read_limits(limits,ss,g,draft.state,(uint64_t)ss.max_cells,4,err),"stream: limits");
+        SessionFileStream file;
+        SessionFileLayout layout;
+        SessionStreamOptions so;
+        so.unbuffered=true;
+        size_t nr=0;
+        check(file.verify(ps,id,limits,so,layout,nr,err) && nr==ns,"stream: pass 1 checks the file");
+        check(conversation_stream_validate(layout,ss,g,draft.state,err),"stream: the layout fits the session");
+        std::vector<ConversationCheckpoint> storage;
+        storage.push_back(checkpoints[0]);   // a dropped chain's checkpoint: its vectors take the incoming one
+        ConversationCheckpoint live;
+        std::vector<ConversationCheckpoint> kept;
+        conversation_stream_storage(layout,storage,live,kept);
+        check(storage.empty() && kept.size()==1,"stream: the dropped checkpoint's storage taken");
+        check(conversation_stream_restore(file,layout,ss,g,draft.state,live,kept,err)==ConversationRestore::restored,
+              "stream: pass 2 restores");
+        SavedConversation back;
+        check(snap_save(back,view,ss,g,draft.state,err),"stream: capture the restored session");
+        check(back.live.gdn==b.live.gdn && back.live.ple==b.live.ple && back.live.tails==b.live.tails &&
+              back.live.dead==b.live.dead && back.live.block_pos==b.live.block_pos &&
+              equal(back.kv[0],b.kv[0]) && equal(back.kv.back(),b.kv.back()),"stream: B exactly, the draft included");
+        check(live.ids==ids && kept[0].ids==b.checkpoints[0].ids && kept[0].gdn==b.checkpoints[0].gdn &&
+              kept[0].used==17 && kept[0].dev_tag==0 && ss.ple_prev[0]==64 && ss.ple_prev[1]==65,
+              "stream: the tokens, the kept checkpoint and the PLE window");
+        // one delivery per verification: a second restore is refused before any device write (the session stays B)
+        check(conversation_stream_restore(file,layout,ss,g,draft.state,live,kept,err)!=ConversationRestore::restored,
+              "stream: no second delivery");
+        std::error_code ec;
+        fs::remove_all(dir,ec);
+    }
     check(a.live.dead!=b.live.dead,"different opening-state spare keys in regression fixture");
     auto bad=a; bad.kv.back().k.pop_back();
     check(conversation_snapshot_restore(bad,ss,g,draft.state,err)==ConversationRestore::invalid,

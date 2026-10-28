@@ -455,6 +455,27 @@ static bool ql_swap_mixed() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_SWAP_MIXED"); return v && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (10/29): STRATA_QL_SESSION_STREAM=1 (opt-in) - SAVE / RESTORE move the session between the device and the
+// disk in 16 MiB blocks with bounded RAM (conversation_file.hpp: session_file_write_streamed, SessionFileStream), the
+// files unbuffered where the volume allows it, and the QuantLab switches and the pack bind the session file.  Off:
+// everything as before.  Not on Metal (its running state lives in the decode window).
+static bool ql_session_stream() {
+#if defined(STRATA_GPU_METAL)
+    return false;
+#else
+    return strata::core::session_stream_requested();
+#endif
+}
+// QuantLab (10/29): the RAM floor a streamed save / restore keeps free beside its own ~20 MiB (it no longer holds the
+// state in RAM): STRATA_QL_SESSION_STREAM_FLOOR_MIB=N, else the smaller of 64 MiB and --conversation-cache-min-free-mib
+static uint64_t ql_session_stream_floor(int64_t cache_floor_mib) {
+    static const long long env = [] {
+        const char* v = std::getenv("STRATA_QL_SESSION_STREAM_FLOOR_MIB");
+        return v != nullptr && *v != '\0' ? std::max(0LL, std::atoll(v)) : -1LL;
+    }();
+    const long long mib = env >= 0 ? env : std::min<long long>(64, std::max<long long>(0, (long long) cache_floor_mib));
+    return (uint64_t) mib << 20;
+}
 // The adaptive tier's pairs for layer `l`: `cand` (not in the GPU tier: usage, expert) and `vict` (in it), the best
 // candidate against the coldest victim while the gain clears `min_gain`; push(gain, in, out) for each pair.  Every
 // layer that is not mixed pairs exactly as the tier always did.
@@ -10460,6 +10481,44 @@ int main(int argc, char** argv) {
                     {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
                     {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+                if (ql_session_stream()) {
+                    // QuantLab (10/29): with streamed session files, the QuantLab switches that change the arithmetic or
+                    // the pack's layout bind the file too, and so do the pack's path and the size and modification
+                    // time of the pack's files and of every expert file (the model fingerprint samples only the first
+                    // and last MiB of each: a pack rebuilt in place with another middle layer kept it).  A file saved
+                    // with another pack or setting is refused instead of silently restored.  Off: as before.
+                    auto env_on = [](const char* name, bool exact_one) -> int64_t {   // as each switch's own reader
+                        const char* v = std::getenv(name);
+                        if (v == nullptr) return 0;
+                        return exact_one ? (std::strcmp(v, "1") == 0 ? 1 : 0) : (std::atoi(v) != 0 ? 1 : 0);
+                    };
+                    c.switches.push_back({"ql.pack_complement", env_on("STRATA_QL_PACK_COMPLEMENT", true)});
+                    c.switches.push_back({"ql.swap_mixed", env_on("STRATA_QL_SWAP_MIXED", false)});
+                    c.switches.push_back({"ql.pcie_mixed", env_on("STRATA_QL_PCIE_MIXED", false)});
+                    c.switches.push_back({"ql.mmq_mixed", env_on("STRATA_QL_MMQ_MIXED", false)});
+                    c.switches.push_back({"ql.adapt_in_prompt", env_on("STRATA_QL_ADAPT_IN_PROMPT", false)});
+                    strata::core::SessionIdentityBuilder pk(0x514c5041434b3031ull);   // "QLPACK01"
+                    pk.str("pack", o.pack);
+                    std::vector<std::string> stamped;
+                    auto stamp = [&](const std::string& p) {
+                        if (p.empty() || std::find(stamped.begin(), stamped.end(), p) != stamped.end()) return;
+                        stamped.push_back(p);
+                        std::error_code ec;
+                        const std::filesystem::path fp(p);
+                        const auto size = std::filesystem::file_size(fp, ec);
+                        if (ec) { pk.str("absent", p); return; }
+                        const auto when = std::filesystem::last_write_time(fp, ec);
+                        pk.str("file", p);
+                        pk.u64("size", (uint64_t) size);
+                        pk.i64("mtime", ec ? (int64_t) 0 : (int64_t) when.time_since_epoch().count());
+                    };
+                    if (!o.pack.empty())
+                        for (const char* n : {"native_experts.txt", "index.txt", "dense.bin", "experts.bin", "manifest.json"})
+                            stamp(o.pack + "/" + n);
+                    if (srcp != nullptr)
+                        for (const auto& input : srcp->model_inputs()) stamp(input.second);
+                    c.switches.push_back({"ql.pack_files", (int64_t) pk.digest()});
+                }
                 config_fp = strata::core::session_config_fingerprint(c);
             }
             id.model = *model_fp;
@@ -13497,6 +13556,9 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
+            // QuantLab (10/29), STRATA_QL_SESSION_STREAM=1: a RESTORE reads the file twice (SESSION <done> <total> runs over
+            // both passes, total = twice the file), and a transfer that fails after the device writes began answers
+            // SERR io 0 with the live session dropped (the next request reads its prompt from token 0), not FATAL.
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
                 const std::string path = line.substr(save ? 5 : 8);
@@ -13556,6 +13618,100 @@ int main(int argc, char** argv) {
                 }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    if (ql_session_stream()) {
+                        // QuantLab (10/29): STRATA_QL_SESSION_STREAM=1 - the bounded-RAM save.  The deepest checkpoint is
+                        // written from the chain where it is (no copy), the live GDN rows and the K/V go from the device
+                        // through the file's 16 MiB block (no host copy), so RAM holds the block, the token list and the
+                        // small running-state arrays: ~20 MiB, asked above a small floor (ql_session_stream_floor).
+                        size_t bytes = 0, kept = 0;
+                        double capture_ms = 0;
+                        uint64_t need = UINT64_MAX;
+                        const uint64_t floor = ql_session_stream_floor(o.conversation_cache_min_free_mib);
+                        bool unbuffered = false;
+                        const MemSample before = mem_sample();
+                        unsigned long long peak_commit = before.commit_mib;
+                        const auto moving_peak = [&](uint64_t done, uint64_t total) {
+                            moving(done, total);
+                            peak_commit = std::max(peak_commit, mem_sample().commit_mib);
+                        };
+                        try {
+                            strata::core::SessionSaveLive sl;
+                            {
+                                strata::core::ConversationStateSizes z;
+                                std::string why;
+                                uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
+                                if (strata::core::conversation_session_sizes(g, ss, z, why)) {
+                                    const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                                    const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
+                                    // the small arrays only: the GDN rows stream from the device
+                                    if (q == 0 || per <= (UINT64_MAX - z.ple) / q) state = z.ple + q * per;
+                                }
+                                sl.state_bytes = state;
+                                sl.tokens = live.size();
+                                sl.images = live_imgs.size();
+                                sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            }
+                            need = strata::core::session_save_stream_peak_bytes(sl);
+                            {
+                                const auto mem = strata::core::sample_host_memory();
+                                const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                                if (!strata::core::conversation_memory_admit(avail, need, floor)) {
+                                    refuse("not enough RAM to save the session (" +
+                                           (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
+                                           " MiB plus a floor of " + std::to_string(floor >> 20) + " MiB needed, " +
+                                           ram_note(mem) + ")", strata::core::SessionError::memory);
+                                    continue;
+                                }
+                            }
+                            const ConvCheckpoint* deepest = strata::core::session_deepest_checkpoint(checks);
+                            std::vector<const ConvCheckpoint*> disk_checks;
+                            if (deepest != nullptr) disk_checks.push_back(deepest);
+                            kept = disk_checks.size();
+                            const std::vector<ConvCheckpoint> no_checks;
+                            const strata::core::ConversationView view{live, live_imgs, no_checks, cvec_cached};
+                            strata::core::SavedConversation meta;
+                            strata::core::SessionKvSource gdn;
+                            std::vector<strata::core::SessionKvSource> sources;
+                            blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
+                            if (!strata::core::conversation_snapshot_stream_sources(meta, gdn, sources, view, deepest, ss, g,
+                                                                                    mtp.kv_state(), err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                continue;
+                            }
+                            capture_ms = ms();
+                            strata::core::SessionWriteOptions wo;
+                            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                            wo.progress = moving_peak;
+                            wo.phase = blocking;
+                            wo.unbuffered = true;
+                            strata::core::SessionStatus st;
+                            if (!strata::core::session_file_write_streamed(path, meta, disk_checks, gdn, sources, id, bytes,
+                                                                           err, wo, &st)) {
+                                refuse(err, st.error, st.published);
+                                continue;
+                            }
+                            unbuffered = st.unbuffered;
+                            if (st.dir_flush_unsupported)
+                                std::fprintf(stderr, "strata serve: session saved to %s; this filesystem cannot flush a "
+                                                     "folder, so the new name is not flushed\n", path.c_str());
+                        } catch (const std::bad_alloc&) {
+                            refuse("not enough RAM to save the session", strata::core::SessionError::memory);
+                            continue;
+                        }
+                        const MemSample after = mem_sample();
+                        std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
+                                     "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
+                                     path.c_str(), ms(), capture_ms);
+                        std::fprintf(stderr, "strata serve: QuantLab session stream: save %s I/O, %.0f MB/s; RAM asked %llu MiB "
+                                     "above a floor of %llu MiB; process commit %llu -> peak %llu -> %llu MiB, available "
+                                     "%llu -> %llu MiB\n", unbuffered ? "unbuffered" : "buffered",
+                                     ms() > 0 ? (double) bytes / 1e3 / ms() : 0.0,
+                                     (unsigned long long) (need >> 20), (unsigned long long) (floor >> 20),
+                                     before.commit_mib, peak_commit, after.commit_mib, before.avail_mib, after.avail_mib);
+                        std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                        std::fflush(stdout);
+                        continue;
+                    }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -13643,6 +13799,153 @@ int main(int argc, char** argv) {
                                  path.c_str(), ms(), capture_ms);
                     std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
                 } else {
+                    if (ql_session_stream()) {
+                        // QuantLab (10/29): STRATA_QL_SESSION_STREAM=1 - the streamed restore.  Pass 1 checks the whole
+                        // file (size, header, identity, bounded parse, payload hash) through one 16 MiB block holding
+                        // only the token lists; pass 2 reads it again straight into the device (the live GDN rows, every
+                        // K/V part, the draft's) and the kept checkpoint into the dropped chain's storage.  RAM: the
+                        // block, the token lists and the small arrays.  A failure after pass 2 began drops the live
+                        // session (SERR io; the next request reads its prompt from token 0) instead of ending the engine.
+                        const uint64_t floor = ql_session_stream_floor(o.conversation_cache_min_free_mib);
+                        const MemSample before = mem_sample();
+                        unsigned long long peak_commit = before.commit_mib;
+                        const auto moving_peak = [&](uint64_t done, uint64_t total) {
+                            moving(done, total);
+                            peak_commit = std::max(peak_commit, mem_sample().commit_mib);
+                        };
+                        auto admit_text = [floor](uint64_t need, std::string& why) {
+                            const auto mem = strata::core::sample_host_memory();
+                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                  std::to_string(floor >> 20) + " MiB needed, " + ram_note(mem) + ")";
+                            return false;
+                        };
+                        strata::core::SessionFileStream file;
+                        strata::core::SessionFileLayout layout;
+                        size_t bytes = 0;
+                        uint64_t need1 = 0, need2 = 0;
+                        try {
+                            strata::core::SessionReadLimits limits;
+                            limits.admit = [&](uint64_t need, std::string& why) { need1 = need; return admit_text(need, why); };
+                            if (!strata::core::conversation_session_read_limits(
+                                    limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                    (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                continue;
+                            }
+                            strata::core::SessionStreamOptions so;
+                            so.unbuffered = true;
+                            so.progress = moving_peak;
+                            strata::core::SessionStatus st;
+                            if (!file.verify(path, id, limits, so, layout, bytes, err, &st)) {
+                                refuse(err, st.error);
+                                continue;
+                            }
+                        } catch (const std::bad_alloc&) {
+                            refuse("not enough RAM to read the session", strata::core::SessionError::memory);
+                            continue;
+                        }
+                        const double check_ms = ms();
+                        // the whole layout against this engine, still without any device write
+                        blocking("validate", bytes);
+                        if (!strata::core::conversation_stream_validate(layout, ss, g, mtp.kv_state(), err)) {
+                            refuse(err);
+                            continue;
+                        }
+                        // pass 2's RAM: the block again and the checkpoints' state the dropped chain's storage does not hold
+                        {
+                            const size_t reusable = std::min(checks.size(), layout.checkpoints.size());
+                            need2 = strata::core::session_stream_restore_peak_bytes(layout, reusable);
+                            std::string why;
+                            if (!admit_text(need2, why)) {
+                                refuse("session file: " + why, strata::core::SessionError::memory);
+                                continue;
+                            }
+                        }
+                        // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+                        if (!kvg_ensure((int64_t) layout.live.ids.size() + 256, adapt_quiesce)) {
+                            refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
+                            continue;
+                        }
+                        // from here the outgoing session is given up: its chain's storage takes the incoming checkpoints
+                        conversations.take_reuse();   // retained K/V described the outgoing session
+                        const bool was_ok = live_ok;
+                        live_ok = false;
+                        std::vector<ConvCheckpoint> storage = std::move(checks);
+                        checks.clear();
+                        if (storage.empty() && ckpt_pool.on()) {   // (STRATA_CKPT_POOL: a dropped checkpoint's vectors)
+                            ConvCheckpoint spare = ckpt_pool.take();
+                            if (!spare.gdn.empty()) storage.push_back(std::move(spare));
+                        }
+                        const size_t reused = std::min(storage.size(), layout.checkpoints.size());
+                        ConvCheckpoint live_state;
+                        std::vector<ConvCheckpoint> restored;
+                        try {
+                            strata::core::conversation_stream_storage(layout, storage, live_state, restored);
+                        } catch (const std::bad_alloc&) {
+                            // nothing reached the device: the live session stays, with what is left of its chain
+                            checks = std::move(storage);
+                            if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
+                                    return int64_t(c.ids.size()) == tail_ckpt_len;
+                                })) tail_ckpt_len = -1;
+                            live_ok = was_ok;
+                            refuse("not enough RAM to read the session", strata::core::SessionError::memory);
+                            continue;
+                        }
+                        storage.clear();   // the rest of the outgoing chain goes before the second pass
+                        storage.shrink_to_fit();
+                        blocking("transfer", bytes);
+                        const double t2 = ms();
+                        if (strata::core::conversation_stream_restore(file, layout, ss, g, mtp.kv_state(), live_state,
+                                                                      restored, err) !=
+                            strata::core::ConversationRestore::restored) {
+                            // the device state may be partial: never decode from it.  The session is dropped instead of
+                            // the engine (the next request reads its prompt from token 0: session_zero)
+                            live.clear();
+                            live_imgs.clear();
+                            checks.clear();
+                            tail_ckpt_len = -1;
+                            live_ok = false;
+                            std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s; the live session was "
+                                                 "dropped (QuantLab session stream: not fatal)\n", path.c_str(), err.c_str());
+                            refuse(err + " (the live session was dropped: the next request reads its prompt from the start)",
+                                   strata::core::SessionError::io);
+                            continue;
+                        }
+                        const double transfer_ms = ms() - t2;
+                        const bool unbuffered = file.unbuffered();
+                        file.close();
+                        live = std::move(live_state.ids);
+                        live_imgs = std::move(live_state.imgs);
+                        checks = std::move(restored);
+                        for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
+                        cvec_cached = layout.cvec;
+                        live_ok = true;
+                        if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
+                            nan_flush = false;
+                            const size_t n_parked = conversations.clear();
+                            std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
+                                                 "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
+                                         n_parked == 1 ? "" : "s");
+                        }
+                        const MemSample after = mem_sample();
+                        std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
+                                     "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
+                                     ms(), check_ms);
+                        std::fprintf(stderr, "strata serve: QuantLab session stream: restore %s I/O, check %.1f ms, to the "
+                                     "device %.1f ms (%.0f MB/s); RAM asked %llu MiB (check) and %llu MiB (transfer, %zu "
+                                     "checkpoint%s in the dropped chain's storage) above a floor of %llu MiB; process commit "
+                                     "%llu -> peak %llu -> %llu MiB, available %llu -> %llu MiB\n",
+                                     unbuffered ? "unbuffered" : "buffered", check_ms, transfer_ms,
+                                     transfer_ms > 0 ? (double) bytes / 1e3 / transfer_ms : 0.0,
+                                     (unsigned long long) (need1 >> 20), (unsigned long long) (need2 >> 20), reused,
+                                     reused == 1 ? "" : "s", (unsigned long long) (floor >> 20), before.commit_mib,
+                                     peak_commit, after.commit_mib, before.avail_mib, after.avail_mib);
+                        std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                        std::fflush(stdout);
+                        continue;
+                    }
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
                     try {
