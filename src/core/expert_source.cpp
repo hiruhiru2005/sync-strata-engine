@@ -4331,7 +4331,14 @@ uint8_t* FileExpertSource::exchange_buffer(int64_t q, int64_t layer) const {
 }
 
 bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q) {
-    if (fes_pack(n_layers_)) return false;   // QuantLab: one size per layer is needed (see fes_pack)
+    // QuantLab: with the RAM copy packed by own size (fes_pack), `out` takes `in`'s place - so only an `in` and `out` of
+    // one blob size, and only with STRATA_QL_SWAP_MIXED=1 (the tier pairs them that way: pair_adaptive_swaps)
+    const bool packed = fes_pack(n_layers_);
+    if (packed) {
+        static const bool swap_mixed = [] { const char* v = std::getenv("STRATA_QL_SWAP_MIXED"); return v && std::atoi(v) != 0; }();
+        if (!swap_mixed || exchange_storage_.active() || in < 0 || in >= n_expert_ || out < 0 || out >= n_expert_ ||
+            blob_len(layer, in) != blob_len(layer, out)) return false;
+    }
     if (out < 0 || out >= n_expert_ || !has_resident(layer, in) || has_resident(layer, out) ||
         exchange_buffer(q, layer) == nullptr) return false;
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
@@ -4341,7 +4348,7 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     for (const Exchange& x : staged_)
         if (x.in == i_in || x.q == q) return false;
     override_[i_out] = exchange_buffer(q, layer);
-    staged_.push_back({i_in, i_out, q, layer_blob_bytes_[(size_t) layer]});
+    staged_.push_back({i_in, i_out, q, packed ? blob_len(layer, out) : layer_blob_bytes_[(size_t) layer]});   // QuantLab: own size
     return true;
 }
 

@@ -441,6 +441,37 @@ struct SwapHome {
     cudaStream_t stream;
     int dev;
 };
+// QuantLab (10/28): adaptive swaps on a per-expert K (mixed) layer, STRATA_QL_SWAP_MIXED=1 (opt-in until measured).
+// An exchange puts `in` into `out`'s GPU slot and `out` into `in`'s place in the packed RAM copy, and both are sized to
+// their expert - so a mixed layer pairs only experts of one blob size.  Off: a mixed layer makes no pairs.
+static bool ql_swap_mixed() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_SWAP_MIXED"); return v && std::atoi(v) != 0; }();
+    return on;
+}
+// The adaptive tier's pairs for layer `l`: `cand` (not in the GPU tier: usage, expert) and `vict` (in it), the best
+// candidate against the coldest victim while the gain clears `min_gain`; push(gain, in, out) for each pair.  Every
+// layer that is not mixed pairs exactly as the tier always did.
+template <class Push>
+void pair_adaptive_swaps(int64_t l, std::vector<std::pair<float, int32_t>>& cand, std::vector<std::pair<float, int32_t>>& vict,
+                         float min_gain, Push push) {
+    auto pair_sorted = [&](std::vector<std::pair<float, int32_t>>& c, std::vector<std::pair<float, int32_t>>& v) {
+        if (c.empty() || v.empty()) return;
+        std::sort(c.begin(), c.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        const size_t nc = std::min(c.size(), v.size());
+        std::partial_sort(v.begin(), v.begin() + (ptrdiff_t) nc, v.end(), [](auto& a, auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < nc; ++i) {
+            if (c[i].first < v[i].first + min_gain) break;
+            push(c[i].first - v[i].first, c[i].second, v[i].second);
+        }
+    };
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.layer_mixed(l)) { pair_sorted(cand, vict); return; }
+    if (!ql_swap_mixed()) return;
+    std::map<uint64_t, std::pair<std::vector<std::pair<float, int32_t>>, std::vector<std::pair<float, int32_t>>>> by;
+    for (const auto& c : cand) by[lay.expert_bytes(l, c.second)].first.push_back(c);
+    for (const auto& v : vict) by[lay.expert_bytes(l, v.second)].second.push_back(v);
+    for (auto& kv : by) pair_sorted(kv.second.first, kv.second.second);
+}
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
                           int64_t n_expert, std::vector<Swap>& swaps, Locate locate) {
@@ -460,7 +491,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
         const strata::core::OnDevice on(home.dev);
         nib::guard_raw(s.layer, "the adaptive tier's copy back (resident_stage_swaps)");
         if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
-                            (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
+                            (size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.out), cudaMemcpyDeviceToHost,
                             home.stream); e != cudaSuccess) {
             std::fprintf(stderr, "strata: copy back of layer %d slot %d (device %d) failed: %s\n", (int) s.layer,
                          (int) slot, home.dev, cudaGetErrorString(e));
@@ -11381,15 +11412,10 @@ int main(int argc, char** argv) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
-                if (cand.empty() || vict.empty()) continue;
-                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-                const size_t nc = std::min(cand.size(), vict.size());
-                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                                  [](auto& a, auto& b) { return a.first < b.first; });
-                for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
-                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-                }
+                // QuantLab: a mixed layer pairs within one blob size (pair_adaptive_swaps); every other layer as before
+                pair_adaptive_swaps(l, cand, vict, o.adapt_min_gain, [&](float gain, int32_t in, int32_t out) {
+                    swaps.push_back({gain, (int32_t) l, in, out});
+                });
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
@@ -11416,7 +11442,7 @@ int main(int argc, char** argv) {
                 for (const Swap& s : swaps)
                     if (const uint8_t* b = srcp->blob_stable(s.layer, s.in))
                         spans.emplace_back((uintptr_t) b,
-                                           (uintptr_t) b + strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                                           (uintptr_t) b + strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in));   // QuantLab: own size
                 pin_blobs(std::move(spans), pin_live);
             }
             // --pipeline-windows: windows are in flight while the tier adapts.  The evicted experts stop being planned
@@ -11458,7 +11484,7 @@ int main(int argc, char** argv) {
                 if (dma_mode != 0 && slot >= 0 && b != nullptr) {
                     cp_dst.push_back(xcache.device_slot(slot));
                     cp_src.push_back(b);
-                    cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                    cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in));   // QuantLab: own size
                     main_live = true;
                     host_res[out] = strata::core::kNotResident;
                     srcp->prefetch(s.layer, s.out);
@@ -11467,7 +11493,7 @@ int main(int argc, char** argv) {
                 }
                 if (slot < 0 || b == nullptr ||
                     adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                   (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                   (size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in),   // QuantLab: own size
                                    gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
@@ -11656,15 +11682,10 @@ int main(int argc, char** argv) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
-                if (cand.empty() || vict.empty()) continue;
-                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-                const size_t nc = std::min(cand.size(), vict.size());
-                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                                  [](auto& a, auto& b) { return a.first < b.first; });
-                for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
-                    all.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-                }
+                // QuantLab: a mixed layer pairs within one blob size (pair_adaptive_swaps); every other layer as before
+                pair_adaptive_swaps(l, cand, vict, o.adapt_min_gain, [&](float gain, int32_t in, int32_t out) {
+                    all.push_back({gain, (int32_t) l, in, out});
+                });
             }
             std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.gain > b.gain; });
             aswaps.clear();
@@ -11688,7 +11709,7 @@ int main(int argc, char** argv) {
                     if (w.home != hi || !w.exchange) continue;
                     nib::guard_raw(w.layer, "the async adaptive tier's copy back (a_back)");
                     if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(w.j, w.layer), h.cache->device_slot(w.slot),
-                                                              (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
+                                                              (size_t) strata::kernels::cpu::expert_layout().expert_bytes(w.layer, w.out),   // QuantLab: own size
                                                               cudaMemcpyDeviceToHost, h.stream); e != cudaSuccess) {
                         std::fprintf(stderr, "strata serve: adaptive tier: copy back of layer %d slot %d (CUDA%d) failed: %s\n",
                                      (int) w.layer, (int) w.slot, h.dev, cudaGetErrorString(e));
@@ -11726,7 +11747,7 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on(h.dev);
             nib::guard_raw(w.layer, "the async adaptive tier's copy in (a_in_one)");
             if (const cudaError_t e = cudaMemcpyAsync(h.cache->device_slot(w.slot), b,
-                                                      (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
+                                                      (size_t) strata::kernels::cpu::expert_layout().expert_bytes(w.layer, w.in),   // QuantLab: own size
                                                       cudaMemcpyHostToDevice, h.stream); e != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: adaptive tier: copy of layer %d into slot %d (CUDA%d) failed: %s\n",
                              (int) w.layer, (int) w.slot, h.dev, cudaGetErrorString(e));
@@ -17980,15 +18001,10 @@ int main(int argc, char** argv) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
-                if (cand.empty() || vict.empty()) continue;
-                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-                const size_t nc = std::min(cand.size(), vict.size());
-                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                                  [](auto& a, auto& b) { return a.first < b.first; });
-                for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + 1.5f) break;
-                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-                }
+                // QuantLab: a mixed layer pairs within one blob size (pair_adaptive_swaps); every other layer as before
+                pair_adaptive_swaps(l, cand, vict, 1.5f, [&](float gain, int32_t in, int32_t out) {
+                    swaps.push_back({gain, (int32_t) l, in, out});
+                });
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
@@ -18003,7 +18019,7 @@ int main(int argc, char** argv) {
                 for (const Swap& s : swaps)
                     if (const uint8_t* b = srcp->blob_stable(s.layer, s.in))
                         spans.emplace_back((uintptr_t) b,
-                                           (uintptr_t) b + strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                                           (uintptr_t) b + strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in));   // QuantLab: own size
                 pin_blobs(std::move(spans), pin_live);
             }
             // STRATA_DMA_BATCH (F12): the round's copies as one cudaMemcpyBatchAsync; mode 0 is the loop of one copy each
@@ -18016,7 +18032,7 @@ int main(int argc, char** argv) {
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
                 nib::guard_raw(s.layer, "the adaptive refill's copy in");
-                const size_t blob_n = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                const size_t blob_n = (size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in);   // QuantLab: own size
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
