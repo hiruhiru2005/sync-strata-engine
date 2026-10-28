@@ -382,6 +382,9 @@ struct GpuPlanSink {
     void (*publish)(void* ctx) = nullptr;
     /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
     void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;
+    /// QuantLab: a per-expert K (mixed) layer's PCIe share - blob q copies fetch_sizes[q] bytes (its own size; the
+    /// staging slots still stride `bytes`, the layer's largest).  Set by the pool for the one fetch call, else null.
+    const size_t* fetch_sizes = nullptr;
     void* ctx = nullptr;
     /// Plan v0.3 P6: how a PCIe group reaches the GPU.  0 = the copy engine stages it (DMA, `fetch`); 1 = the grouped
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`

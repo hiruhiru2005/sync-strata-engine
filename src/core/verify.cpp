@@ -2294,7 +2294,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                if (lay.native && lay.layer_mixed(l)) {
+                    // QuantLab: a per-expert K layer's PCIe share (STRATA_QL_PCIE_MIXED) - each pointer carries its K pair;
+                    // the kernel copies that expert's own size (the slots still stride the layer's largest) and the
+                    // rebase keeps the tag (rebase_ptrs keeps every pointer's top byte)
+                    const auto& f = lay.fmt[(size_t) l];
+                    const int64_t gu_unit = 2 * f.n_ff * (f.n_embd / 128), d_unit = f.n_embd * (f.n_ff / 128);
+                    fetch_blobs_mixed(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), gu_unit, d_unit, (int) per, cs);
+                } else {
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                }
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
             }
             stamp(l, 21, grp);
@@ -3545,7 +3554,10 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     // cannot be submitted stops the engine: flag B must not release the consumers to expert weights that were never
     // copied.
     const int batch_mode = strata::core::dma_batch_mode();
-    if (batch_mode == 0) {
+    if (v->sink_.fetch_sizes != nullptr) {   // QuantLab: a mixed layer - each blob at its own size, the slots striding `bytes`
+        const size_t* sz = v->sink_.fetch_sizes;
+        for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], sz[i], cudaMemcpyHostToDevice, v->copy_);
+    } else if (batch_mode == 0) {
         for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
     } else {
         const auto copied = strata::core::copy_expert_blobs(stage, src, n, bytes, v->copy_, batch_mode);

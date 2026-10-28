@@ -4988,10 +4988,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
         }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
-        // (QuantLab v6: a per-expert K layer's PCIe share would copy its blobs at the layer's largest size - not yet:
-        // its misses stay on the CPU)
+        // QuantLab (10/28): a per-expert K layer's PCIe share, STRATA_QL_PCIE_MIXED=1 (opt-in until measured): each staged
+        // blob carries its K pair in the pointer's top byte like a VRAM group, and copies its own size (fetch_sizes;
+        // the copy kernel derives it from the tag).  Off: its misses stay on the CPU, as before.
+        static const bool pcie_mixed = [] { const char* v = std::getenv("STRATA_QL_PCIE_MIXED"); return v && std::atoi(v) != 0; }();
         const bool mixed = native && lay.layer_mixed(d.layers);
-        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers) && !mixed;
+        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers) && (!mixed || pcie_mixed);
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
         // decode step; with >= 2 misses give it at least one (the last in routing order).  It only flies if its blob is
@@ -5063,10 +5065,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
+        size_t fsz[64];                           // QuantLab: a mixed layer's own blob sizes for the DMA copies
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
+            if (mixed) {   // QuantLab: the staged (or mapped) blob carries its K pair like a VRAM group (tq_mix.hpp)
+                if ((P.ptr2[q] & ~strata::kernels::kTqAddrMask) != 0) {
+                    std::fprintf(stderr, "strata: a PCIe blob address 0x%llx has its top byte in use; per-expert K "
+                                         "layers cannot tag it\n", P.ptr2[q]);
+                    std::abort();
+                }
+                const auto& fe = lay.fmt_of(d.layers, ids[i0]);
+                P.ptr2[q] |= strata::kernels::tq_mix_tag(strata::kernels::cpu::tq_kbits(fe.gu_type),
+                                                         strata::kernels::cpu::tq_kbits(fe.d_type));
+                fsz[q] = (size_t) lay.expert_bytes(d.layers, ids[i0]);
+            }
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) {
@@ -5084,7 +5098,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
+        P.fetch_sizes = mixed && fetches > 0 ? fsz : nullptr;   // QuantLab: read by the fetch call only
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        P.fetch_sizes = nullptr;
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];

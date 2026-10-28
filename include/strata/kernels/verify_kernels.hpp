@@ -136,10 +136,16 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 /// into dst + k * blob_bytes with coalesced 16-byte loads - the PCIe share of a layer's missed experts, staged
 /// into VRAM before the grouped expert kernel reads them.  Launched for a capacity of `cap` blobs.
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream);
+/// QuantLab: the same for a per-expert K (mixed) layer - src[k] carries its (K gate/up, K down) in the top byte
+/// (tq_mix_tag); blob k is gu_unit * (2 + 4 K gate/up) + d_unit * (2 + 4 K down) bytes (its own size, a multiple of 16)
+/// and lands at dst + k * slot_bytes (the layer's largest).
+void fetch_blobs_mixed(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
+                       int64_t d_unit, int cap, void* stream);
 /// table[pairs[2k]] = pairs[2k + 1] for k < n, `pairs` in mapped host memory: a residency table's changed entries,
 /// stream-ordered before the window that reads it, without the copy engine (where the tier's swaps may queue).
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream);
-/// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
+/// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).  QuantLab: ptr[k]'s top byte (a
+/// mixed layer's K tag; 0 for every other pointer, which is below 2^48) is kept.
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
 
 // ---- the MTP draft layer (src/core/mtp.cpp)

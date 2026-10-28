@@ -623,13 +623,29 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
     }
 }
 
+// QuantLab: a mixed layer's PCIe share - blob k's own size from its tag, copied to slot k (slot_per uint4 apart); the
+// flat index walks every slot's largest size and skips past the blob's end
+__global__ void fetch_blobs_mixed_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                         uint4* __restrict__ dst, long long slot_per, long long gu_unit, long long d_unit) {
+    const long long total = (long long) *n * slot_per;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long) gridDim.x * blockDim.x) {
+        const long long k = i / slot_per, off = i - k * slot_per;
+        const unsigned long long p = src[k];
+        const unsigned tag = (unsigned) (p >> 56);
+        const long long own = gu_unit * (2 + 4 * (long long) (tag & 15u)) + d_unit * (2 + 4 * (long long) (tag >> 4));
+        if (off * 16 < own) dst[i] = ((const uint4*) (p & ((1ull << 56) - 1)))[off];
+    }
+}
+
 __global__ void res_patch_kernel(int32_t* __restrict__ table, const volatile int32_t* pairs, int n) {
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) table[pairs[2 * k]] = pairs[2 * k + 1];
 }
 
 __global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
     const int k = threadIdx.x;
-    if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
+    // QuantLab: keep the top byte (a mixed layer's K tag; 0 for every other pointer)
+    if (k < *n) ptr[k] = (base + (unsigned long long) k * (unsigned long long) bytes) | (ptr[k] & ~((1ull << 56) - 1));
 }
 
 __global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
@@ -720,6 +736,18 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
     fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
+}
+
+void fetch_blobs_mixed(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
+                       int64_t d_unit, int cap, void* stream) {
+    if (cap <= 0) return;
+    if (slot_bytes % 16 != 0 || gu_unit % 8 != 0 || d_unit % 8 != 0) {   // (2 + 4K) is even: unit * 2 is a multiple of 16
+        std::fprintf(stderr, "fetch_blobs_mixed: sizes must be multiples of 16\n");
+        std::exit(1);
+    }
+    fetch_blobs_mixed_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (slot_bytes / 16),
+                                                                       (long long) gu_unit, (long long) d_unit);
+    check("fetch_blobs_mixed");
 }
 
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
