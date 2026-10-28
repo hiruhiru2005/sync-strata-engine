@@ -9151,6 +9151,10 @@ int main(int argc, char** argv) {
             src.set_extra_drop_files(std::move(drop));
         }
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
+        // QuantLab (10/28): the complement page-locks until the OS refuses, as the arena does, so it takes the same
+        // headroom first (pin_budget.hpp): without it the verify window's staging found no page-locked memory after a
+        // partly pinned complement (STRATA_PARTIAL_PIN=1, --resident-budget-gib 30: 13.8 GiB pinned, then exit 1)
+        strata::core::pin_reserve_take();
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
         std::string whole_err;
@@ -9170,6 +9174,7 @@ int main(int argc, char** argv) {
             else
                 err = whole_err + "; " + err;
         }
+        strata::core::pin_reserve_release_soft();   // QuantLab: the complement is placed (the hard part stays until needed)
         // the startup reads are done: the view of experts.bin back, the file tier as chosen above
         bool startup_kept = false;
         if (src.startup_unbuffered()) {
@@ -14766,6 +14771,12 @@ int main(int argc, char** argv) {
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 pp_exact = true;   // between windows the session is exactly at `a`
+                // QuantLab (10/28): STRATA_QL_ADAPT_IN_PROMPT=1 (quality tests only) - the adaptive tier moves between
+                // this read's windows as it does between decode windows (a round every --adapt-every windows, its
+                // copies landed before the next window reads), so the yardstick's KL sees what the swaps change
+                const bool ql_tier = ql_adapt_in_prompt() && !drive.d.usage.empty() && o.adapt_every > 0 && o.adapt_swaps > 0;
+                int64_t ql_windows = 0, ql_rounds = 0;
+                const int64_t ql_swaps0 = adapt_nswaps;
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
@@ -14803,7 +14814,18 @@ int main(int argc, char** argv) {
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
+                    if (ql_tier && q < b && (++ql_windows % o.adapt_every) == 0) {
+                        if (!ver.wait_commit(e)) return false;   // nothing in flight reads a slot the round overwrites
+                        apply_pending(true);
+                        if (!adapt()) { e = "an adaptive round failed during the read"; return false; }
+                        apply_pending(true);
+                        ++ql_rounds;
+                    }
                 }
+                if (ql_rounds > 0)
+                    std::fprintf(stderr, "strata: QuantLab adaptive tier during the read: %lld rounds, %lld experts swapped "
+                                         "(STRATA_QL_ADAPT_IN_PROMPT)\n", (long long) ql_rounds,
+                                 (long long) (adapt_nswaps - ql_swaps0));
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
                 if (!ver.wait_commit(e)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
