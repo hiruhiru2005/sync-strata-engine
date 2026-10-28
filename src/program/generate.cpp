@@ -5936,7 +5936,8 @@ int main(int argc, char** argv) {
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
             // QuantLab (10/29): STRATA_QL_KV_GROW_RESIDENT=1 lets the resident RAM mode have it too - the experts the cache
-            // gives up go into the RAM copy (kvg_ensure's ql_demote), or are read from the drive.  Unset: refused, as upstream.
+            // gives up go into the RAM copy (kvg_ensure's ql_stage / ql_install), or are read from the drive.  Unset: refused,
+            // as upstream.
             const bool ql_res = ql_kv_grow_resident() && o.resident_cpu_experts;
             const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
                             !o.expert_profile.empty() && (!o.resident_cpu_experts || ql_res) && o.expert_cache != 0 && !remote &&
@@ -8851,7 +8852,8 @@ int main(int argc, char** argv) {
         // K/V can grow from the cache's slots below the loan (past that it maps new VRAM, which may not be there)
         kvg.ql = ql_kv_grow_resident() && o.resident_cpu_experts;
         if (kvg.ql) {
-            kvg.demote = ql_kv_grow_demote() && srcp == &src && src.complement_ready();
+            // (not with STRATA_EXCHANGE_ROTATE: its ownership table moves the places, ql_take_into_ram refuses every move)
+            kvg.demote = ql_kv_grow_demote() && srcp == &src && src.complement_ready() && !src.exchange_rotation();
             kvg.moves = ql_kv_grow_moves();
             const uint64_t G = strata::core::vmm_granularity();
             const uint64_t mapped = strata::core::qsa_kv_elastic_mapped_bytes();
@@ -8884,9 +8886,9 @@ int main(int argc, char** argv) {
                 }
             }
             std::fprintf(stderr, "strata generate: QuantLab: elastic K/V beside the resident RAM mode: the %.2f GiB of K/V not "
-                                 "mapped yet hold ~%lld expert slots (%.2f GiB, the cache's coldest) until the context needs "
-                                 "them; the %lld slots below the loan (%.2f GiB) let the K/V reach %lld of %lld cells; the "
-                                 "experts given back %s%s\n",
+                                 "mapped yet are ~%lld more expert slots (%.2f GiB) until the context needs them (the slots "
+                                 "just below the loan go first, the coldest experts leave the cache); the %lld slots below "
+                                 "the loan (%.2f GiB) let the K/V reach %lld of %lld cells; the experts given back %s%s\n",
                          (double) unmapped / 1073741824.0, (long long) extra, (double) extra_b / 1073741824.0,
                          (long long) (kvg.top - kvg.floor), (double) ((uint64_t) room * G) / 1073741824.0, (long long) reach,
                          (long long) o.max_context,
@@ -8931,18 +8933,19 @@ int main(int argc, char** argv) {
             return k;
         };
         // QuantLab (10/29), STRATA_QL_KV_GROW_RESIDENT: the resident RAM copy holds only the experts no slot held at start,
-        // so an expert given up here is read from the drive unless it goes into the copy.  ql_demote(i, slot): expert `i`,
-        // whose bytes are still in `slot` (read back before the slot is overwritten or unmapped), takes the place of the
-        // coldest expert of its layer and own size that only the copy holds, when that one is colder (it is then read from
-        // the drive, as the file tier's experts are).  The copy does not grow; the PCIe share and pinned() follow the place.
+        // so an expert given up here is read from the drive unless it goes into the copy.  ql_stage(i, slot) picks, for
+        // expert `i` whose bytes are still in `slot`, the coldest expert of its layer and own size that only the copy holds
+        // (when that one is colder) and reads i's bytes back into ql_buf before the slot is overwritten or unmapped; once i
+        // has really left its slot, ql_install(i, victim) puts them in the victim's place (the victim is then read from the
+        // drive, as the file tier's experts are).  The copy does not grow; the PCIe share and pinned() follow the place.
         std::vector<std::vector<std::pair<float, int32_t>>> ql_victims;   // per layer: (heat, expert) only RAM holds, hottest first
         std::vector<uint8_t> ql_buf;
         int64_t q_demoted = 0, q_in_ram = 0, q_on_file = 0;
         double q_ms = 0;
-        auto ql_demote = [&](int32_t i, int32_t slot) {
+        auto ql_stage = [&](int32_t i, int32_t slot) -> int32_t {   // the victim (its bytes in ql_buf), or -1 (counted)
             const int64_t l = i / g.n_expert, e = i % g.n_expert;
-            if (srcp == &src && src.has_resident(l, e)) { ++q_in_ram; return; }   // in the copy already (a lend slot's, ...)
-            if (!kvg.demote) { ++q_on_file; return; }
+            if (srcp == &src && src.has_resident(l, e)) { ++q_in_ram; return -1; }   // in the copy already (a lend slot's, ...)
+            if (!kvg.demote) { ++q_on_file; return -1; }
             const auto t0 = Clock::now();
             if (ql_victims.empty()) {
                 ql_victims.resize((size_t) g.n_layers);
@@ -8955,27 +8958,41 @@ int main(int argc, char** argv) {
                 for (auto& v : ql_victims)
                     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             }
-            auto& vic = ql_victims[(size_t) l];
+            const auto& vic = ql_victims[(size_t) l];
             const uint64_t own = lay.expert_bytes(l, e);
             const float h = heat(i);
-            bool done = false;
+            int32_t pick = -1;
             for (int64_t k = (int64_t) vic.size() - 1; k >= 0 && vic[(size_t) k].first < h; --k) {   // coldest first
                 const int32_t ve = vic[(size_t) k].second;
                 if (lay.expert_bytes(l, ve) != own) continue;   // a place packed by own size takes one size (fes_pack)
                 if (ql_buf.size() < (size_t) own) ql_buf.resize((size_t) own);
-                nib::guard_raw(l, "the elastic K/V's copy back (QuantLab ql_demote)");
+                nib::guard_raw(l, "the elastic K/V's copy back (QuantLab ql_stage)");
                 // synchronous, on the legacy stream: after any move queued before it, and done before the slot changes.  A
                 // failed read leaves the expert to the drive (a device fault stays for the synchronize below)
-                if (cudaMemcpy(ql_buf.data(), xcache.device_slot(slot), (size_t) own, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                if (cudaMemcpy(ql_buf.data(), xcache.device_slot(slot), (size_t) own, cudaMemcpyDeviceToHost) != cudaSuccess)
                     (void) cudaGetLastError();
-                    break;
-                }
-                if (!src.ql_take_into_ram(l, e, ve, ql_buf.data(), own)) break;
-                vic.erase(vic.begin() + (ptrdiff_t) k);
-                done = true;
+                else
+                    pick = ve;
                 break;
             }
-            ++(done ? q_demoted : q_on_file);
+            if (pick < 0) ++q_on_file;
+            q_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            return pick;
+        };
+        auto ql_install = [&](int32_t i, int32_t victim) {   // ql_stage's bytes of `i` into the victim's place (counted)
+            const int64_t l = i / g.n_expert, e = i % g.n_expert;
+            const auto t0 = Clock::now();
+            if (src.ql_take_into_ram(l, e, victim, ql_buf.data(), lay.expert_bytes(l, e))) {
+                auto& vic = ql_victims[(size_t) l];
+                for (size_t k = vic.size(); k-- > 0;)
+                    if (vic[k].second == victim) {
+                        vic.erase(vic.begin() + (ptrdiff_t) k);
+                        break;
+                    }
+                ++q_demoted;
+            } else {
+                ++q_on_file;
+            }
             q_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
         };
         while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
@@ -9009,7 +9026,7 @@ int main(int argc, char** argv) {
                         const int32_t ci_i = cold[(size_t) ci].second;
                         const int32_t vs = host_res[(size_t) ci_i];
                         nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
-                        ql_demote(ci_i, vs);
+                        const int32_t qv = ql_stage(ci_i, vs);   // read back before the move overwrites the slot
                         if (cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo), (size_t) own,
                                        cudaMemcpyDeviceToDevice) == cudaSuccess) {
                             vi = ci_i;
@@ -9017,9 +9034,13 @@ int main(int argc, char** argv) {
                             host_res[(size_t) oi] = vs;
                             host_res[(size_t) vi] = strata::core::kNotResident;
                             ++moved;
+                            if (qv >= 0) ql_install(vi, qv);
                         }
                     }
-                    if (vi < 0) ql_demote(oi, (int32_t) kvg.lo);   // its bytes stay in slot lo until the unmap below
+                    if (vi < 0) {   // oi gives its slot up: its bytes stay in slot lo until the unmap below
+                        const int32_t qv = ql_stage(oi, (int32_t) kvg.lo);
+                        if (qv >= 0) ql_install(oi, qv);
+                    }
                 } else if (!cold.empty() && cold.back().first < heat(oi)) {
                     vi = cold.back().second;
                     const int32_t vs = host_res[(size_t) vi];
