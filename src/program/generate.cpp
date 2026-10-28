@@ -441,6 +441,13 @@ struct SwapHome {
     cudaStream_t stream;
     int dev;
 };
+// QuantLab: STRATA_QL_ADAPT_IN_PROMPT=1 (quality tests only) - the adaptive tier also moves while a prompt is read through
+// the decode windows (--short-read: quant_quality's teacher-forced read, no prefill chunks and no slot loans), so the
+// yardstick's KL sees the swaps.  Upstream keeps the tier still during a prompt's chunks (their slot loans read the tables).
+static bool ql_adapt_in_prompt() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_ADAPT_IN_PROMPT"); return v && std::atoi(v) != 0; }();
+    return on;
+}
 // QuantLab (10/28): adaptive swaps on a per-expert K (mixed) layer, STRATA_QL_SWAP_MIXED=1 (opt-in until measured).
 // An exchange puts `in` into `out`'s GPU slot and `out` into `in`'s place in the packed RAM copy, and both are sized to
 // their expert - so a mixed layer pairs only experts of one blob size.  Off: a mixed layer makes no pairs.
@@ -12732,7 +12739,7 @@ int main(int argc, char** argv) {
             // Never between a prompt's chunks (its loan of cache slots and its chunks read the tables); a request drains
             // the round before its prompt starts (adapt_tick(true) where the request begins).  The main thread's part is
             // small (the table changes and uploads); the copies are on the helper thread and the cards' refill streams.
-            if (ajob && !in_prompt_read) {
+            if (ajob && (!in_prompt_read || ql_adapt_in_prompt())) {
                 const Clock::time_point ta = Clock::now();
                 if (!adapt_tick(false)) {
                     std::printf("ERR an adaptive refill failed\n");
@@ -12770,7 +12777,8 @@ int main(int argc, char** argv) {
                 bool ok = true;
                 ~AdaptRun() { if (th.joinable()) th.join(); }   // an error return below still joins it
             } adapt_run;
-            if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
+            if (!drive.d.usage.empty() && !ajob && (!in_prompt_read || ql_adapt_in_prompt()) && (++ba_window % o.adapt_every) == 0 &&
+                pending.empty())
                 adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
             std::vector<int> keep(bs.size(), 0);
