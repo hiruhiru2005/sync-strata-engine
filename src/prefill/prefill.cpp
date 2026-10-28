@@ -1357,6 +1357,9 @@ const MmqPlan& mmq_plan() {
         p.wmma_only.assign(p.layer.size(), 0);
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
+            // QuantLab v6: a per-expert K layer's MMQ group would take one type for experts of several - the FP16
+            // path, which dequantizes each expert by its own format
+            if (lay.native && lay.layer_mixed(l)) { p.fallback = true; continue; }
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
             if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
@@ -3349,7 +3352,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const PeerPrefill::PsEntry& en = P.pseq[P.p_issued];
                 const size_t sl = P.p_issued % (size_t) P.RP;
                 if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
-                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l),
+                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().expert_bytes(en.l, en.e),
                                 cudaMemcpyHostToDevice, P.s_cp);
                 cudaEventRecord(P.pcopied[sl], P.s_cp);
                 P.plive[sl] = 1;
@@ -3397,7 +3400,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
                         job = (int) js.size();
-                        js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
+                        js.push_back({nullptr, (size_t) lay0.expert_bytes(l, e), m.src, (int32_t) l, e});
                     } else {
                         b = m.src->blob_stable(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
@@ -3412,7 +3415,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (!m.src->pinned(l, e)) {
                             job = (int) js.size();
-                            js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                            js.push_back({b, (size_t) lay0.expert_bytes(l, e)});
                         }
                     }
                     seq.push_back({(int32_t) l, e, b, job});
@@ -3434,7 +3437,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const StreamEntry& en = seq[issued];
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
-                const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                const size_t bytes = (size_t) lay0.expert_bytes(en.l, en.e);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (en.job < 0) {
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
@@ -3524,7 +3527,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
-                    const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                    const size_t bytes = (size_t) lay0.expert_bytes(en.l, en.e);   // QuantLab: a mixed layer's own size
                     if (m.stage_live[sl]) {
                         // Both this slot and the previous one must have been released in THIS walk (idx - 1 >= ring: the
                         // previous slot's event of an earlier walk could be re-recorded by this walk's first flush), and
@@ -4327,8 +4330,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
                         }
+                        // (QuantLab v6: not for a per-expert K layer - the CPU thread computes with the layer's one format)
                         bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead &&
-                                         lay.native && !m.pp && !lay.fmt.empty();
+                                         lay.native && !m.pp && !lay.fmt.empty() && !lay.layer_mixed(l);
                         // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
                         // nothing left (0.1.41 report: tight RAM, chats failing).  A buffer that cannot be had ends the share
                         // for this engine - the GPU takes every expert, as with STRATA_PREFILL_CPU_SHARE=0 - instead of
@@ -4574,6 +4578,46 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 std::fwrite(x.data(), sizeof(float), x.size(), f);
                                 std::fwrite(ids_h, sizeof(int32_t), (size_t) (T * K), f);
                                 std::fclose(f);
+                            }
+                        }
+                        // QuantLab (local build, not upstream): STRATA_DUMP_MOE_DIR=dir [STRATA_DUMP_MOE_LAYERS=3,7,... | all]
+                        // - EVERY chunk's MoE input of every listed layer, one file per layer and chunk in the same format as
+                        // above: dir/l<layer>/c<k>.bin, k counting that layer's chunks from 0 for the life of the process (every
+                        // layer sees every chunk, so the k of one chunk is the same in each layer's folder).  The folders must
+                        // exist.  One start of the engine then gives the calibration rows of all layers for many prompts.
+                        static const char* dump_dir = std::getenv("STRATA_DUMP_MOE_DIR");
+                        if (dump_dir) {
+                            static std::vector<int64_t> dump_seq;
+                            static std::vector<char> dump_on;
+                            if (dump_on.empty()) {
+                                const int64_t nl = 512;                 // more than any model's layer count
+                                dump_seq.assign((size_t) nl, 0);
+                                const char* want = std::getenv("STRATA_DUMP_MOE_LAYERS");
+                                dump_on.assign((size_t) nl, (want == nullptr || std::string(want) == "all") ? 1 : 0);
+                                if (want != nullptr && std::string(want) != "all") {
+                                    const std::string s(want);
+                                    for (size_t a = 0; a < s.size();) {
+                                        size_t b = s.find(',', a);
+                                        if (b == std::string::npos) b = s.size();
+                                        const int v = std::atoi(s.substr(a, b - a).c_str());
+                                        if (v >= 0 && v < nl) dump_on[(size_t) v] = 1;
+                                        a = b + 1;
+                                    }
+                                }
+                            }
+                            if (l >= 0 && (size_t) l < dump_on.size() && dump_on[(size_t) l]) {
+                                std::vector<float> x((size_t) (T * N));
+                                cudaMemcpyAsync(x.data(), m.mixed, x.size() * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                                cudaStreamSynchronize(m.cs);
+                                const std::string path = std::string(dump_dir) + "/l" + std::to_string(l) + "/c" +
+                                                         std::to_string(dump_seq[(size_t) l]++) + ".bin";
+                                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                                    const int64_t hdr[3] = {(int64_t) T, (int64_t) N, (int64_t) K};
+                                    std::fwrite(hdr, sizeof hdr, 1, f);
+                                    std::fwrite(x.data(), sizeof(float), x.size(), f);
+                                    std::fwrite(ids_h, sizeof(int32_t), (size_t) (T * K), f);
+                                    std::fclose(f);
+                                }
                             }
                         }
                         n_order = order.size();
@@ -5094,12 +5138,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 if (m.src->transient(l, e)) {   // CS-T: copied by the source
-                                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                                    js.push_back({nullptr, (size_t) lay.expert_bytes(l, e), m.src, (int32_t) l, e});
                                     continue;
                                 }
                                 const uint8_t* b = m.src->blob_stable(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
-                                js.push_back({b, (size_t) lay.blob_bytes(l)});
+                                js.push_back({b, (size_t) lay.expert_bytes(l, e)});
                             }
                             if (m.warmer) {
                                 std::vector<int64_t> cur;
@@ -5134,13 +5178,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.expert_bytes(l, e), cudaMemcpyHostToDevice, m.copy);
                                 ++stats_.experts_dma;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.expert_bytes(l, e), cudaMemcpyHostToDevice, m.copy);
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
@@ -5359,7 +5403,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int q = (int) (j % DQ);
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
-                                const auto& f = lay.fmt[(size_t) l];
+                                // (QuantLab v6: by this expert's own format; = the layer's unless it mixes them)
+                                const auto& f = lay.fmt_of(l, e);
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs,
                                                                    f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);

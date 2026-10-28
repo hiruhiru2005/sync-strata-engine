@@ -51,6 +51,7 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"   // QuantLab: tq_kbits for the per-expert K check
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -4019,6 +4020,18 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
+            if (lay.layer_mixed(l)) {   // QuantLab v6: every format of a per-expert K layer is a trellis pair the mixed kernels take
+                for (const auto& c : lay.cls_fmt[(size_t) l]) {
+                    const int kg = strata::kernels::cpu::tq_kbits(c.gu_type), kd = strata::kernels::cpu::tq_kbits(c.d_type);
+                    if (!strata::kernels::tq_mix_supported(kg, kd)) {
+                        std::fprintf(stderr, "strata generate: layer %lld mixes per-expert formats, but ggml types %d/%d "
+                                             "are not trellis rates this engine's mixed-layer kernels take\n",
+                                     (long long) l, c.gu_type, c.d_type);
+                        return 1;
+                    }
+                }
+                continue;
+            }
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,
@@ -7012,11 +7025,18 @@ int main(int argc, char** argv) {
         const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+        // QuantLab v6: a mixed layer's experts differ in size, and the profile fill puts pair i in slot i and never moves
+        // it (no eviction; the adaptive swaps are off with a mixed pack), so slot i is sized for pair i's own blob - not
+        // the layer's largest - and the same VRAM holds about twice the experts of a layer with K13 experts in it.
         for (const auto& pr : profile) {
-            const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(pr.first), slot_guard);
+            // QuantLab v6: a mixed layer's experts differ in size and the profile fill never moves an expert, so slot i is
+            // sized for pair i's own blob (STRATA_EXPERT_NIBBLE's 4-bit slots keep their own size)
+            const int64_t own = nib::layer(pr.first).on ? (int64_t) nib::slot_bytes(pr.first)
+                                                        : (int64_t) lay.expert_bytes(pr.first, pr.second);
+            const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride(own, slot_guard);
             if (used + b > cap) break;
             used += b;
-            sized_slots.push_back((int64_t) nib::slot_bytes(pr.first));
+            sized_slots.push_back(own);
         }
         // #831: the sized-slots loop walks the profile's pairs, so the profile's length is the ceiling; an explicit
         // --expert-cache above it used to be cut with no word.  A warning only (what is allocated does not change).
@@ -7239,7 +7259,8 @@ int main(int argc, char** argv) {
             const bool nib_pair = nib_x.active() && nib::layer(profile[(size_t) i].first).on;   // STRATA_EXPERT_NIBBLE
             if (b == nullptr || !(nib_pair ? nib_x.add(profile[(size_t) i].first, profile[(size_t) i].second, slot, b, err)
                                            : xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first)))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(profile[(size_t) i].first,
+                                                                          profile[(size_t) i].second)))) {   // QuantLab: own size
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -7259,7 +7280,7 @@ int main(int argc, char** argv) {
         if (prefilled > 0 && !nib::layer(profile[0].first).on &&
             !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob_stable(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+                                (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(profile[0].first, profile[0].second))) {   // QuantLab: a mixed layer's expert is its own size
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -7381,7 +7402,7 @@ int main(int argc, char** argv) {
             const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
             const bool nib_pair = nib_c.active() && nib::layer(pr.first).on;   // STRATA_EXPERT_NIBBLE
             if (b == nullptr || !(nib_pair ? nib_c.add(pr.first, pr.second, slot, b, err)
-                                           : st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first)))) {
+                                           : st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.expert_bytes(pr.first, pr.second)))) {   // QuantLab: own size
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
                              st.dev, (long long) filled, err.c_str());
                 return 1;
@@ -7396,7 +7417,7 @@ int main(int argc, char** argv) {
         if (filled == 0 || (!nib::layer(st.profile[0].first).on &&
                             !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                                   srcp->blob_stable(st.profile[0].first, st.profile[0].second), err,
-                                                  (int64_t) lay.blob_bytes(st.profile[0].first)))) {
+                                                  (int64_t) lay.expert_bytes(st.profile[0].first, st.profile[0].second)))) {   // QuantLab: own size
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
             return 1;
@@ -12361,7 +12382,7 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                            (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(layer, pick % g.n_expert))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
@@ -14783,7 +14804,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(i / g.n_expert, i % g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
@@ -17472,7 +17493,7 @@ int main(int argc, char** argv) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
                                                         : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());

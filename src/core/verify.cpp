@@ -1174,7 +1174,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                     }
                 }
             }
-            all_resident_ = all_ok;
+            // QuantLab v6: the device planners write untagged blob pointers, and a per-expert K layer's groups need
+            // their tag (tq_mix.hpp) - such a pack plans on the host
+            all_resident_ = all_ok && !strata::kernels::cpu::expert_layout().any_mixed();
         }
     }
     if (g_side_mixer() > 0 &&
@@ -1192,7 +1194,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
-        device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
+        device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0) &&
+                       !strata::kernels::cpu::expert_layout().any_mixed();   // (QuantLab v6: as all_resident_)
     }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse() || g_qfuse_hc()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
@@ -2252,6 +2255,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
 #endif
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
+                // QuantLab v6: a per-expert K layer - each group's pointer carries its K (the host plan tags it)
+                if (lay.layer_mixed(l)) L.gu_type = L.d_type = strata::kernels::kTqMixedType;
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
             } else {
