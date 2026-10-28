@@ -135,7 +135,8 @@ bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
-    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err);
+    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err,
+    const std::vector<uint64_t>* expert_bytes = nullptr);   // QuantLab: each expert's own size (n_layers x n_expert)
 
 /// Resolve one blob through the compact copy when present, otherwise preserve its exact mapped-file fallback.
 const uint8_t* cache_complement_blob_or_fallback(
@@ -1177,6 +1178,10 @@ private:
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
     int spans(int64_t layer, int64_t expert, Span* out) const;
+    /// QuantLab v6: this expert's own size and offset in experts.bin (a mixed layer packs its experts by their own
+    /// sizes; layer_blob_bytes_ is then the layer's largest blob, which sizes the buffers).
+    uint64_t blob_len(int64_t layer, int64_t expert) const;
+    uint64_t blob_off(int64_t layer, int64_t expert) const;
     /// Bytes of the blob's pages in the page cache (mincore); `total` the blob's bytes.
     /// `exact` false: four sampled pages (a blob is cached when they are; a handful of syscalls, not hundreds of pages' walk).
     uint64_t cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact = true) const;

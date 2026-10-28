@@ -7,6 +7,8 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"   // QuantLab: tq_kbits (per-expert K tags)
+#include "strata/kernels/tq_mix.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "strata/core/pinned.hpp"
@@ -165,7 +167,8 @@ bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
-    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err) {
+    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err,
+    const std::vector<uint64_t>* expert_bytes) {
     offsets.clear();
     bytes = 0;
     err.clear();
@@ -214,15 +217,25 @@ bool make_cache_complement_plan(
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
-            if (bytes > std::numeric_limits<uint64_t>::max() - blob_bytes) {
+            // QuantLab (10/27): packed by the expert's own size when `expert_bytes` is given (a pack of mixed layers)
+            const uint64_t own = expert_bytes != nullptr && index < expert_bytes->size() && (*expert_bytes)[index] != 0
+                                     ? (*expert_bytes)[index] : blob_bytes;
+            if (bytes > std::numeric_limits<uint64_t>::max() - own) {
                 offsets.clear();
                 bytes = 0;
                 err = "FileExpertSource: cache complement size overflows";
                 return false;
             }
             offsets[index] = bytes;
-            bytes += blob_bytes;
+            bytes += own;
         }
+    }
+    // QuantLab (10/27): a tail pad of the largest blob, so a copy of a layer's largest blob size from the last packed
+    // expert (copy_blob, the fill's bounds check) stays inside the copy
+    if (expert_bytes != nullptr && bytes > 0) {
+        uint64_t pad = 0;
+        for (uint64_t b : layer_blob_bytes) pad = std::max(pad, b);
+        bytes += pad;
     }
     if (bytes > (uint64_t) std::numeric_limits<size_t>::max()) {
         offsets.clear();
@@ -977,6 +990,36 @@ bool pread_full(int fd, uint8_t* dst, uint64_t n, uint64_t off) {
 }  // namespace
 #endif
 
+// QuantLab v6: an expert's own size and place in experts.bin.  A mixed layer (experts_k.txt) packs its experts by their
+// own sizes, so its blob is not `layer offset + expert x layer_blob_bytes_`; layer_blob_bytes_ stays the layer's
+// LARGEST blob, which still sizes every buffer and RAM slot safely.
+static inline bool fes_mixed(int64_t layer) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    return lay.native && lay.layer_mixed(layer);
+}
+// QuantLab (10/27): STRATA_QL_PACK_COMPLEMENT=1 packs the RAM copy (the cache complement) of a pack with mixed layers
+// by each expert's own size, not the layer's largest blob (Sync-S v2: 47.5 GiB that way, 24 GiB packed).  The
+// exchanges between the RAM copy and the GPU cache and the RAM tier's adaptation put one expert's blob in another's
+// place, which needs one size per layer, so they are off while it is on.  Packs without mixed layers are unchanged.
+static bool fes_pack(int64_t n_layers) {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_QL_PACK_COMPLEMENT");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    if (!env) return false;
+    for (int64_t l = 0; l < n_layers; ++l)
+        if (fes_mixed(l)) return true;
+    return false;
+}
+uint64_t FileExpertSource::blob_len(int64_t layer, int64_t expert) const {
+    return fes_mixed(layer) ? strata::kernels::cpu::expert_layout().expert_bytes(layer, expert)
+                            : layer_blob_bytes_[(size_t) layer];
+}
+uint64_t FileExpertSource::blob_off(int64_t layer, int64_t expert) const {
+    return fes_mixed(layer) ? strata::kernels::cpu::expert_layout().blob_offset(layer, expert)
+                            : layer_offsets_[(size_t) layer] + (uint64_t) expert * layer_blob_bytes_[(size_t) layer];
+}
+
 int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
     if (!role_ptr_.empty()) {
@@ -994,7 +1037,7 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return 0;
-    out[0] = {b, layer_blob_bytes_[(size_t) layer], io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
+    out[0] = {b, blob_len(layer, expert), io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
     return 1;
 }
 
@@ -1396,6 +1439,12 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
             err = "FileExpertSource: the native expert layout is incomplete";
             return false;
         }
+        // QuantLab v6: a mixed layer reads each expert at its own place and size (blob_off / blob_len); its
+        // layer_blob_bytes_ is the layer's largest blob (layout.bytes), which sizes the buffers and the RAM slots
+        if (layout.any_mixed() && !gguf_.empty() && !std::filesystem::exists(pack_dir + "/experts.bin")) {
+            err = "FileExpertSource: a pack with per-expert formats (experts_k.txt) needs its experts.bin (not the GGUF in place)";
+            return false;
+        }
         uint64_t at = 0;
         for (int64_t layer = 0; layer < n_layers; ++layer) {
             const size_t i = (size_t) layer;
@@ -1405,7 +1454,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
                 err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
                 return false;
             }
-            const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
+            const uint64_t layer_bytes = layout.layer_mixed(layer) ? layout.layer_bytes(layer) : bytes * (uint64_t) n_expert;
             if (at > want || layer_bytes > want - at) {
                 err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
                       std::to_string(layer);
@@ -1782,7 +1831,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
-    std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
+    std::memcpy(dst, b, (size_t) blob_len(layer, expert));   // (QuantLab v6: the expert's own size)
     return true;
 }
 
@@ -2322,7 +2371,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
-            if (const uint8_t* b = mapped_blob(l, e)) strata::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
+            if (const uint8_t* b = mapped_blob(l, e)) strata::platform::advise_willneed(b, blob_len(l, e));
             continue;
         }
         for (int r = 0; r < 3; ++r) {
@@ -2401,7 +2450,9 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
 
 uint64_t FileExpertSource::expert_bytes() const {
     uint64_t total = 0;
-    for (uint64_t b : layer_blob_bytes_) total += b * (uint64_t) n_expert_;
+    for (size_t l = 0; l < layer_blob_bytes_.size(); ++l)   // (QuantLab v6: a mixed layer's own total)
+        total += fes_mixed((int64_t) l) ? strata::kernels::cpu::expert_layout().layer_bytes((int64_t) l)
+                                        : layer_blob_bytes_[l] * (uint64_t) n_expert_;
     return total;
 }
 
@@ -2593,7 +2644,7 @@ bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
     const auto t0 = std::chrono::steady_clock::now();
     const uint8_t* m = mapped_blob(0, 0);   // the first blob as the mapping reads it, for the check below
     if (m == nullptr) { why = "the first blob is not mapped"; return false; }
-    const std::vector<uint8_t> ref(m, m + (size_t) layer_blob_bytes_[0]);
+    const std::vector<uint8_t> ref(m, m + (size_t) blob_len(0, 0));
     // NTFS runs the unbuffered reads of a file one at a time while it is mapped or open buffered (drop_mapping), so
     // the view, the section and the handle all go.  The first unbuffered open with no buffered handle left purges the
     // file's cached pages: 1.2-2.5 s after a mapped start had left IQ2_XS's 33 GiB experts.bin on the standby list,
@@ -2722,8 +2773,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         const Fill& f = fills[k];
         if (f.dst == nullptr || f.layer < 0 || f.e < 0 || f.layer >= n_layers_ || f.e >= n_expert_) return false;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
-            const uint64_t per = layer_blob_bytes_[(size_t) f.layer];
-            const uint64_t off = layer_offsets_[(size_t) f.layer] + (uint64_t) f.e * per;
+            const uint64_t per = blob_len(f.layer, f.e);   // (QuantLab v6: the expert's own place and size)
+            const uint64_t off = blob_off(f.layer, f.e);
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
             continue;
@@ -2842,8 +2893,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         const Fill& f = fills[k];
         if (f.dst == nullptr || f.layer < 0 || f.e < 0 || f.layer >= n_layers_ || f.e >= n_expert_) return false;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
-            const uint64_t per = layer_blob_bytes_[(size_t) f.layer];
-            const uint64_t off = layer_offsets_[(size_t) f.layer] + (uint64_t) f.e * per;
+            const uint64_t per = blob_len(f.layer, f.e);   // (QuantLab v6: the expert's own place and size)
+            const uint64_t off = blob_off(f.layer, f.e);
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
             continue;
@@ -3398,6 +3449,11 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t i = (size_t) layer;
     if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return nullptr;
+    if (fes_mixed(layer)) {   // QuantLab v6: the expert's own place and size
+        const uint64_t offset = blob_off(layer, expert), len = blob_len(layer, expert);
+        if (len == 0 || offset > mapped_bytes_ || len > mapped_bytes_ - offset) return nullptr;
+        return base_ + (size_t) offset;
+    }
     const uint64_t blob_bytes = layer_blob_bytes_[i];
     if (blob_bytes == 0 || (uint64_t) expert > std::numeric_limits<uint64_t>::max() / blob_bytes) return nullptr;
     const uint64_t expert_offset = (uint64_t) expert * blob_bytes;
@@ -3446,7 +3502,7 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
     };
     if (role_ptr_.empty()) {
         const uint8_t* p = mapped_blob(layer, expert);
-        return p == nullptr ? 0 : trim(p, layer_blob_bytes_[(size_t) layer]);
+        return p == nullptr ? 0 : trim(p, blob_len(layer, expert));
     }
     uint64_t bytes = 0;
     for (int r = 0; r < 3; ++r) {
@@ -3496,10 +3552,22 @@ bool FileExpertSource::pin_cache_complement(
             if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
         }
     }
+    // QuantLab (10/27): the packed RAM copy (fes_pack) takes each expert at its own size
+    std::vector<uint64_t> own_bytes;
+    uint64_t max_blob = 0;
+    for (uint64_t b : layer_blob_bytes_) max_blob = std::max(max_blob, b);
+    if (fes_pack(n_layers_)) {
+        own_bytes.resize((size_t) n_layers_ * (size_t) n_expert_);
+        for (int64_t l = 0; l < n_layers_; ++l)
+            for (int64_t e = 0; e < n_expert_; ++e) own_bytes[(size_t) l * (size_t) n_expert_ + (size_t) e] = blob_len(l, e);
+        std::fprintf(stderr, "FileExpertSource: QuantLab: the RAM copy is packed by each expert's own size "
+                             "(STRATA_QL_PACK_COMPLEMENT=1); exchanges with the GPU cache and RAM adaptation are off\n");
+    }
+    const std::vector<uint64_t>* own = own_bytes.empty() ? nullptr : &own_bytes;
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
-                                            additional_gpu_pairs, offsets, bytes, err)) return false;
+                                            additional_gpu_pairs, offsets, bytes, err, own)) return false;
 #if defined(_WIN32)
     // #467: the GPU cache's pre-fill touched its experts through the mapping (~19 GiB on a 24 GB card), and Windows
     // counts those file pages in this process's working set, not as available: a 32 GB PC read 0.44 GiB here
@@ -3555,7 +3623,7 @@ bool FileExpertSource::pin_cache_complement(
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                const uint64_t b = own != nullptr ? (*own)[i] : layer_blob_bytes_[(size_t) pr.first];
                 if (b > budget_bytes - at) continue;
                 ranked[i] = at;
                 at += b;
@@ -3586,7 +3654,7 @@ bool FileExpertSource::pin_cache_complement(
             for (size_t i : order) {
                 const auto& pr = primary_gpu_pairs[i];
                 const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                const uint64_t b = own != nullptr ? (*own)[idx] : layer_blob_bytes_[(size_t) pr.first];
                 if (b > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
                 if (ranked[idx] != kNoComplement) continue;
                 ranked[idx] = at;
@@ -3600,6 +3668,7 @@ bool FileExpertSource::pin_cache_complement(
         }
         offsets.swap(ranked);
         bytes = at;
+        if (own != nullptr && at > 0) bytes += max_blob;   // QuantLab: the tail pad (see make_cache_complement_plan)
         lend_from_slot = -1;
     }
 
@@ -3647,7 +3716,7 @@ bool FileExpertSource::pin_cache_complement(
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
                 if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
             if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
-                                                    additional_gpu_pairs, offsets, bytes, err)) return false;
+                                                    additional_gpu_pairs, offsets, bytes, err, own)) return false;
         }
     }
 
@@ -4044,7 +4113,8 @@ bool FileExpertSource::pin_cache_complement(
 #if !defined(_WIN32)
             if (role_ptr_.empty()) {   // experts.bin; the GGUF in place leaves its pages to the OS
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
-            const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
+            const uint64_t layer_bytes = fes_mixed(layer) ? strata::kernels::cpu::expert_layout().layer_bytes(layer)   // (QuantLab v6)
+                                                          : blob_bytes * (uint64_t) n_expert_;
             const uint64_t layer_end = layer_offset + layer_bytes;
             const uint64_t page = (uint64_t) page_size;
             const uint64_t advice_start = layer_offset - layer_offset % page;
@@ -4202,7 +4272,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
     // layers of several block sizes (a GGUF's mixed i-quants): spares of every size, see ExchangeStorage
     bounce = std::max<int64_t>(0, std::min(bounce, n));
     const uint64_t rotate_total = detail::ExchangeStorage::exchange_bytes_needed(layer_blob_bytes_, (size_t) n, (size_t) bounce);
-    const bool eligible = requested && rotate_total != 0 && rotate_total <= std::numeric_limits<size_t>::max() &&
+    const bool eligible = requested && !fes_pack(n_layers_) && rotate_total != 0 && rotate_total <= std::numeric_limits<size_t>::max() &&
                           complement_pinned_ && !complement_partial_ &&
                           complement_host_ && complement_device_ && complement_bytes_ > 0;
     const size_t total = eligible ? (size_t) rotate_total : (size_t) n * (size_t) blob;
@@ -4255,6 +4325,7 @@ uint8_t* FileExpertSource::exchange_buffer(int64_t q, int64_t layer) const {
 }
 
 bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q) {
+    if (fes_pack(n_layers_)) return false;   // QuantLab: one size per layer is needed (see fes_pack)
     if (out < 0 || out >= n_expert_ || !has_resident(layer, in) || has_resident(layer, out) ||
         exchange_buffer(q, layer) == nullptr) return false;
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
@@ -4326,6 +4397,7 @@ int64_t FileExpertSource::commit_exchanges() {
 }
 
 bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) {
+    if (fes_pack(n_layers_)) return false;   // QuantLab: one size per layer is needed (see fes_pack)
     if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
         layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
         return false;
@@ -4377,6 +4449,7 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
 // `in`'s bytes (src) into `out`'s place of the compact copy, and the two offsets swapped - the checks again, as the caller
 // may have read `src` a while ago (149-prefetch: ram_install)
 bool FileExpertSource::install_resident(int64_t layer, int64_t in, int64_t out, const uint8_t* src) {
+    if (fes_pack(n_layers_)) return false;   // QuantLab: one size per layer is needed (see fes_pack)
     if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
         layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out || src == nullptr)
         return false;
@@ -4401,6 +4474,7 @@ bool FileExpertSource::install_resident(int64_t layer, int64_t in, int64_t out, 
 // ---- 149-prefetch: staged promotions.  The read of `in` runs on this source's own thread (one at a time: the drive's
 // queue stays the decode's first); the install is the decode thread's (ram_install, at a window boundary).
 bool FileExpertSource::ram_stage(int64_t layer, int64_t in, int64_t out) {
+    if (fes_pack(n_layers_)) return false;   // QuantLab: one size per layer is needed (see fes_pack)
     if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_ || in < 0 || out < 0 ||
         in >= n_expert_ || out >= n_expert_ || in == out)
         return false;
@@ -4908,7 +4982,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
         }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
-        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
+        // (QuantLab v6: a per-expert K layer's PCIe share would copy its blobs at the layer's largest size - not yet:
+        // its misses stay on the CPU)
+        const bool mixed = native && lay.layer_mixed(d.layers);
+        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers) && !mixed;
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
         // decode step; with >= 2 misses give it at least one (the last in routing order).  It only flies if its blob is
@@ -4958,6 +5035,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) kind[i] = kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
+            if (mixed) {   // QuantLab v6: the expert's (K gate/up, K down) rides in the pointer's top byte (tq_mix.hpp)
+                if ((ptr & ~strata::kernels::kTqAddrMask) != 0) {
+                    std::fprintf(stderr, "strata: an expert blob address 0x%llx has its top byte in use; per-expert K "
+                                         "layers cannot tag it\n", ptr);
+                    std::abort();
+                }
+                const auto& fe = lay.fmt_of(d.layers, e);
+                ptr |= strata::kernels::tq_mix_tag(strata::kernels::cpu::tq_kbits(fe.gu_type),
+                                                   strata::kernels::cpu::tq_kbits(fe.d_type));
+            }
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
             for (int64_t i = i0; i < n; ++i)
@@ -5140,11 +5227,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
-                nj.fmt = nullptr;
+                // QuantLab v6: a mixed layer's expert carries its own format (the pool honours a job's fmt)
+                nj.fmt = native && lay.layer_mixed(d.layers) ? &lay.fmt_of(d.layers, e) : nullptr;
                 if (zc) {   // 149-cold mode 3: the gate rows are the blob; up and down at their distance in the mapping
                     if (d.zc_fmt.size() < d.jobs_multi.size()) d.zc_fmt.resize(d.jobs_multi.size());
                     strata::kernels::cpu::NativeFmt& f = d.zc_fmt[(size_t) jo];
-                    f = lay.fmt[(size_t) d.layers];
+                    f = lay.fmt_of(d.layers, e);
                     f.up_off = (size_t) ((uintptr_t) zp[1] - (uintptr_t) zp[0]);     // modular: the tensors' order
                     f.down_off = (size_t) ((uintptr_t) zp[2] - (uintptr_t) zp[0]);   // in the file does not matter
                     nj.fmt = &f;
@@ -5284,7 +5372,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                 // count of distinct experts moved rather than of looks.
                 const uint8_t* b = d.src->blob(d.layers, e);
                 std::string ferr;
-                if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(d.layers))) {
+                if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(d.layers, e))) {   // QuantLab v6: own size
                     d.failed = true;
                     d.fail = "the expert cache could not fill a slot";
                     d.fail_layer = d.layers;
@@ -5839,7 +5927,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     for (int64_t l = 0; l < n_layers; ++l) {
         bounds.push_back(lay.layer_offset(l));
         loff.push_back(lay.layer_offset(l));
-        lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
+        lbytes.push_back(lay.layer_bytes(l));   // QuantLab v6: a mixed layer's own total
     }
     bounds.push_back(want);
     // Pin by need: the arena gets a page-aligned blob STRIDE (blob rounded up to 4 KiB, ~+0.15 %), so every blob starts
@@ -5848,7 +5936,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // writes experts.bin from the arena).  The file offsets (loff) stay packed; only the destination moves.
     padded_ = false;
     pad_ = PadMap{};
-    if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty()) {   // (a shared arena file has one layout for every process: the packed one)
+    // (QuantLab v6: not for per-expert formats - the PadMap strides one blob size per layer)
+    if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty() && !lay.any_mixed()) {   // (a shared arena file has one layout for every process: the packed one)
         padded_ = true;
         uint64_t at = 0;
         for (int64_t l = 0; l < n_layers; ++l) {
@@ -6073,7 +6162,7 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
-    const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
+    const uint64_t end = lay.blob_offset(layer, expert) + lay.expert_bytes(layer, expert);   // (QuantLab v6)
     madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
 #endif
 }
@@ -6092,7 +6181,7 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
-    const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer)) & ~(uint64_t) 4095;
+    const uint64_t end = (lay.blob_offset(layer, expert) + lay.expert_bytes(layer, expert)) & ~(uint64_t) 4095;   // (QuantLab v6)
     if (end <= off) return 0;
     if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
     return end - off;
@@ -6120,8 +6209,8 @@ bool ArenaExpertSource::pcie_layer(int64_t layer) const {
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (ranges_) return pin_range_of(arena_off(layer, expert), lay.blob_bytes(layer)) >= 0;   // the whole blob inside ONE registered range
-    return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
+    if (ranges_) return pin_range_of(arena_off(layer, expert), lay.expert_bytes(layer, expert)) >= 0;   // the whole blob inside ONE registered range
+    return lay.blob_offset(layer, expert) + lay.expert_bytes(layer, expert) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
@@ -6129,7 +6218,7 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
         if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
         const auto& rl = strata::kernels::cpu::expert_layout();
         const uint64_t off = arena_off(layer, expert);
-        const int64_t i = pin_range_of(off, rl.blob_bytes(layer));
+        const int64_t i = pin_range_of(off, rl.expert_bytes(layer, expert));
         return i < 0 ? nullptr : pin_dev_[(size_t) i] + (off - pin_start_[(size_t) i]);
     }
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
@@ -6137,7 +6226,7 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;
-    return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+    return dev_slice_[(size_t) layer] + (lay.blob_offset(layer, expert) - lay.layer_offset(layer));   // QuantLab v6: mixed-safe
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {

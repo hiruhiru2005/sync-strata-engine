@@ -125,6 +125,10 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
                        std::string& err) {
     close();
+    if (strata::kernels::cpu::expert_layout().any_mixed()) {   // QuantLab v6: its launch takes one format per layer
+        err = "peer experts: a pack with per-expert formats (experts_k.txt) runs on one GPU for now";
+        return false;
+    }
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
     if (device < 1 || device >= count) {

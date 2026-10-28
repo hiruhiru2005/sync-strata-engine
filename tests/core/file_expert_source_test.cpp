@@ -276,6 +276,11 @@ void test_complement_plan() {
     require(!make_cache_complement_plan(2, 3, {3, 5}, {{2, 0}}, {}, offsets, bytes, error),
             "out-of-range pair accepted");
     require(!make_cache_complement_plan(2, 3, {0, 5}, {}, {}, offsets, bytes, error), "zero-size layer accepted");
+    // QuantLab (10/27): packed by each expert's own size (a pack of mixed layers), with a tail pad of the largest blob
+    const std::vector<uint64_t> own{1, 2, 3, 4, 5, 5};
+    require(make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}}, {}, offsets, bytes, error, &own), error);
+    require(bytes == 23 && offsets == std::vector<uint64_t>{0, kNoCacheComplement, 1, 4, 8, 13},
+            "wrong packed offsets for per-expert sizes");
 }
 
 void test_resident_lend_region() {

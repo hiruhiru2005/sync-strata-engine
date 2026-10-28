@@ -137,6 +137,10 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          const ExpertCache& primary, ExpertSource& source,
                          std::vector<uint8_t>& claimed, std::string& err, bool auto_size) {
     close();
+    if (strata::kernels::cpu::expert_layout().any_mixed()) {   // QuantLab v6: its launch takes one format per layer
+        err = "remote experts: a pack with per-expert formats (experts_k.txt) runs on one GPU for now";
+        return false;
+    }
     int count = 0;
     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
     if (device < 0 || device >= count || slots <= 0 || ranked.empty() ||
