@@ -429,6 +429,15 @@ void native_gu_rows_invariant(const NativeFmt&, const uint8_t*, const void* cons
 void native_down_rows_invariant(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
+uint64_t ExpertLayout::layer_bytes(int64_t layer) const {
+    if (layer_mixed(layer)) {
+        uint64_t s = 0;
+        for (int64_t e = 0; e < n_expert; ++e) s += ebytes[eidx(layer, e)];
+        return s;
+    }
+    return blob_bytes(layer) * (uint64_t) n_expert;
+}
+
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     ExpertLayout L;
     L.n_layers = n_layers;
@@ -524,13 +533,83 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
     }
+    // QuantLab v6: per-expert formats from experts_k.txt ("layer expert gu_type d_type").  A listed layer must list
+    // all its experts; its native_experts.txt row must be its largest format.  A v6 pack without the file, or the file
+    // beside an older native_experts.txt, is refused (the hadamard.txt rule).
+    {
+        std::ifstream kin(pack_dir + "/experts_k.txt");
+        const bool have = (bool) kin;
+        if (L.version >= 6 && !have) {
+            err = "native_experts.txt v6 declares per-expert formats, but " + pack_dir + "/experts_k.txt is missing";
+            return false;
+        }
+        if (have && L.version < 6) {
+            err = pack_dir + "/experts_k.txt exists but native_experts.txt is v" + std::to_string(L.version);
+            return false;
+        }
+        if (have) {
+            const size_t ne = (size_t) L.n_expert;
+            std::vector<int> gts((size_t) n_layers * ne, -1), dts((size_t) n_layers * ne, -1);
+            while (std::getline(kin, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream ks(line);
+                long long l = -1, e = -1, gt = -1, dt = -1;
+                if (!(ks >> l >> e >> gt >> dt) || l < 0 || l >= n_layers || e < 0 || e >= L.n_expert) {
+                    err = "experts_k.txt: a malformed line: " + line;
+                    return false;
+                }
+                gts[(size_t) l * ne + (size_t) e] = (int) gt;
+                dts[(size_t) l * ne + (size_t) e] = (int) dt;
+            }
+            L.mixed_layer.assign((size_t) n_layers, 0);
+            L.eoff.assign((size_t) n_layers * ne, 0);
+            L.ebytes.assign((size_t) n_layers * ne, 0);
+            L.ecls.assign((size_t) n_layers * ne, 0);
+            L.cls_fmt.assign((size_t) n_layers, {});
+            for (int64_t l = 0; l < n_layers; ++l) {
+                size_t listed = 0;
+                for (size_t e = 0; e < ne; ++e) listed += gts[(size_t) l * ne + e] >= 0;
+                if (listed == 0) continue;
+                if (listed != ne) {
+                    err = "experts_k.txt: layer " + std::to_string(l) + " lists " + std::to_string(listed) + " of " +
+                          std::to_string(ne) + " experts";
+                    return false;
+                }
+                L.mixed_layer[(size_t) l] = 1;
+                auto& cls = L.cls_fmt[(size_t) l];
+                uint64_t at_l = L.offset[(size_t) l], biggest = 0;
+                for (size_t e = 0; e < ne; ++e) {
+                    const int gt = gts[(size_t) l * ne + e], dt = dts[(size_t) l * ne + e];
+                    size_t c = 0;
+                    while (c < cls.size() && !(cls[c].gu_type == gt && cls[c].d_type == dt)) ++c;
+                    if (c == cls.size()) {
+                        if (c >= 255) { err = "experts_k.txt: layer " + std::to_string(l) + " has too many formats"; return false; }
+                        NativeFmt f;
+                        if (!native_fmt(gt, dt, H, FF, f, err)) return false;
+                        cls.push_back(f);
+                    }
+                    const size_t i = (size_t) l * ne + e;
+                    L.ecls[i] = (uint8_t) c;
+                    L.ebytes[i] = (uint32_t) cls[c].bytes;
+                    L.eoff[i] = at_l;
+                    at_l += cls[c].bytes;
+                    if (cls[c].bytes > biggest) biggest = cls[c].bytes;
+                }
+                if (biggest != L.bytes[(size_t) l]) {
+                    err = "experts_k.txt: layer " + std::to_string(l) + "'s largest expert is " + std::to_string(biggest) +
+                          " B but native_experts.txt gives " + std::to_string(L.bytes[(size_t) l]);
+                    return false;
+                }
+            }
+        }
+    }
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+        at += L.layer_bytes(l);
     }
     L.total = at;
     // v5: Agention's Hadamard-folded experts (prism.hadamard, hadamard.hpp).  The pack must say which layers are
@@ -574,6 +653,19 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 err = "hadamard.txt: no sign vector for layer " + std::to_string(l) + "'s expert width";
                 return false;
             }
+            // QuantLab v6: a mixed layer's formats rotate exactly like the layer's own
+            if (L.layer_mixed(l))
+                for (NativeFmt& c : L.cls_fmt[(size_t) l]) {
+                    if ((f.had_gu && c.gu_type == 42) || (f.had_d && c.d_type == 42)) {
+                        err = "hadamard.txt: layer " + std::to_string(l) + " folds a Q2_0 expert, which this engine cannot rotate";
+                        return false;
+                    }
+                    c.had_block = f.had_block;
+                    c.had_gu = f.had_gu;
+                    c.had_d = f.had_d;
+                    c.gu_signs = f.gu_signs;
+                    c.d_signs = f.d_signs;
+                }
         }
     }
     g_layout = L;

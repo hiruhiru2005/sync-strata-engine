@@ -17,6 +17,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -335,6 +336,78 @@ void arena() {
                                                                                   strata::kernels::cpu::expert_layout(), err);
     check(ok && err.find("is not [640, 2560, 2]") != std::string::npos, "a down tensor of another shape is refused");
 }
+
+// ---- 4. QuantLab v6: per-expert trellis formats (experts_k.txt)
+void per_expert_k() {
+    using strata::kernels::cpu::kTqPseudoBase;
+    constexpr int64_t H = 2560, FF = 640, NE = 4;
+    // layer 0 is Gyro-S's TQK6/TQK7 for all; layer 1 mixes K 5/6, 3/4 (pseudo/TQK4), 8/9 (TQ2_T/pseudo), 5/6
+    const int gu[NE] = {150, kTqPseudoBase + 3, 144, 150}, dn[NE] = {145, 151, kTqPseudoBase + 9, 145};
+    strata::kernels::cpu::NativeFmt f0, fe[NE];
+    std::string err;
+    bool ok = strata::kernels::cpu::native_fmt(145, 146, H, FF, f0, err);
+    for (int e = 0; ok && e < NE; ++e) ok = strata::kernels::cpu::native_fmt(gu[e], dn[e], H, FF, fe[e], err);
+    check(ok, "TQ formats for K 3..9 (SPEC ids and pseudo ids)" + (ok ? "" : ": " + err));
+    if (!ok) return;
+    // a trellis block is 2 + 4K bytes per 128 values: gate+up 2 x 640 x 2560, down 2560 x 640
+    auto expect = [&](int kg, int kd) { return (uint64_t) 2 * (FF * H / 128) * (2 + 4 * kg) + (uint64_t) (H * FF / 128) * (2 + 4 * kd); };
+    check(f0.bytes == 1049600 && fe[0].bytes == expect(5, 6) && fe[1].bytes == expect(3, 4) && fe[2].bytes == expect(8, 9),
+          "expert bytes = 25600 x (3 + 4 Kg + 2 Kd)");
+    uint64_t biggest = 0, sum1 = 0;
+    for (int e = 0; e < NE; ++e) { biggest = std::max<uint64_t>(biggest, fe[e].bytes); sum1 += fe[e].bytes; }
+    const uint64_t off1 = f0.bytes * NE;
+    auto manifest6 = [&](int version, uint64_t row_blob, int row_gu, int row_d) {
+        return "# strata native experts v" + std::to_string(version) + ": (n_expert " + std::to_string(NE) + ", total " +
+               std::to_string(off1 + sum1) + ")\n0 145 146 0 " + std::to_string(f0.bytes) + " 100 200 300\n1 " +
+               std::to_string(row_gu) + " " + std::to_string(row_d) + " " + std::to_string(off1) + " " +
+               std::to_string(row_blob) + " 400 500 600\n";
+    };
+    std::string ks;
+    for (int e = 0; e < NE; ++e) ks += "1 " + std::to_string(e) + " " + std::to_string(gu[e]) + " " + std::to_string(dn[e]) + "\n";
+    const std::string had = "# strata hadamard v1: test\nblock 128\nlayer 0 1 1 1\nlayer 1 1 1 1\n";
+    TempDir d;
+    write_text(d.path / "native_experts.txt", manifest6(6, biggest, 144, kTqPseudoBase + 9));
+    write_text(d.path / "experts_k.txt", "# layer expert gu_type d_type\n" + ks);
+    write_text(d.path / "hadamard.txt", had);
+    ok = load(d.path, 2, NE, err);
+    check(ok, "v6 with experts_k.txt loads" + (ok ? "" : ": " + err));
+    if (!ok) return;
+    const ExpertLayout& L = strata::kernels::cpu::expert_layout();
+    bool same = L.version == 6 && !L.layer_mixed(0) && L.layer_mixed(1) && L.cls_fmt[1].size() == 3;
+    uint64_t at = off1;
+    for (int e = 0; e < NE; ++e) {
+        same = same && L.blob_offset(0, e) == (uint64_t) e * f0.bytes && L.expert_bytes(0, e) == f0.bytes &&
+               L.fmt_of(0, e).gu_type == 145 && L.fmt_of(0, e).d_type == 146;
+        same = same && L.blob_offset(1, e) == at && L.expert_bytes(1, e) == fe[e].bytes &&
+               L.fmt_of(1, e).gu_type == gu[e] && L.fmt_of(1, e).d_type == dn[e] && L.fmt_of(1, e).bytes == fe[e].bytes;
+        at += fe[e].bytes;
+    }
+    check(same, "layer 0 uniform; layer 1's offsets, sizes and formats per expert (3 classes)");
+    check(L.layer_bytes(0) == off1 && L.layer_bytes(1) == sum1 && L.total == off1 + sum1 && L.max_blob == biggest &&
+              L.blob_bytes(1) == biggest,
+          "layer bytes, total, and the largest blob sizing the buffers");
+    bool rot = true;
+    for (int e = 0; e < NE; ++e)
+        rot = rot && L.fmt_of(1, e).had_gu && L.fmt_of(1, e).had_d && L.fmt_of(1, e).had_block == 128;
+    check(rot, "a mixed layer's formats rotate like the layer (hadamard.txt)");
+
+    // the refusals
+    std::filesystem::remove(d.path / "experts_k.txt");
+    check(!load(d.path, 2, NE, err) && err.find("experts_k.txt is missing") != std::string::npos, "v6 without experts_k.txt is refused");
+    write_text(d.path / "experts_k.txt", ks);
+    write_text(d.path / "native_experts.txt", manifest6(5, biggest, 144, kTqPseudoBase + 9));
+    check(!load(d.path, 2, NE, err) && err.find("is v5") != std::string::npos, "experts_k.txt beside a v5 manifest is refused");
+    write_text(d.path / "native_experts.txt", manifest6(6, biggest, 144, kTqPseudoBase + 9));
+    write_text(d.path / "experts_k.txt", ks.substr(0, ks.rfind("1 3 ")));
+    check(!load(d.path, 2, NE, err) && err.find("lists 3 of 4") != std::string::npos, "a layer listing 3 of its 4 experts is refused");
+    write_text(d.path / "experts_k.txt", ks);
+    write_text(d.path / "native_experts.txt", manifest6(6, fe[0].bytes, 150, 145));
+    check(!load(d.path, 2, NE, err) && err.find("largest expert") != std::string::npos,
+          "a row that is not the layer's largest format is refused");
+    write_text(d.path / "native_experts.txt", manifest6(6, biggest, 144, kTqPseudoBase + 9));
+    write_text(d.path / "experts_k.txt", ks + "1 0 " + std::to_string(kTqPseudoBase + 13) + " 145\n");
+    check(!load(d.path, 2, NE, err), "K 13 (no kernel) is refused");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -353,6 +426,28 @@ int main(int argc, char** argv) {
                     ok ? "every span is its tensor" : "REFUSED: ", ok ? "" : err.c_str());
         return ok ? 0 : 1;
     }
+    // `expert_layout_test --layout PACK_DIR`: load a pack's tables only (QuantLab: a v6 pack's per-expert formats)
+    if (argc == 3 && std::string(argv[1]) == "--layout") {
+        std::string err;
+        if (!load(argv[2], 48, 512, err)) { std::printf("layout refused: %s\n", err.c_str()); return 1; }
+        const ExpertLayout& L = strata::kernels::cpu::expert_layout();
+        std::printf("%s: v%d, %lld layers x %lld experts, %.2f GiB (%llu B), largest blob %llu B\n", argv[2], L.version,
+                    (long long) L.n_layers, (long long) L.n_expert, (double) L.total / (1u << 30),
+                    (unsigned long long) L.total, (unsigned long long) L.max_blob);
+        for (int64_t l = 0; l < L.n_layers; ++l) {
+            if (!L.layer_mixed(l)) continue;
+            std::printf("  layer %lld: mixed, %llu B at %llu, formats:", (long long) l, (unsigned long long) L.layer_bytes(l),
+                        (unsigned long long) L.layer_offset(l));
+            for (const auto& c : L.cls_fmt[(size_t) l]) {
+                int n = 0;
+                for (int64_t e = 0; e < L.n_expert; ++e) n += &L.fmt_of(l, e) == &c;
+                std::printf(" %d/%d x%d", c.gu_type, c.d_type, n);
+            }
+            std::printf("; expert 511 at %llu (%llu B)\n", (unsigned long long) L.blob_offset(l, L.n_expert - 1),
+                        (unsigned long long) L.expert_bytes(l, L.n_expert - 1));
+        }
+        return 0;
+    }
     std::printf("expert_layout_test\n");
     if (argc < 2) {
         std::printf("usage: expert_layout_test <tests/data/native_experts>\n");
@@ -361,6 +456,7 @@ int main(int argc, char** argv) {
     real_packs(argv[1]);
     columns();
     arena();
+    per_expert_k();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

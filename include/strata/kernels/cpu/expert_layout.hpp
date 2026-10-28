@@ -32,13 +32,38 @@ struct ExpertLayout {
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
+    /// QuantLab v6 (per-expert K): a MIXED layer's experts differ in format and size (experts_k.txt beside
+    /// native_experts.txt).  Per (layer, expert) at `layer * n_expert + expert`: `eoff` (absolute, in experts.bin),
+    /// `ebytes`, and `ecls`, an index into `cls_fmt[layer]` (the layer's formats).  For a mixed layer `fmt[layer]`
+    /// and `bytes[layer]` are its LARGEST format, so `blob_bytes` / `max_blob` still size every buffer safely; code
+    /// that reads or copies one expert must use expert_bytes / blob_offset / fmt_of.
+    std::vector<uint8_t> mixed_layer;     ///< per layer, 1 = mixed (empty = no mixed layer)
+    std::vector<uint64_t> eoff;
+    std::vector<uint32_t> ebytes;
+    std::vector<uint8_t> ecls;
+    std::vector<std::vector<NativeFmt>> cls_fmt;
+
     uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
     uint64_t layer_offset(int64_t layer) const {
         return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
     }
+    bool any_mixed() const { return !mixed_layer.empty(); }
+    bool layer_mixed(int64_t layer) const { return !mixed_layer.empty() && mixed_layer[(size_t) layer] != 0; }
+    size_t eidx(int64_t layer, int64_t expert) const { return (size_t) layer * (size_t) n_expert + (size_t) expert; }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
+        if (layer_mixed(layer)) return eoff[eidx(layer, expert)];
         return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
     }
+    /// This expert's own blob size (= blob_bytes(layer) unless the layer is mixed).
+    uint64_t expert_bytes(int64_t layer, int64_t expert) const {
+        return layer_mixed(layer) ? (uint64_t) ebytes[eidx(layer, expert)] : blob_bytes(layer);
+    }
+    /// This expert's format (= fmt[layer] unless the layer is mixed).
+    const NativeFmt& fmt_of(int64_t layer, int64_t expert) const {
+        return layer_mixed(layer) ? cls_fmt[(size_t) layer][ecls[eidx(layer, expert)]] : fmt[(size_t) layer];
+    }
+    /// Bytes of the whole layer in experts.bin.
+    uint64_t layer_bytes(int64_t layer) const;
 };
 
 /// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
@@ -98,6 +123,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 /// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,
 /// so an engine that cannot rotate the activations refuses the pack instead of running it wrong.
-inline constexpr int kExpertLayoutVersion = 5;
+/// v6 (QuantLab, local builds only) = v5 plus `experts_k.txt` beside it: per-expert formats ("layer expert gu_type
+/// d_type" lines; a layer it lists is mixed, its native_experts.txt row giving the layer's largest format and blob).
+/// An older engine refuses v6 here, so a mixed pack never runs on an engine that would read it as one format.
+inline constexpr int kExpertLayoutVersion = 6;
 
 }  // namespace strata::kernels::cpu
