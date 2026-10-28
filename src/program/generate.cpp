@@ -4691,7 +4691,7 @@ int main(int argc, char** argv) {
             {
                 const auto& elay = strata::kernels::cpu::expert_layout();
                 for (int64_t l = 0; l < elay.n_layers; ++l)
-                    experts_ram += elay.blob_bytes(l) * (uint64_t) elay.n_expert;
+                    experts_ram += elay.layer_bytes(l);   // QuantLab: a mixed layer sums its own blob sizes
             }
             if (allowed && need > 0 && strata::core::ple_resident_admit(available, need, experts_ram, 8ull << 30)) {
                 ple_table.close();

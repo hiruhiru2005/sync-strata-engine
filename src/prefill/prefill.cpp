@@ -6290,12 +6290,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             if ((m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) || m.src->pinned(l, e)) continue;
             pf_job[(size_t) e] = (int) js.size();
             if (pdirect || m.src->transient(l, e)) {
-                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                js.push_back({nullptr, (size_t) lay.expert_bytes(l, e), m.src, (int32_t) l, e});
                 continue;
             }
             const uint8_t* b = m.src->blob_stable(l, e);
             if (!b) { err = "prefill (layer-major): expert source has no blob"; return false; }
-            js.push_back({b, (size_t) lay.blob_bytes(l)});
+            js.push_back({b, (size_t) lay.expert_bytes(l, e)});
         }
         m.stager->start(std::move(js));
         return true;
@@ -6353,12 +6353,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 if (resident(e) || m.src->pinned(l, e)) continue;
                 job_of[u] = (int) js.size();
                 if (pdirect || m.src->transient(l, e)) {
-                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                    js.push_back({nullptr, (size_t) lay.expert_bytes(l, e), m.src, (int32_t) l, e});
                     continue;
                 }
                 const uint8_t* b = m.src->blob_stable(l, e);
                 if (!b) { err = "prefill (layer-major): expert source has no blob"; return false; }
-                js.push_back({b, (size_t) lay.blob_bytes(l)});
+                js.push_back({b, (size_t) lay.expert_bytes(l, e)});
             }
             m.stager->start(std::move(js));
         }
@@ -6475,12 +6475,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             if (pinned && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
             if (pinned) {
-                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.expert_bytes(l, e), cudaMemcpyHostToDevice, m.copy);
                 ++stats_.experts_dma;
             } else {
                 m.stager->pass(job_of[u]);   // the prefetched jobs below it the routing skipped get no DMA
                 const uint8_t* hb = m.stager->wait(job_of[u]);
-                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.expert_bytes(l, e), cudaMemcpyHostToDevice, m.copy);
                 m.stager->issued_one(job_of[u], m.copy);
             }
             cudaEventRecord(m.copied[sl], m.copy);
@@ -6489,7 +6489,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             stats_.ms_experts_host += ms_since(tq);
             ++stats_.experts_streamed;
             ++lm_streamed;
-            lm_bytes += (uint64_t) lay.blob_bytes(l);
+            lm_bytes += (uint64_t) lay.expert_bytes(l, e);
             return true;
         };
         const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
