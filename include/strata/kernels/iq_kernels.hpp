@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "strata/kernels/tq_mix.hpp"   // QuantLab: per-expert trellis K (kTqMixedType, tq_mix_tag)
+
 namespace strata::kernels {
 
 /// ggml type ids handled here.

@@ -621,6 +621,21 @@ template<> struct TqInfo<146> { using block_t = block_tqk7; static constexpr int
 template<> struct TqInfo<147> { using block_t = block_tqp5; static constexpr int K = 5; };
 template<> struct TqInfo<148> { using block_t = block_tqp6; static constexpr int K = 6; };
 template<> struct TqInfo<149> { using block_t = block_tqp7; static constexpr int K = 7; };
+// QuantLab (per-expert K, v6 packs; tq_mix.hpp): the rates the Gyro SPEC names TQK5 (150) / TQK4 (151), and the local
+// pseudo ids 160 + K for K 2, 3, 9..12 (src/kernels/cpu/tq_cpu.hpp).  The same block, 2 + 4K bytes; tq_states4's
+// bitstream window holds for every K up to 12 (it needs r + 3K + 16 <= 64 bits: at most 61, K 11).  K 8 stays TQ2_T.
+template<int K> struct block_tq_any { uint16_t d; uint8_t qs[4 * K]; };
+template<> struct TqInfo<150> { using block_t = block_tq_any<5>; static constexpr int K = 5; };
+template<> struct TqInfo<151> { using block_t = block_tq_any<4>; static constexpr int K = 4; };
+template<> struct TqInfo<162> { using block_t = block_tq_any<2>; static constexpr int K = 2; };
+template<> struct TqInfo<163> { using block_t = block_tq_any<3>; static constexpr int K = 3; };
+template<> struct TqInfo<169> { using block_t = block_tq_any<9>; static constexpr int K = 9; };
+template<> struct TqInfo<170> { using block_t = block_tq_any<10>; static constexpr int K = 10; };
+template<> struct TqInfo<171> { using block_t = block_tq_any<11>; static constexpr int K = 11; };
+template<> struct TqInfo<172> { using block_t = block_tq_any<12>; static constexpr int K = 12; };
+// 10/26: K 13 and 14 (173, 174) for the v2 packs' down rows; tq_states4 reads their states one step at a time
+template<> struct TqInfo<173> { using block_t = block_tq_any<13>; static constexpr int K = 13; };
+template<> struct TqInfo<174> { using block_t = block_tq_any<14>; static constexpr int K = 14; };
 __device__ __forceinline__ float tq_h2f(uint32_t bits) { return __half2float(__ushort_as_half((unsigned short) bits)); }
 // the four unscaled weights of the step with state s: (a.x, a.y, b.x, b.y)
 __device__ __forceinline__ void tq_step(uint32_t s, float2& a, float2& b) {
@@ -654,6 +669,14 @@ __device__ __forceinline__ void tq_states4(const uint8_t* qs, int l, uint32_t s[
         // step t's state: the 16 stream bits from bit (31 - t)*K, circular over 2K u16 words; steps 4l..4l+3 all
         // lie in the four words from (28 - 4l)*K >> 4
         constexpr int K = TqInfo<TY>::K, nwords = 2 * K;
+        if constexpr (K > 12) {   // 10/26: four steps need up to r + 3K + 16 = 67 bits here; each step's 16 bits from its own two words
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int off = (31 - (4 * l + i)) * K, w0 = off >> 4, w1 = w0 + 1 >= nwords ? w0 + 1 - nwords : w0 + 1;
+                s[i] = (uint32_t) (((uint32_t) qs16[w0] | ((uint32_t) qs16[w1] << 16)) >> (off & 15)) & 0xFFFFu;
+            }
+            return;
+        }
         const int off3 = (28 - 4 * l) * K, wb = off3 >> 4, r = off3 & 15;
         const int wi1 = wb + 1 >= nwords ? wb + 1 - nwords : wb + 1;
         const int wi2 = wb + 2 >= nwords ? wb + 2 - nwords : wb + 2;
@@ -837,6 +860,14 @@ STRATA_TQP_FMT(147)
 STRATA_TQP_FMT(148)
 STRATA_TQP_FMT(149)
 #undef STRATA_TQP_FMT
+// QuantLab: the per-expert K rates (TqInfo above); only the mixed-layer kernels instantiate them (STRATA_TQ_MIX_KS)
+#define STRATA_TQ_MIX_FMT(T) template<> struct Fmt<T> { static constexpr int qk = 128, ipb = 8, step = 4; \
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_tq_q8_1<T>(v, y, kbx, iqs); } };
+STRATA_TQ_MIX_FMT(150) STRATA_TQ_MIX_FMT(151) STRATA_TQ_MIX_FMT(162) STRATA_TQ_MIX_FMT(163) STRATA_TQ_MIX_FMT(169)
+STRATA_TQ_MIX_FMT(170) STRATA_TQ_MIX_FMT(171) STRATA_TQ_MIX_FMT(172) STRATA_TQ_MIX_FMT(173) STRATA_TQ_MIX_FMT(174)
+#undef STRATA_TQ_MIX_FMT
+// K -> its type id, for every K a mixed layer may hold (K 8 is TQ2_T's own layout)
+#define STRATA_TQ_MIX_KS(X) X(2, 162) X(3, 163) X(4, 151) X(5, 150) X(6, 145) X(7, 146) X(8, 144) X(9, 169) X(10, 170) X(11, 171) X(12, 172) X(13, 173) X(14, 174)
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
@@ -1484,6 +1515,12 @@ template<> inline constexpr bool kSplit<149> = true;
 template<> struct Split<147> : SplitTqp<147> {};
 template<> struct Split<148> : SplitTqp<148> {};
 template<> struct Split<149> : SplitTqp<149> {};
+// QuantLab: the per-expert K rates
+#define STRATA_TQ_MIX_SPLIT(T) template<> inline constexpr bool kSplit<T> = true; template<> struct Split<T> : SplitTq<T> {};
+STRATA_TQ_MIX_SPLIT(150) STRATA_TQ_MIX_SPLIT(151) STRATA_TQ_MIX_SPLIT(162) STRATA_TQ_MIX_SPLIT(163)
+STRATA_TQ_MIX_SPLIT(169) STRATA_TQ_MIX_SPLIT(170) STRATA_TQ_MIX_SPLIT(171) STRATA_TQ_MIX_SPLIT(172)
+STRATA_TQ_MIX_SPLIT(173) STRATA_TQ_MIX_SPLIT(174)
+#undef STRATA_TQ_MIX_SPLIT
 
 // One row against the n <= NC activations x + off[0..n) (n >= 1, warp-uniform; offsets in q8_1 blocks, 32-bit to
 // spare registers), the whole warp.  Per activation this is row_dot: the same calls k, lane-strided the same way,
@@ -2429,6 +2466,100 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
     }
 }
 
+// ---------------------------------------------------------------- QuantLab: per-expert trellis K (v6 packs, tq_mix.hpp)
+// A mixed layer's groups each carry their expert's (K gate/up, K down) in the top byte of their blob pointer; one
+// launch per role, and each group's rows run that K's row_dot_multi.  The warp layout is native_gu_kernel's and
+// native_down_kernel's (a row per warp, 8 rows per block), the entries GRP_NC at a time as the multi kernels.
+template<int TY>
+__device__ __forceinline__ void tqmix_gu_rows(const uint8_t* wr, const block_q8_1* __restrict__ xq,
+                                              const int32_t* __restrict__ ent_tok, int e0, int e1, int xb, int nb,
+                                              int lane, float* __restrict__ dst, int64_t n_ff, int r) {
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        int off[GRP_NC];
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
+        float s[GRP_NC];
+        row_dot_multi<TY, GRP_NC>(wr, xq, off, n, nb, lane, s);
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c)
+            if (c < n && lane == c) dst[(size_t) (e + c) * n_ff + r] = s[c];
+    }
+}
+template<int TY>
+__device__ __forceinline__ void tqmix_down_rows(const uint8_t* wr, const block_q8_1* __restrict__ hq,
+                                                const int32_t* __restrict__ ent_dst, int e0, int e1, int hb, int nb,
+                                                int lane, float* __restrict__ out, int64_t n_embd, int r) {
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        int off[GRP_NC];
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
+        float s[GRP_NC];
+        row_dot_multi<TY, GRP_NC>(wr, hq, off, n, nb, lane, s);
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c)
+            if (c < n && lane == c) out[(size_t) ent_dst[e + c] * n_embd + r] = s[c];
+    }
+}
+
+__global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_tok,
+                                                              const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                              float* __restrict__ gate, float* __restrict__ up) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
+    if (row >= 2 * L.n_ff) return;
+    const bool is_up = row >= L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const int nb = (int) (L.n_embd / 128), xb = (int) (L.n_embd / 32);
+    float* dst = is_up ? up : gate;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const unsigned long long p = grp_ptr[g];
+        const int kg = (int) (p >> kTqTagShift) & 15;
+        const size_t gu_row = (size_t) nb * (size_t) (2 + 4 * kg);
+        const uint8_t* wr = (const uint8_t*) (p & kTqAddrMask) + (is_up ? gu_row * (size_t) L.n_ff : 0) + (size_t) r * gu_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        switch (kg) {   // block-uniform: one group per block row
+#define STRATA_TQ_MIX_GU(K, T) case K: tqmix_gu_rows<T>(wr, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r); break;
+            STRATA_TQ_MIX_KS(STRATA_TQ_MIX_GU)
+#undef STRATA_TQ_MIX_GU
+            default: break;   // (refused at startup: tq_mix_supported)
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                const int32_t* __restrict__ grp_start,
+                                                                const int32_t* __restrict__ n_groups,
+                                                                const int32_t* __restrict__ ent_dst,
+                                                                const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                                float* __restrict__ out) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * 8 + warp;
+    if (r >= L.n_embd) return;
+    const int nb = (int) (L.n_ff / 128), hb = (int) (L.n_ff / 32), nbg = (int) (L.n_embd / 128);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const unsigned long long p = grp_ptr[g];
+        const int kg = (int) (p >> kTqTagShift) & 15, kd = (int) (p >> (kTqTagShift + 4)) & 15;
+        const size_t gu_row = (size_t) nbg * (size_t) (2 + 4 * kg), d_row = (size_t) nb * (size_t) (2 + 4 * kd);
+        const uint8_t* wr = (const uint8_t*) (p & kTqAddrMask) + 2 * gu_row * (size_t) L.n_ff + (size_t) r * d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        switch (kd) {
+#define STRATA_TQ_MIX_DOWN(K, T) case K: tqmix_down_rows<T>(wr, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r); break;
+            STRATA_TQ_MIX_KS(STRATA_TQ_MIX_DOWN)
+#undef STRATA_TQ_MIX_DOWN
+            default: break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- EXPDEC (STRATA_EXPDEC=1): the group's activations
 // in shared memory, R rows per lane
 //
@@ -3320,6 +3451,17 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 147: dq_tqp<147>(vx, ibs, y, tid); break;
         case 148: dq_tqp<148>(vx, ibs, y, tid); break;
         case 149: dq_tqp<149>(vx, ibs, y, tid); break;
+        // QuantLab: the per-expert K rates (a mixed layer's prompt path dequantizes each expert by its own type)
+        case 150: dq_tq<150>(vx, ibs, y, tid); break;
+        case 151: dq_tq<151>(vx, ibs, y, tid); break;
+        case 162: dq_tq<162>(vx, ibs, y, tid); break;
+        case 163: dq_tq<163>(vx, ibs, y, tid); break;
+        case 169: dq_tq<169>(vx, ibs, y, tid); break;
+        case 170: dq_tq<170>(vx, ibs, y, tid); break;
+        case 171: dq_tq<171>(vx, ibs, y, tid); break;
+        case 172: dq_tq<172>(vx, ibs, y, tid); break;
+        case 173: dq_tq<173>(vx, ibs, y, tid); break;
+        case 174: dq_tq<174>(vx, ibs, y, tid); break;
         default: break;
     }
 }
@@ -3359,6 +3501,9 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
+    // QuantLab: the per-expert K rates (dq_dispatch only; no grouped or MMVQ kernel lists them, so
+    // native_expert_supported still refuses them as a layer's one format)
+    if (t == 150 || t == 151 || t == 162 || t == 163 || (t >= 169 && t <= 174)) return true;
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149;
@@ -6262,6 +6407,21 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         std::exit(1);
     }
 #endif
+    if (L.gu_type == kTqMixedType) {   // QuantLab: a layer of per-expert trellis K (tq_mix.hpp), its own three passes
+        const int64_t gyq = (grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+        const dim3 gq((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gyq);
+        native_gu_tqmix_kernel<<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        check("native_expert_grouped/gu (per-expert K)");
+        const long long nhq = (long long) cap_entries * L.n_ff;
+        swiglu_entries_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(gate, up, h, nhq);
+        if (L.had_block > 0) hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
+        quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
+        check("native_expert_grouped/swiglu (per-expert K)");
+        const dim3 gdq((unsigned) ((L.n_embd + 7) / 8), (unsigned) gyq);
+        native_down_tqmix_kernel<<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        check("native_expert_grouped/down (per-expert K)");
+        return;
+    }
     // STRATA_EXPERT_NIBBLE (nib_layout): only the gate/up step below takes another kernel (launch_gu_nib, in place of
     // launch_gu); SwiGLU, the q8_1 quantization and the down rows (GGUF, at L.down_off) are the layout's own
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
