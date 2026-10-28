@@ -38,9 +38,12 @@ inline constexpr int kTqTypeK5X = 224;   ///< version 2: K = 5 with the computed
 inline constexpr int kTqTypeK4X = 225;   ///< version 2: K = 4, computed codebook
 inline constexpr int kTqTypeK5T = 226;   ///< version 1: K = 5 with the fork's point table (the first pilots)
 inline constexpr int kTqTypeK4T = 227;   ///< version 1: K = 4, point table
-/// TQ2_T (144), TQK6 (145), TQK7 (146) and the experimental TQK5X / TQK4X / TQK5T / TQK4T.
+/// QuantLab: local-only trellis types kTqPseudoBase + K (K = 2, 3, 9..14) for the rates the Gyro SPEC has no id for.
+inline constexpr int kTqPseudoBase = 160;
+/// TQ2_T (144), TQK6 (145), TQK7 (146), TQP5/6/7 (147..149), the experimental TQK5X / TQK4X / TQK5T / TQK4T, and QuantLab's
+/// TQK5 (150), TQK4 (151) and pseudo types kTqPseudoBase + K.
 bool tq_supported(int ggml_type) noexcept;
-/// Bits per step: 8, 6, 7, 5, 4 (0 for any other type).
+/// Bits per step: 8, 6, 7, 5, 4, or K of a QuantLab pseudo type (0 for any other type).
 int tq_kbits(int ggml_type) noexcept;
 /// Values per block of the trellis types, and bytes per block (2 + 4 * bits: 34, 26, 30, 22, 18).
 constexpr int kTqBlock = 128;

@@ -8,11 +8,34 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::kernels::cpu::tq_detail {
 
 inline constexpr uint32_t kTqStateMask = 0x7fffu;
+
+// QuantLab (per-expert K): the kernels are templates on K; this dispatches a run-time K in 2..12 (K = 8 is TQ2_T, the
+// rest the circular TQK bitstream - the layout of TQK4..TQK7, Gyro SPEC 3.2, which the code below reads for any K in
+// 2..16) and aborts on anything else instead of the old silent fall-back to K = 7.
+#define STRATA_TQ_DISPATCH_K(KB_, FN_, ...)                                                                  \
+    switch (KB_) {                                                                                          \
+        case 2: FN_<2>(__VA_ARGS__); break;                                                                 \
+        case 3: FN_<3>(__VA_ARGS__); break;                                                                 \
+        case 4: FN_<4>(__VA_ARGS__); break;                                                                 \
+        case 5: FN_<5>(__VA_ARGS__); break;                                                                 \
+        case 6: FN_<6>(__VA_ARGS__); break;                                                                 \
+        case 7: FN_<7>(__VA_ARGS__); break;                                                                 \
+        case 8: FN_<8>(__VA_ARGS__); break;                                                                 \
+        case 9: FN_<9>(__VA_ARGS__); break;                                                                 \
+        case 10: FN_<10>(__VA_ARGS__); break;                                                               \
+        case 11: FN_<11>(__VA_ARGS__); break;                                                               \
+        case 12: FN_<12>(__VA_ARGS__); break;                                                               \
+        case 13: FN_<13>(__VA_ARGS__); break;                                                               \
+        case 14: FN_<14>(__VA_ARGS__); break;                                                               \
+        default: std::fprintf(stderr, "strata: trellis K=%d is not supported\n", (int) (KB_)); std::abort(); \
+    }
 
 inline uint32_t tq_ld32(const uint8_t* p) {
     uint32_t v;

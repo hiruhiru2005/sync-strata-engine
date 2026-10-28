@@ -87,11 +87,7 @@ void rows_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, con
 
 void tq_rows_avx512(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1) {
-    if (kb == 8) rows_t<8>(table, w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 6) rows_t<6>(table, w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 5) rows_t<5>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK5X
-    else if (kb == 4) rows_t<4>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK4X
-    else rows_t<7>(table, w, row_bytes, n, a, nt, out, r0, r1);
+    STRATA_TQ_DISPATCH_K(kb, rows_t, table, w, row_bytes, n, a, nt, out, r0, r1)
 }
 
 }  // namespace strata::kernels::cpu::tq_detail

@@ -529,10 +529,65 @@ int bench(bool quick, const std::string& only) {
     return 0;
 }
 
+// QuantLab: `--vectors FILE` - the kernels for K 2..12 (the SPEC ids and the pseudo ids kTqPseudoBase + K) against
+// rows decoded by QuantLab's Python reader (tools/tq_vectors.py: "TQV1", a count, then per K: K, type, rows, width,
+// row bytes, the rows, one Q8_0 activation, and w_r . a in double).  ggml has no such types, so this is their only
+// reference.
+int vectors(const char* path) {
+    FILE* fp = std::fopen(path, "rb");
+    if (!fp) { std::fprintf(stderr, "cannot open %s\n", path); return 1; }
+    char magic[4] = {};
+    int count = 0, fails = 0;
+    if (std::fread(magic, 1, 4, fp) != 4 || std::memcmp(magic, "TQV1", 4) != 0 || std::fread(&count, 4, 1, fp) != 1) {
+        std::fprintf(stderr, "%s: not a TQV1 file\n", path);
+        std::fclose(fp);
+        return 1;
+    }
+    for (int c = 0; c < count; ++c) {
+        int h[5];
+        if (std::fread(h, 4, 5, fp) != 5) { std::fprintf(stderr, "%s: truncated\n", path); ++fails; break; }
+        const int K = h[0], type = h[1], m = h[2], n = h[3], rb = h[4];
+        std::vector<uint8_t> w((size_t) m * (size_t) rb), act((size_t) n / 32 * 34);
+        std::vector<double> ref((size_t) m);
+        if (std::fread(w.data(), 1, w.size(), fp) != w.size() || std::fread(act.data(), 1, act.size(), fp) != act.size() ||
+            std::fread(ref.data(), 8, ref.size(), fp) != ref.size()) {
+            std::fprintf(stderr, "%s: truncated at K %d\n", path, K);
+            ++fails;
+            break;
+        }
+        const bool known = tq_kbits(type) == K && tq_block_bytes(type) * (size_t) (n / kTqBlock) == (size_t) rb;
+        if (!known) { std::printf("K %2d type %d: the engine does not know this type as K %d  FAIL\n", K, type, K); ++fails; continue; }
+        double scale = 0;
+        for (double r : ref) scale += std::fabs(r);
+        scale /= (double) m;
+        for (TqIsa isa : {TqIsa::scalar, TqIsa::avx2, TqIsa::avx512}) {
+            if (!tq_isa_ok(isa)) continue;
+            std::vector<float> out((size_t) m, std::nanf(""));
+            const void* ap[1] = {act.data()};
+            float* op[1] = {out.data()};
+            tq_rows(isa, type, w.data(), (size_t) rb, n, ap, 1, op, 0, m);
+            double worst = 0;
+            for (int r = 0; r < m; ++r) worst = std::max(worst, std::fabs((double) out[(size_t) r] - ref[(size_t) r]));
+            if (!(worst == worst)) worst = INFINITY;
+            const bool ok = worst <= 1e-4 * scale;
+            std::printf("K %2d type %3d %-7s: worst |err| %.2e = %.1e of mean |w.a| %.3f  %s\n", K, type, tq_isa_name(isa),
+                        worst, worst / scale, scale, ok ? "ok" : "FAIL");
+            fails += !ok;
+        }
+    }
+    std::fclose(fp);
+    return fails;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     ggml_cpu_init();
+    if (argc == 3 && std::strcmp(argv[1], "--vectors") == 0) {
+        const int f = vectors(argv[2]);
+        std::printf("%d failures\n", f);
+        return f ? 1 : 0;
+    }
     if (GGML_TYPE_COUNT <= 146) {
         std::fprintf(stderr, "this ggml has no trellis types (build with STRATA_GGML_DIR = the agention llama.cpp fork): skipped\n");
         return 77;   // ctest SKIP_RETURN_CODE: a plain ggml is not a failure (#3358)

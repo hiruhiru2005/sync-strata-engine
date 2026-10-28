@@ -29,7 +29,12 @@
 namespace strata::kernels::cpu {
 namespace {
 
-const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
+// ggml indexes its type table by the id: an id past the table (a pack with a type this ggml lacks, or a QuantLab
+// pseudo type outside K 2..12) is "no such type", never a read past the table.
+const ggml_type_traits_cpu* traits(int type) {
+    if (type < 0 || type >= (int) GGML_TYPE_COUNT) return nullptr;
+    return ggml_get_type_traits_cpu((ggml_type) type);
+}
 
 // Do the trellis rows take Strata's own kernels (tq_cpu.hpp)?  Always, unless STRATA_NO_TQ_KERNELS=1 asks for ggml-cpu's
 // vec_dot AND this ggml has the type (the agentionai fork; an upstream ggml does not, and must never be asked about it).

@@ -139,16 +139,21 @@ const int16_t* tq_state_table_for(int t) { return (t == kTqTypeK5X || t == kTqTy
 
 bool tq_supported(int t) noexcept {
     return t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149 ||
-           t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T;
+           t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T ||
+           t == 150 || t == 151 || (t >= kTqPseudoBase + 2 && t <= kTqPseudoBase + 14 && tq_kbits(t) != 0);   // QuantLab
 }
 
+// QuantLab: 150 TQK5 and 151 TQK4 (the Gyro SPEC ids) and the local-only pseudo types kTqPseudoBase + K for the rates
+// the SPEC has no id for (K 2, 3, 9..14; never handed to ggml).  Upstream's 147..149 (TQP5/6/7) and 224..227 are kept.
 int tq_kbits(int t) noexcept {
     if (t == 148) return 6;                                   // TQP6
     if (t == 144) return 8;
     if (t == 146 || t == 149) return 7;
     if (t == 145) return 6;
-    if (t == 147 || t == kTqTypeK5X || t == kTqTypeK5T) return 5;
-    if (t == kTqTypeK4X || t == kTqTypeK4T) return 4;
+    if (t == 147 || t == kTqTypeK5X || t == kTqTypeK5T || t == 150) return 5;
+    if (t == kTqTypeK4X || t == kTqTypeK4T || t == 151) return 4;
+    const int k = t - kTqPseudoBase;
+    if ((k >= 2 && k <= 3) || (k >= 9 && k <= 14)) return k;   // QuantLab, 10/26: K 13, 14 (v2 packs' down rows)
     return 0;
 }
 
@@ -201,11 +206,7 @@ void unpack_act(const void* q8_0, int n, TqAct& a) {
 
 void tq_rows_scalar(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1) {
-    if (kb == 8) rows_scalar_t<8>(tab, w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 6) rows_scalar_t<6>(tab, w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 5) rows_scalar_t<5>(tab, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK5X / TQK5T
-    else if (kb == 4) rows_scalar_t<4>(tab, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK4X / TQK4T
-    else rows_scalar_t<7>(tab, w, row_bytes, n, a, nt, out, r0, r1);
+    STRATA_TQ_DISPATCH_K(kb, rows_scalar_t, tab, w, row_bytes, n, a, nt, out, r0, r1)
 }
 
 void tq_rows_scalar_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
