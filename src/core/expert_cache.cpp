@@ -776,6 +776,11 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
+    if ((uint64_t) n > slot_room(slot)) {   // QuantLab v6: a slot sized for one expert never takes a larger one
+        err = "ExpertCache::fill_slot: the blob (" + std::to_string(n) + " bytes) is larger than slot " + std::to_string(slot) +
+              " (" + std::to_string(slot_room(slot)) + " bytes)";
+        return false;
+    }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
                                           (cudaStream_t) stream);
     if (e != cudaSuccess) {
@@ -796,6 +801,11 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     }
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
+        return false;
+    }
+    if ((uint64_t) n > slot_room(slot)) {   // QuantLab v6: a slot sized for one expert never takes a larger one
+        err = "ExpertCache::fill_slot_blocking: the blob (" + std::to_string(n) + " bytes) is larger than slot " + std::to_string(slot) +
+              " (" + std::to_string(slot_room(slot)) + " bytes)";
         return false;
     }
 #if defined(STRATA_USE_HIP)
@@ -825,6 +835,11 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
                              : "ExpertCache::fill_slot_queued: the host blob is null";
+        return false;
+    }
+    if ((uint64_t) n > slot_room(slot)) {   // QuantLab v6: a slot sized for one expert never takes a larger one
+        err = "ExpertCache::fill_slot_queued: the blob (" + std::to_string(n) + " bytes) is larger than slot " + std::to_string(slot) +
+              " (" + std::to_string(slot_room(slot)) + " bytes)";
         return false;
     }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
