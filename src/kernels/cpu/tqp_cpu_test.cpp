@@ -34,11 +34,19 @@ void fail(const char* what, int a = 0, int b = 0) {
 }
 
 // ---- the type predicates as they were before the pair types (the old formulas, copied)
+// QuantLab: TQK5 (150), TQK4 (151) and the local pseudo types kTqPseudoBase + K (K 2, 3, 9..14) are trellis types too
+int ql_kbits(int t) {
+    if (t == 150) return 5;
+    if (t == 151) return 4;
+    const int k = t - kTqPseudoBase;
+    return ((k >= 2 && k <= 3) || (k >= 9 && k <= 14)) ? k : 0;
+}
 bool old_supported(int t) {
-    return t == 144 || t == 145 || t == 146 || t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T;
+    return t == 144 || t == 145 || t == 146 || t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T ||
+           ql_kbits(t) != 0;
 }
 int old_kbits(int t) {
-    return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : (t == kTqTypeK5X || t == kTqTypeK5T) ? 5 : (t == kTqTypeK4X || t == kTqTypeK4T) ? 4 : 0;
+    return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : (t == kTqTypeK5X || t == kTqTypeK5T) ? 5 : (t == kTqTypeK4X || t == kTqTypeK4T) ? 4 : ql_kbits(t);
 }
 
 void check_predicates() {
