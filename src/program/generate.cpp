@@ -455,6 +455,25 @@ static bool ql_swap_mixed() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_SWAP_MIXED"); return v && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (10/29): the elastic K/V beside the resident RAM mode, STRATA_QL_KV_GROW_RESIDENT=1 with --kv-grow (opt-in).
+// The K/V maps only the cells the requests reach, so the expert cache is sized on the rest of the VRAM at start; the slots
+// the K/V takes back as a conversation grows give their experts to the RAM copy, each in the place of a colder expert of
+// its layer and own size that only RAM holds (that one is then read from the drive): the RAM copy does not grow.
+// STRATA_QL_KV_GROW_DEMOTE=0 (A/B): the given-back experts themselves are read from the drive.  STRATA_QL_KV_GROW_MOVES=0
+// (A/B): no hotter expert moves into a colder one's slot of the prompt path's loan (the slots just below the loan give
+// up their own experts).  Unset: --kv-grow is refused with the resident RAM mode, as upstream.
+static bool ql_kv_grow_resident() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_KV_GROW_RESIDENT"); return v && std::atoi(v) != 0; }();
+    return on;
+}
+static bool ql_kv_grow_demote() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_KV_GROW_DEMOTE"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+static bool ql_kv_grow_moves() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_KV_GROW_MOVES"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
 // The adaptive tier's pairs for layer `l`: `cand` (not in the GPU tier: usage, expert) and `vict` (in it), the best
 // candidate against the coldest victim while the gain clears `min_gain`; push(gain, in, out) for each pair.  Every
 // layer that is not mixed pairs exactly as the tier always did.
@@ -5916,14 +5935,46 @@ int main(int argc, char** argv) {
             bool remote = false;
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
+            // QuantLab (10/29): STRATA_QL_KV_GROW_RESIDENT=1 lets the resident RAM mode have it too - the experts the cache
+            // gives up go into the RAM copy (kvg_ensure's ql_demote), or are read from the drive.  Unset: refused, as upstream.
+            const bool ql_res = ql_kv_grow_resident() && o.resident_cpu_experts;
             const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
-                            !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
+                            !o.expert_profile.empty() && (!o.resident_cpu_experts || ql_res) && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
                             o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
+            if (ql_kv_grow_resident()) {   // QuantLab (10/29): what decided, one line
+                if (!asked)
+                    std::fprintf(stderr, "strata generate: QuantLab: STRATA_QL_KV_GROW_RESIDENT=1 does nothing without --kv-grow "
+                                         "(or STRATA_KV_GROW=1)\n");
+                else if (on)
+                    std::fprintf(stderr, "strata generate: QuantLab: elastic K/V %s; CUDA virtual memory: available (%llu KiB "
+                                         "chunks)\n",
+                                 ql_res ? "beside the resident RAM mode (STRATA_QL_KV_GROW_RESIDENT=1)"
+                                        : "as upstream (not the resident RAM mode: STRATA_QL_KV_GROW_RESIDENT changes nothing)",
+                                 (unsigned long long) (strata::core::vmm_granularity() >> 10));
+                else {
+                    std::string why;
+                    auto add = [&why](bool bad, const char* w) {
+                        if (bad) why += (why.empty() ? "" : "; ") + std::string(w);
+                    };
+                    add(multi_gpu, "a layer split");
+                    add(o.kv_resident > 0, "--kv-resident (KV streaming)");
+                    add(o.expert_profile.empty(), "no --expert-profile");
+                    add(o.expert_cache == 0, "--expert-cache 0");
+                    add(remote, "helper expert caches on other GPUs");
+                    add(!strata::core::vmm_available(), "CUDA virtual memory: NOT available on this GPU or driver (cuMemCreate / "
+                                                        "cuMemMap; CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED)");
+                    add(o.batch != 0, "--batch");
+                    add(o.vram_elastic, "--vram-elastic");
+                    add(o.peer_device >= 0, "--peer-device");
+                    std::fprintf(stderr, "strata generate: QuantLab: STRATA_QL_KV_GROW_RESIDENT=1: the elastic K/V stays off: %s\n",
+                                 why.empty() ? "(no reason found)" : why.c_str());
+                }
+            }
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
@@ -8776,6 +8827,10 @@ int main(int argc, char** argv) {
         int64_t cells = 0;                // what every K/V pool holds now
         std::vector<strata::core::VmmChunk> spare;   // out of the cache, not (yet) in the K/V
         int64_t grows = 0, trims = 0, fresh = 0, evicted = 0, refilled = 0;
+        // QuantLab (10/29), STRATA_QL_KV_GROW_RESIDENT=1 with the resident RAM mode: `ql` the QuantLab steps of kvg_ensure /
+        // kvg_trim, `demote` the given-back experts go into the RAM copy, `moves` hotter experts move into colder slots
+        bool ql = false, demote = false, moves = true;
+        int64_t ql_demoted = 0, ql_in_ram = 0, ql_on_file = 0;   // the experts given back, by where they are read from
     } kvg;
     auto kvg_start = [&](int64_t top) {
         kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
@@ -8792,6 +8847,58 @@ int main(int argc, char** argv) {
                      (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
                      (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0, (long long) xcache.slots(),
                      (long long) top);
+        // QuantLab (10/29): beside the resident RAM mode, say what the K/V not mapped yet gave the cache, and how far the
+        // K/V can grow from the cache's slots below the loan (past that it maps new VRAM, which may not be there)
+        kvg.ql = ql_kv_grow_resident() && o.resident_cpu_experts;
+        if (kvg.ql) {
+            kvg.demote = ql_kv_grow_demote() && srcp == &src && src.complement_ready();
+            kvg.moves = ql_kv_grow_moves();
+            const uint64_t G = strata::core::vmm_granularity();
+            const uint64_t mapped = strata::core::qsa_kv_elastic_mapped_bytes();
+            const uint64_t full = strata::core::qsa_kv_elastic_full_bytes();
+            const uint64_t unmapped = full > mapped ? full - mapped : 0;
+            int64_t extra = 0;   // the cache's last (coldest) slots that the K/V's unmapped bytes hold
+            uint64_t extra_b = 0;
+            for (int64_t s = xcache.slots() - 1; s >= 0 && extra_b + xcache.slot_room((int32_t) s) <= unmapped; --s) {
+                extra_b += xcache.slot_room((int32_t) s);
+                ++extra;
+            }
+            // the chunks the cache can give: wholly inside the slots [floor, top), all mapped now
+            const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.floor) + G - 1) / G);
+            const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+            const int64_t room = std::max<int64_t>(0, c1 - c0);
+            auto target_of = [&](int64_t k) {   // kvg_ensure's target for k steps of cells
+                return std::min<int64_t>(o.max_context, k * kvg.step);
+            };
+            int64_t reach = kvg.cells;
+            {   // the largest target whose unmapped chunks the cache can give (the need rises with the cells)
+                int64_t lo = 1, hi = (o.max_context + kvg.step - 1) / kvg.step;
+                while (lo <= hi) {
+                    const int64_t mid = lo + (hi - lo) / 2;
+                    if (strata::core::qsa_kv_elastic_need(target_of(mid)) <= room) {
+                        reach = std::max<int64_t>(reach, target_of(mid));
+                        lo = mid + 1;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+            }
+            std::fprintf(stderr, "strata generate: QuantLab: elastic K/V beside the resident RAM mode: the %.2f GiB of K/V not "
+                                 "mapped yet hold ~%lld expert slots (%.2f GiB, the cache's coldest) until the context needs "
+                                 "them; the %lld slots below the loan (%.2f GiB) let the K/V reach %lld of %lld cells; the "
+                                 "experts given back %s%s\n",
+                         (double) unmapped / 1073741824.0, (long long) extra, (double) extra_b / 1073741824.0,
+                         (long long) (kvg.top - kvg.floor), (double) ((uint64_t) room * G) / 1073741824.0, (long long) reach,
+                         (long long) o.max_context,
+                         kvg.demote ? "go into the RAM copy in place of colder ones (the copy does not grow)"
+                                    : "are read from the drive (STRATA_QL_KV_GROW_DEMOTE=0, or no RAM copy)",
+                         kvg.moves ? "" : "; no moves into colder slots (STRATA_QL_KV_GROW_MOVES=0)");
+            if (reach < o.max_context)
+                std::fprintf(stderr, "strata generate: QuantLab: WARNING: past %lld cells the K/V needs more VRAM than the cache "
+                                     "can give below the prompt path's loan: it maps new VRAM, and the engine stops (\"the K/V "
+                                     "cannot grow\") when there is none - a smaller --max-context or prompt chunk keeps it inside\n",
+                             (long long) reach);
+        }
     };
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
@@ -8823,6 +8930,54 @@ int main(int argc, char** argv) {
             for (int64_t c = c0; c < c1; ++c) k += r.mapped(c) ? 1 : 0;
             return k;
         };
+        // QuantLab (10/29), STRATA_QL_KV_GROW_RESIDENT: the resident RAM copy holds only the experts no slot held at start,
+        // so an expert given up here is read from the drive unless it goes into the copy.  ql_demote(i, slot): expert `i`,
+        // whose bytes are still in `slot` (read back before the slot is overwritten or unmapped), takes the place of the
+        // coldest expert of its layer and own size that only the copy holds, when that one is colder (it is then read from
+        // the drive, as the file tier's experts are).  The copy does not grow; the PCIe share and pinned() follow the place.
+        std::vector<std::vector<std::pair<float, int32_t>>> ql_victims;   // per layer: (heat, expert) only RAM holds, hottest first
+        std::vector<uint8_t> ql_buf;
+        int64_t q_demoted = 0, q_in_ram = 0, q_on_file = 0;
+        double q_ms = 0;
+        auto ql_demote = [&](int32_t i, int32_t slot) {
+            const int64_t l = i / g.n_expert, e = i % g.n_expert;
+            if (srcp == &src && src.has_resident(l, e)) { ++q_in_ram; return; }   // in the copy already (a lend slot's, ...)
+            if (!kvg.demote) { ++q_on_file; return; }
+            const auto t0 = Clock::now();
+            if (ql_victims.empty()) {
+                ql_victims.resize((size_t) g.n_layers);
+                for (int64_t vl = 0; vl < g.n_layers; ++vl)
+                    for (int64_t ve = 0; ve < g.n_expert; ++ve) {
+                        const size_t vi = (size_t) (vl * g.n_expert + ve);
+                        if (host_res[vi] < 0 && src.has_resident(vl, ve))
+                            ql_victims[(size_t) vl].emplace_back(heat((int32_t) vi), (int32_t) ve);
+                    }
+                for (auto& v : ql_victims)
+                    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            }
+            auto& vic = ql_victims[(size_t) l];
+            const uint64_t own = lay.expert_bytes(l, e);
+            const float h = heat(i);
+            bool done = false;
+            for (int64_t k = (int64_t) vic.size() - 1; k >= 0 && vic[(size_t) k].first < h; --k) {   // coldest first
+                const int32_t ve = vic[(size_t) k].second;
+                if (lay.expert_bytes(l, ve) != own) continue;   // a place packed by own size takes one size (fes_pack)
+                if (ql_buf.size() < (size_t) own) ql_buf.resize((size_t) own);
+                nib::guard_raw(l, "the elastic K/V's copy back (QuantLab ql_demote)");
+                // synchronous, on the legacy stream: after any move queued before it, and done before the slot changes.  A
+                // failed read leaves the expert to the drive (a device fault stays for the synchronize below)
+                if (cudaMemcpy(ql_buf.data(), xcache.device_slot(slot), (size_t) own, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    break;
+                }
+                if (!src.ql_take_into_ram(l, e, ve, ql_buf.data(), own)) break;
+                vic.erase(vic.begin() + (ptrdiff_t) k);
+                done = true;
+                break;
+            }
+            ++(done ? q_demoted : q_on_file);
+            q_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        };
         while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
             if (owner.empty()) {
                 owner.assign((size_t) xcache.slots(), -1);
@@ -8840,7 +8995,32 @@ int main(int argc, char** argv) {
             if (const int32_t oi = owner[(size_t) kvg.lo]; oi >= 0) {
                 const int64_t layer = oi / g.n_expert;
                 int32_t vi = -1;
-                if (!cold.empty() && cold.back().first < heat(oi)) {
+                if (kvg.ql) {
+                    // QuantLab (10/29): slots sized per expert - the coldest resident of the loan region whose slot holds this
+                    // expert (upstream tries the coldest alone, and gives this one up when that slot is too small).  The one
+                    // moved out leaves for the RAM copy before its slot is overwritten.
+                    const uint64_t own = lay.expert_bytes(layer, oi % g.n_expert);
+                    const float h = heat(oi);
+                    int64_t ci = kvg.moves ? (int64_t) cold.size() - 1 : -1;
+                    while (ci >= 0 && cold[(size_t) ci].first < h &&
+                           xcache.slot_room(host_res[(size_t) cold[(size_t) ci].second]) < own)
+                        --ci;
+                    if (ci >= 0 && cold[(size_t) ci].first < h) {
+                        const int32_t ci_i = cold[(size_t) ci].second;
+                        const int32_t vs = host_res[(size_t) ci_i];
+                        nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
+                        ql_demote(ci_i, vs);
+                        if (cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo), (size_t) own,
+                                       cudaMemcpyDeviceToDevice) == cudaSuccess) {
+                            vi = ci_i;
+                            cold.erase(cold.begin() + (ptrdiff_t) ci);
+                            host_res[(size_t) oi] = vs;
+                            host_res[(size_t) vi] = strata::core::kNotResident;
+                            ++moved;
+                        }
+                    }
+                    if (vi < 0) ql_demote(oi, (int32_t) kvg.lo);   // its bytes stay in slot lo until the unmap below
+                } else if (!cold.empty() && cold.back().first < heat(oi)) {
                     vi = cold.back().second;
                     const int32_t vs = host_res[(size_t) vi];
                     nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
@@ -8900,6 +9080,17 @@ int main(int argc, char** argv) {
                      (long long) gave, (long long) moved, (long long) (kvg.lo + (xcache.slots() - kvg.top)),
                      (long long) xcache.slots(),
                      fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
+        if (kvg.ql && q_demoted + q_in_ram + q_on_file > 0) {   // QuantLab (10/29): where the experts given up are read now
+            kvg.ql_demoted += q_demoted;
+            kvg.ql_in_ram += q_in_ram;
+            kvg.ql_on_file += q_on_file;
+            std::fprintf(stderr, "strata: QuantLab: the %lld experts the cache gave up: %lld went into the RAM copy (as many "
+                                 "colder ones are read from the drive now; %.0f ms), %lld were in RAM already, %lld are read "
+                                 "from the drive; since the start %lld / %lld / %lld\n",
+                         (long long) (q_demoted + q_in_ram + q_on_file), (long long) q_demoted, q_ms, (long long) q_in_ram,
+                         (long long) q_on_file, (long long) kvg.ql_demoted, (long long) kvg.ql_in_ram,
+                         (long long) kvg.ql_on_file);
+        }
         if (!ok)
             std::fprintf(stderr, "strata: the K/V could not grow to %lld cells (%s)\n", (long long) target,
                          cudaGetErrorString(cudaGetLastError()));
@@ -8945,8 +9136,51 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         std::vector<std::pair<size_t, int32_t>> filled;   // (residency index, slot), resident once the copies landed
         size_t pi = 0;
+        std::vector<size_t> ql_skipped;   // QuantLab (10/29): profile pairs too large for an earlier slot, tried again
+        std::vector<uint8_t> ql_used;     // ...and the pairs taken (a profile listing a pair twice fills one slot)
+        int64_t q_ram = 0, q_file = 0;
+        if (kvg.ql) ql_used.assign(host_res.size(), 0);
         for (int64_t s = lo0; s < kvg.lo; ++s) {
             const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
+            if (kvg.ql) {
+                // QuantLab (10/29): slots sized per expert - a pair too large for this slot is tried again for the next ones
+                // (upstream passes it for good), so each slot takes the hottest pair the GPU does not hold that fits it.  A
+                // blob read from the drive sits in a stage buffer: note_async_read keeps it until the copy lands (#1237).
+                for (;;) {
+                    size_t pick = SIZE_MAX;
+                    for (size_t k = 0; k < ql_skipped.size() && pick == SIZE_MAX; ++k) {
+                        const size_t pk = ql_skipped[k];
+                        if (ql_used[(size_t) profile[pk].first * (size_t) g.n_expert + (size_t) profile[pk].second] == 0 &&
+                            lay.expert_bytes(profile[pk].first, profile[pk].second) <= room) {
+                            pick = pk;
+                            ql_skipped.erase(ql_skipped.begin() + (ptrdiff_t) k);
+                        }
+                    }
+                    while (pick == SIZE_MAX && pi < profile.size()) {
+                        const size_t pk = pi++;
+                        const int32_t pl = profile[pk].first, pe = profile[pk].second;
+                        const size_t pidx = (size_t) pl * (size_t) g.n_expert + (size_t) pe;
+                        if (host_res[pidx] >= 0 || ql_used[pidx] != 0) continue;
+                        if (lay.expert_bytes(pl, pe) > room) ql_skipped.push_back(pk);
+                        else pick = pk;
+                    }
+                    if (pick == SIZE_MAX) break;   // nothing left fits: the slot stays empty until the K/V takes it again
+                    const int32_t l = profile[pick].first, e = profile[pick].second;
+                    const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                    ql_used[i] = 1;
+                    const uint8_t* b = srcp->blob_stable(l, e);
+                    if (b == nullptr) continue;
+                    const bool from_ram = srcp == &src && src.has_resident(l, e);
+                    nib::guard_raw(l, "the elastic K/V's refill (kvg_trim)");
+                    cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.expert_bytes(l, e), cudaMemcpyHostToDevice,
+                                    nullptr);
+                    srcp->note_async_read(b, nullptr);
+                    filled.emplace_back(i, (int32_t) s);
+                    ++(from_ram ? q_ram : q_file);
+                    break;
+                }
+                continue;
+            }
             for (; pi < profile.size(); ++pi) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
@@ -8974,6 +9208,10 @@ int main(int argc, char** argv) {
         ++kvg.trims;
         std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
                              "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+        if (kvg.ql)   // QuantLab (10/29): where the refills came from (a given-back expert in the RAM copy stays there too)
+            std::fprintf(stderr, "strata: QuantLab: K/V trim: %zu of those slots refilled with the hottest experts the GPU "
+                                 "did not hold that fit them, %lld from the RAM copy, %lld from the drive\n",
+                         filled.size(), (long long) q_ram, (long long) q_file);
         return true;
     };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
@@ -14950,13 +15188,23 @@ int main(int argc, char** argv) {
                         // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
+                        // QuantLab (10/29): beside the resident RAM mode the elastic K/V may hold the slots just below the auto
+                        // loan (kvg_start's `top`); a loan #2090 starts earlier would lay prompt buffers over the chunks the
+                        // K/V took (unmapped there), so the chunk is halved until the loan starts at or above `top`
+                        const bool ql_kv = kvg.on && kvg.ql && p.cache == &xcache && kvg.lo < kvg.top;
                         int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                        while ((need_p <= 0 || need_p + 128 > p.cache->slots() ||
+                                (ql_kv && p.cache->slots() - need_p < kvg.top)) && want_p > 256) {
                             want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             need_p = part_slots(p, want_p);
                         }
                         if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
+                            return false;
+                        }
+                        if (ql_kv && p.cache->slots() - need_p < kvg.top) {
+                            e = "prefill: no chunk of this request fits the slots the elastic K/V leaves to the prompt path "
+                                "(QuantLab, STRATA_QL_KV_GROW_RESIDENT)";
                             return false;
                         }
                         if (want_p != want)
