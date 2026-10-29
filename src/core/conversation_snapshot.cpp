@@ -767,4 +767,34 @@ void conversation_park_join_for(const SavedConversation& image) {
     if (hits < image.kv.size()) conversation_park_join();
 }
 
+// QuantLab (10/29): streamed session files (STRATA_QL_SESSION_STREAM=1) - conversation_kv_validate's checks on a layer
+// the file's first pass located, then where each of its parts goes (the device pool, or a streamed state's
+// authoritative host pool: the restore's own destinations)
+bool conversation_kv_stream_target(const SessionFileKv& image, const QsaState& st, const ModelGeometry& g,
+                                   int64_t upto, bool index, std::array<void*, 5>& dst, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    if (!valid(st, l, upto, error)) return false;
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
+        image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
+        image.idx_dim != g.idx_key_dim) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (image.parts[i].bytes != (uint64_t) sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    const auto p = pools(st);
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !p[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    dst = p;
+    return true;
+}
+
+// the residency refresh conversation_kv_restore ends with: a streamed state's VRAM slots and a ring's resident pages
+// still hold the outgoing conversation
+bool conversation_kv_stream_finish(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    return refresh_residency(st, g, upto, error);
+}
+
 } // namespace strata::core

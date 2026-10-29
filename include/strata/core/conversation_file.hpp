@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -124,6 +125,9 @@ struct SessionStatus {
     bool published = false;
     // write (POSIX): this filesystem cannot flush a folder (fsync EINVAL); the save succeeded without that flush
     bool dir_flush_unsupported = false;
+    // QuantLab (10/29): write - the file went to the disk without the system file cache (Windows FILE_FLAG_NO_BUFFERING,
+    // POSIX O_DIRECT)
+    bool unbuffered = false;
 };
 
 // Progress of a file transfer: (bytes done, bytes in the file).  A write reports once when its temporary file is
@@ -151,6 +155,10 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // QuantLab (10/29): Windows - the temporary file is written with FILE_FLAG_NO_BUFFERING (the 4 KiB-aligned 16 MiB
+    // blocks POSIX already writes with O_DIRECT) when the folder's volume has sectors that divide 4 KiB, so a session
+    // file does not pass through the system file cache.  STRATA_SESSION_BUFFERED=1 keeps it buffered.
+    bool unbuffered = false;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -239,5 +247,105 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
+
+// ---- QuantLab (10/29): streamed session files (STRATA_QL_SESSION_STREAM=1, opt-in) ------------------------------
+// A save or a restore that moves the state between the device and the file in 16 MiB blocks with bounded RAM: no
+// whole copy of the K/V, of the live GDN rows or of a checkpoint is made in RAM.  Format v1 is unchanged - a streamed
+// save writes the bytes session_file_write writes for the same state, and either reader reads either file.  (The
+// engine's identity is another matter: with the switch on, its config fingerprint also takes the QuantLab switches
+// and the pack's files, so an engine with it on refuses files saved with it off, and the reverse.)
+
+// STRATA_QL_SESSION_STREAM=1 (read once).
+bool session_stream_requested();
+
+// The bounded-RAM save: `meta` holds the geometry, the layer range, cvec and the live state WITHOUT its GDN rows (no
+// checkpoints, no K/V); `checkpoints` are written from where they are (the caller's chain: not copied); `live_gdn` (its
+// part 0) supplies the live GDN rows and `kv` the K/V layers, each pulled in pieces straight into the file's block.
+bool session_file_write_streamed(const std::string& path, const SavedConversation& meta,
+                                 const std::vector<const ConversationCheckpoint*>& checkpoints,
+                                 const SessionKvSource& live_gdn, const std::vector<SessionKvSource>& kv,
+                                 const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                                 const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+// Its RAM peak: the 16 MiB write block, the live state's small arrays (`live.state_bytes`, without the GDN rows), its
+// tokens and pictures, the source directory (the K/V layers and the GDN rows) and 1 MiB for the small vectors - no
+// checkpoint copy and no GDN copy.
+uint64_t session_save_stream_peak_bytes(const SessionSaveLive& live);
+
+// Where the first pass of a streamed restore found an array: the file offset of its first byte (past its count) and
+// its length.
+struct SessionFileArray {
+    uint64_t offset = 0, bytes = 0;
+};
+// A checkpoint (or the live state) as the file holds it: its tokens and pictures read, its five running-state arrays
+// (gdn, ple, tails, dead, block_pos) located.
+struct SessionFileCheckpoint {
+    std::vector<int32_t> ids;
+    std::vector<ConversationImageKey> imgs;
+    std::array<SessionFileArray, 5> state{};
+    uint64_t used = 0;
+};
+// A K/V layer: its header and its five parts (k, v, k_scale, v_scale, pooled) located.
+struct SessionFileKv {
+    int format = 0;
+    int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+    std::array<SessionFileArray, 5> parts{};
+};
+// Everything of a SavedConversation but the arrays' bytes.
+struct SessionFileLayout {
+    std::array<int64_t, 18> geometry{};
+    int64_t layer_lo = 0, layer_hi = 0;
+    bool cvec = true;
+    SessionFileCheckpoint live;
+    std::vector<SessionFileCheckpoint> checkpoints;   // in file order
+    std::vector<SessionFileKv> kv;                    // the QSA layers, then the draft
+    uint64_t file_bytes = 0;
+};
+// One piece of an array in the second pass, at most one block: `kind` 0 = the live state, 1 = checkpoint `index`, 2 =
+// K/V layer `index`; `part` its array (0..4: gdn, ple, tails, dead, block_pos - or k, v, k_scale, v_scale, pooled);
+// `at` the piece's offset in the array.  Pieces come in file order, each array's from its start to its end.
+struct SessionStreamPiece {
+    int kind = 0;
+    size_t index = 0, part = 0;
+    uint64_t at = 0;
+};
+// false stops the delivery (the sink says why in the error string it shares with its caller)
+using SessionStreamSink = std::function<bool(const SessionStreamPiece& piece, const uint8_t* data, size_t n)>;
+struct SessionStreamOptions {
+    bool unbuffered = false;   // Windows: FILE_FLAG_NO_BUFFERING, as SessionWriteOptions::unbuffered (POSIX: O_DIRECT)
+    // both passes: (done, 2 x the file size), never decreasing - one report after every block read
+    SessionProgress progress;
+};
+
+// A restore read in two passes through one 16 MiB block, the file kept open between them (on Windows no other
+// process can write it meanwhile: it is opened sharing reads only).
+class SessionFileStream {
+public:
+    SessionFileStream();
+    ~SessionFileStream();
+    SessionFileStream(const SessionFileStream&) = delete;
+    SessionFileStream& operator=(const SessionFileStream&) = delete;
+    // Pass 1: every check session_file_read makes (a regular file with one link, size, header, identity, the bounded
+    // parse, the payload hash, the end marker) holding only the token and picture lists; `layout` locates every array.
+    // `limits.admit` is asked for session_stream_read_peak_bytes.  On failure `layout` is unchanged and the file closed.
+    bool verify(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
+                const SessionStreamOptions& options, SessionFileLayout& layout, size_t& bytes, std::string& error,
+                SessionStatus* status = nullptr);
+    // Pass 2, once per verify: the file read again from its start; every array's bytes go to `sink` in file order, and
+    // the payload hash must still be the one pass 1 checked (a file changed in between fails at its end, after the
+    // sink has had its pieces).
+    bool deliver(const SessionStreamSink& sink, std::string& error, SessionStatus* status = nullptr);
+    // the open file is read without the system file cache (Windows FILE_FLAG_NO_BUFFERING, POSIX O_DIRECT)
+    bool unbuffered() const;
+    void close();
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+// What pass 1 asks `limits.admit` for: the 16 MiB block, 1 MiB for the small vectors and the token and picture lists
+// the limits allow (the live state's and each checkpoint's, 4 + 16 bytes a token), at most the file.
+uint64_t session_stream_read_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);
+// What pass 2 adds: the block again (pass 1's is gone), the live state's small arrays and every checkpoint's running
+// state but the first `reused` ones' (their storage is the dropped chain's).
+uint64_t session_stream_restore_peak_bytes(const SessionFileLayout& layout, size_t reused);
 
 } // namespace strata::core

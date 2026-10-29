@@ -184,4 +184,43 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
                                                           SessionState& session, const ModelGeometry& g,
                                                           const QsaState* draft, std::string& error);
 
+// ---- QuantLab (10/29): streamed session files (STRATA_QL_SESSION_STREAM=1; conversation_file.hpp) ----------------
+// CUDA / HIP only: a Metal build refuses them (its running state lives in the decode window).
+//
+// Save: conversation_snapshot_sources without a host copy of the live GDN rows or of the checkpoint.  `meta.live` gets
+// the tokens, the pictures and the small running-state arrays (ple, tails, dead, block_pos); `live_gdn` reads the GDN
+// rows from the device in pieces; `checkpoint` (the deepest, or nullptr) is checked as one of the view's would be (the
+// view's own list must be empty) and stays where it is - the caller hands it to session_file_write_streamed.  The
+// caller keeps the session untouched until the file is written.
+bool conversation_snapshot_stream_sources(SavedConversation& meta, SessionKvSource& live_gdn,
+                                          std::vector<SessionKvSource>& sources, const ConversationView& view,
+                                          const ConversationCheckpoint* checkpoint, const SessionState& session,
+                                          const ModelGeometry& g, const QsaState& draft, std::string& error);
+// Restore, between the passes: the file's layout against this session as conversation_snapshot_validate checks an
+// image (geometry, layer range, tokens and pictures, every running-state size, each K/V layer with the draft last).
+// No device access.
+bool conversation_stream_validate(const SessionFileLayout& layout, const SessionState& session,
+                                  const ModelGeometry& g, const QsaState& draft, std::string& error);
+// The host storage the second pass fills, sized from the layout: `live` (the small running-state arrays) and
+// `checkpoints` (each one's running state), taking `storage`'s checkpoints first (the dropped chain's: vectors of the
+// same sizes, whose pages are in).  Allocation only; bad_alloc propagates (a checkpoint taken from `storage` is gone).
+void conversation_stream_storage(const SessionFileLayout& layout, std::vector<ConversationCheckpoint>& storage,
+                                 ConversationCheckpoint& live, std::vector<ConversationCheckpoint>& checkpoints);
+// The second pass into this session: the live GDN rows and every K/V part go from the file's block straight to the
+// device (or a streamed state's authoritative host pool), the small arrays and the checkpoints' state into `live` /
+// `checkpoints` (conversation_stream_storage's); then each K/V layer's residency is refreshed and the live small state
+// written, as conversation_snapshot_restore does.  The token and picture lists move out of `layout`.
+// invalid: refused before any device write.  transfer_failed: the session may be partial - the caller must not decode
+// from it (it drops it, and the next request starts from token 0).
+ConversationRestore conversation_stream_restore(SessionFileStream& file, SessionFileLayout& layout,
+                                                SessionState& session, const ModelGeometry& g, const QsaState& draft,
+                                                ConversationCheckpoint& live,
+                                                std::vector<ConversationCheckpoint>& checkpoints, std::string& error);
+// The K/V side (conversation_snapshot.cpp): a layer's destinations once its header and part sizes were checked against
+// `state` at `upto` tokens (as conversation_kv_validate checks an image's), and its residency refresh once its parts
+// are written (as conversation_kv_restore ends).
+bool conversation_kv_stream_target(const SessionFileKv& kv, const QsaState& state, const ModelGeometry& g,
+                                   int64_t upto, bool include_index, std::array<void*, 5>& dst, std::string& error);
+bool conversation_kv_stream_finish(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
+
 } // namespace strata::core

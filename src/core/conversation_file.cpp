@@ -132,6 +132,11 @@ bool split_path(const std::string& path, std::string& dir, std::string& leaf, st
     return true;
 }
 
+bool buffered_forced() {
+    const char* e = std::getenv("STRATA_SESSION_BUFFERED");
+    return e != nullptr && e[0] == '1';
+}
+
 #ifdef _WIN32
 // paths reach the engine as UTF-8 (the server writes its commands as UTF-8); invalid UTF-8 is refused, not replaced
 bool wide(const std::string& s, std::wstring& w) {
@@ -161,14 +166,47 @@ std::string last_error(DWORD code = GetLastError()) {
     return s.empty() ? "error " + std::to_string(code) : s;
 }
 
+// QuantLab (10/29): FILE_FLAG_NO_BUFFERING needs every transfer's offset, length and buffer aligned to the volume's
+// sectors.  The session file's blocks are aligned to kAlign (4 KiB), so it is used only where the logical sector and
+// the atomic physical sector both divide 4 KiB (512e and 4Kn drives); a volume that says otherwise, or cannot say (an
+// old network share), stays buffered, and so does every session file with STRATA_SESSION_BUFFERED=1.
+bool sectors_fit(HANDLE h) {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+    if (buffered_forced()) return false;
+    FILE_STORAGE_INFO s{};
+    if (!GetFileInformationByHandleEx(h, FileStorageInfo, &s, (DWORD) sizeof s)) return false;
+    const auto fits = [](ULONG n) { return n != 0 && n <= kAlign && kAlign % n == 0; };
+    return fits(s.LogicalBytesPerSector) && fits(s.PhysicalBytesPerSectorForAtomicity);
+#else
+    (void) h;
+    return false;
+#endif
+}
+// the same for the folder a file is about to be created in ("" = the current folder)
+bool dir_sectors_fit(const std::wstring& dir) {
+    const HANDLE h = CreateFileW(dir.empty() ? L"." : dir.c_str(), FILE_READ_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const bool fits = sectors_fit(h);
+    CloseHandle(h);
+    return fits;
+}
+
 class RawFile {
 public:
     ~RawFile() { close(); }
+    // QuantLab (10/29): create_new makes the file unbuffered (FILE_FLAG_NO_BUFFERING) when asked
+    // (SessionWriteOptions::unbuffered, and only where the folder's sectors fit)
+    void want_direct(bool on) { want_direct_ = on; }
+    bool wants_direct() const { return want_direct_; }
     // a new file that did not exist (CREATE_NEW: never an existing file or link)
     bool create_new(const std::wstring& path) {
         h_ = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
+                             (want_direct_ ? (DWORD) FILE_FLAG_NO_BUFFERING : (DWORD) 0), nullptr);
         if (h_ == INVALID_HANDLE_VALUE) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
+        direct_ = want_direct_;
         return true;
     }
     // a session to restore: the name itself is opened, never what a link or reparse point there points to; it must be
@@ -209,7 +247,8 @@ public:
         return true;
     }
     bool is_open() const { return h_ != INVALID_HANDLE_VALUE; }
-    bool direct() const { return false; }
+    // unbuffered (QuantLab, 10/29: create_new with want_direct, or a session file after go_direct); else buffered
+    bool direct() const { return direct_; }
     bool write_all(const uint8_t* p, size_t n) {
         while (n) {
             DWORD w = 0;
@@ -221,12 +260,55 @@ public:
     }
     // bytes read, 0 at the end of the file, -1 on error
     long long read_some(uint8_t* p, size_t n) {
-        DWORD r = 0;
-        if (!ReadFile(h_, p, (DWORD) std::min<size_t>(n, size_t(1) << 30), &r, nullptr)) {
-            { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
+        for (;;) {
+            DWORD r = 0;
+            if (ReadFile(h_, p, (DWORD) std::min<size_t>(n, size_t(1) << 30), &r, nullptr)) return (long long) r;
+            const DWORD c_ = GetLastError();
+            // QuantLab (10/29): a volume that refuses an unbuffered transfer (nothing was read): the same file, buffered
+            if (c_ == ERROR_INVALID_PARAMETER && direct_ && leave_direct()) continue;
+            kind_ = win_kind(c_);
+            error_ = last_error(c_);
             return -1;
         }
-        return (long long) r;
+    }
+    // QuantLab (10/29): the session file opened by open_session read unbuffered from here on (SessionStreamOptions::
+    // unbuffered).  ReOpenFile gives a handle on the same file without a new name lookup, at offset 0; the handle stays
+    // buffered where the volume's sectors do not fit the 4 KiB-aligned blocks or the reopen is refused.
+    bool go_direct() {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+        if (h_ == INVALID_HANDLE_VALUE || direct_ || !sectors_fit(h_)) return direct_;
+        const HANDLE d = ReOpenFile(h_, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN);
+        if (d == INVALID_HANDLE_VALUE) return false;
+        CloseHandle(h_);
+        h_ = d;
+        direct_ = true;
+        return true;
+#else
+        return direct_;   // (sectors_fit: never unbuffered for an older Windows target)
+#endif
+    }
+    // QuantLab (10/29): back to buffered reads at the same offset (an unbuffered read the volume refused)
+    bool leave_direct() {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+        LARGE_INTEGER zero{}, at{};
+        if (!SetFilePointerEx(h_, zero, &at, FILE_CURRENT)) return false;
+        const HANDLE b = ReOpenFile(h_, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_SEQUENTIAL_SCAN);
+        if (b == INVALID_HANDLE_VALUE) return false;
+        if (!SetFilePointerEx(b, at, nullptr, FILE_BEGIN)) { CloseHandle(b); return false; }
+        CloseHandle(h_);
+        h_ = b;
+        direct_ = false;
+        return true;
+#else
+        return false;
+#endif
+    }
+    // QuantLab (10/29): back to the file's start (the streamed restore's second pass)
+    bool rewind() {
+        LARGE_INTEGER zero{};
+        if (SetFilePointerEx(h_, zero, nullptr, FILE_BEGIN)) return true;
+        { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
+        return false;
     }
     bool read_at(uint64_t offset, uint8_t* p, size_t n) {
         LARGE_INTEGER at{};
@@ -240,6 +322,17 @@ public:
         return true;
     }
     bool truncate(uint64_t n) {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+        if (direct_) {
+            // QuantLab (10/29): an unbuffered handle cannot move its file pointer to an unaligned offset
+            // (ERROR_INVALID_PARAMETER), so the padded last block is cut back by the end-of-file information instead
+            FILE_END_OF_FILE_INFO eof{};
+            eof.EndOfFile.QuadPart = (LONGLONG) n;
+            if (SetFileInformationByHandle(h_, FileEndOfFileInfo, &eof, (DWORD) sizeof eof)) return true;
+            { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
+            return false;
+        }
+#endif
         LARGE_INTEGER at{};
         at.QuadPart = (LONGLONG) n;
         if (SetFilePointerEx(h_, at, nullptr, FILE_BEGIN) && SetEndOfFile(h_)) return true;
@@ -268,6 +361,7 @@ private:
     SessionError kind_ = SessionError::io;
     bool refused_ = false;
     bool missing_ = false;
+    bool want_direct_ = false, direct_ = false;   // QuantLab (10/29)
     std::string error_;
 };
 
@@ -316,6 +410,8 @@ public:
         return false;
     }
     SessionError kind() const { return SessionError::io; }
+    // QuantLab (10/29): the destination folder's volume takes the unbuffered 4 KiB-aligned blocks (after open)
+    bool sectors_fit() const { return dir_sectors_fit(prefix_); }
     ~Publisher() { if (own_) DeleteFileW(temp_.c_str()); }   // only the temporary file this call created
 private:
     std::wstring prefix_, final_, temp_;
@@ -335,11 +431,6 @@ bool free_space(const std::string& path, uint64_t& out) {
 #ifndef O_DIRECT
 #define O_DIRECT 0            // not offered by this system: buffered I/O
 #endif
-
-bool buffered_forced() {
-    const char* e = std::getenv("STRATA_SESSION_BUFFERED");
-    return e != nullptr && e[0] == '1';
-}
 
 static_assert(sizeof(off_t) >= 8, "session files need 64-bit file offsets (large-file support)");
 
@@ -417,6 +508,15 @@ public:
     }
     bool truncate(uint64_t n) {
         if (::ftruncate(fd_, (off_t) n) == 0) return true;
+        kind_ = errno_kind(errno);
+        error_ = std::strerror(errno);
+        return false;
+    }
+    // QuantLab (10/29): O_DIRECT was tried when the file was opened (try_direct): nothing more to switch
+    bool go_direct() { return direct_; }
+    // QuantLab (10/29): back to the file's start (the streamed restore's second pass)
+    bool rewind() {
+        if (::lseek(fd_, 0, SEEK_SET) == 0) return true;
         kind_ = errno_kind(errno);
         error_ = std::strerror(errno);
         return false;
@@ -602,6 +702,17 @@ public:
         }
         return true;
     }
+    // QuantLab (10/29): `n` bytes handed to fn(pointer, count) where they lie in the block (no copy), in pieces of at
+    // most one block; a false from fn, or a failed read, stops
+    template<class Fn> bool pass(uint64_t n, Fn fn) {
+        while (n) {
+            if (at_ == have_ && !fill()) return false;
+            const size_t c = (size_t) std::min<uint64_t>(n, have_ - at_);
+            if (!fn(static_cast<const uint8_t*>(buf_.get() + at_), c)) return false;
+            at_ += c; n -= c;
+        }
+        return true;
+    }
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
@@ -707,6 +818,35 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
     }
 }
 
+// QuantLab (10/29): the bounded-RAM save's parts (session_file_write_streamed): the checkpoints written from where they
+// are and the live GDN rows pulled from their source
+struct StreamedParts {
+    const std::vector<const ConversationCheckpoint*>* checkpoints = nullptr;
+    const SessionKvSource* live_gdn = nullptr;
+};
+
+// put_payload's bytes with the live GDN rows from `p.live_gdn` (`o.vec(c.gdn)` and `o.source(.., 0)` both write the
+// byte count, then the bytes) and the checkpoints from `p.checkpoints`
+void put_payload_streamed(Out& o, const SavedConversation& s, const StreamedParts& p,
+                          const std::vector<SessionKvSource>& sources) {
+    for (int64_t g : s.geometry) o.i64(g);
+    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
+    const ConversationCheckpoint& c = s.live;   // put_checkpoint's order
+    o.vec(c.ids);
+    o.u64(c.imgs.size());
+    for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
+    o.source(*p.live_gdn, 0);
+    o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
+    o.u64(c.used);
+    o.u64(p.checkpoints->size());
+    for (const ConversationCheckpoint* k : *p.checkpoints) put_checkpoint(o, *k);
+    o.u64(sources.size());
+    for (const auto& k : sources) {
+        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+        for (size_t part = 0; part < 5; ++part) o.source(k, part);
+    }
+}
+
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
 struct In {
     FileSource* f;
@@ -791,6 +931,113 @@ bool get_payload(In& in, SavedConversation& s) {
         k.format = (int) format;
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
+    }
+    return true;
+}
+
+// ---- QuantLab (10/29): the streamed restore's first pass (SessionFileStream::verify): get_payload's walk with the same
+// bounds, in the same order; the token and picture lists are read, every other array is only hashed where it lies in
+// the block and located (a segment for the second pass)
+struct StreamSegment {
+    uint64_t offset, bytes;
+    SessionStreamPiece piece;
+};
+struct StreamIn {
+    FileSource* f;
+    SessionHasher hash;
+    uint64_t left, pos;   // the payload bytes still to come; the file offset of the next byte
+    std::string& error;
+    const SessionReadLimits& limits;
+    std::vector<StreamSegment>* segments;
+    SessionError kind = SessionError::invalid;
+    bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
+    bool raw(void* p, size_t c) {
+        if (c > left) return fail("payload ends early");
+        if (c && !f->read(p, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
+        hash.update(p, c);
+        left -= c;
+        pos += c;
+        return true;
+    }
+    bool u64(uint64_t& v) { return raw(&v, 8); }
+    bool i64(int64_t& v) { return raw(&v, 8); }
+    // In::count
+    bool count(uint64_t& n, size_t elem, uint64_t limit = UINT64_MAX) {
+        if (!u64(n)) return false;
+        if (elem && n > left / elem) return fail("element count exceeds the payload");
+        if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
+                                   std::to_string(limit));
+        if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+        return true;
+    }
+    template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {
+        uint64_t n = 0;
+        if (!count(n, sizeof(T), limit)) return false;
+        v.resize((size_t) n);
+        return raw(v.data(), (size_t) n * sizeof(T));
+    }
+    // a byte array (its count bounded as In::vec and In::buffer bound it): located and hashed in place, not kept
+    bool array(SessionFileArray& a, uint64_t limit, const SessionStreamPiece& piece) {
+        uint64_t n = 0;
+        if (!count(n, 1, limit)) return false;
+        a.offset = pos;
+        a.bytes = n;
+        if (n == 0) return true;
+        segments->push_back({pos, n, piece});
+        if (!f->pass(n, [this](const uint8_t* p, size_t c) { hash.update(p, c); return true; })) {
+            kind = f->kind();
+            return fail("read error: " + f->error());
+        }
+        left -= n;
+        pos += n;
+        return true;
+    }
+};
+
+bool stream_checkpoint(StreamIn& in, SessionFileCheckpoint& c, int kind, size_t index) {
+    if (!in.vec(c.ids, in.limits.max_tokens)) return false;
+    uint64_t n = 0;
+    if (!in.count(n, 16, in.limits.max_tokens)) return false;
+    c.imgs.resize((size_t) n);
+    for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
+    const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
+    for (size_t part = 0; part < 5; ++part)
+        if (!in.array(c.state[part], m[part], SessionStreamPiece{kind, index, part, 0})) return false;
+    return in.u64(c.used);
+}
+
+bool stream_payload(StreamIn& in, SessionFileLayout& s) {
+    for (auto& g : s.geometry) if (!in.i64(g)) return false;
+    // checked before any state array is read: a file of another geometry allocates nothing
+    if (in.limits.geometry && *in.limits.geometry != s.geometry)
+        return in.fail("saved with another model geometry than this runtime's");
+    uint64_t cvec = 0;
+    if (!in.i64(s.layer_lo) || !in.i64(s.layer_hi) || !in.u64(cvec)) return false;
+    if (in.limits.layer_range &&
+        (in.limits.layer_range->first != s.layer_lo || in.limits.layer_range->second != s.layer_hi))
+        return in.fail("saved with another layer range than this runtime's");
+    if (cvec > 1) return in.fail("invalid cvec flag");
+    s.cvec = cvec == 1;
+    if (!stream_checkpoint(in, s.live, 0, 0)) return false;
+    uint64_t n = 0;
+    // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
+    if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
+    s.checkpoints.resize((size_t) n);
+    for (size_t i = 0; i < s.checkpoints.size(); ++i)
+        if (!stream_checkpoint(in, s.checkpoints[i], 1, i)) return false;
+    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    s.kv.resize((size_t) n);
+    for (size_t j = 0; j < s.kv.size(); ++j) {
+        SessionFileKv& k = s.kv[j];
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+        k.format = (int) format;
+        for (size_t part = 0; part < 5; ++part) {
+            const uint64_t limit = j < in.limits.max_kv_bytes.size() ? in.limits.max_kv_bytes[j][part] : UINT64_MAX;
+            if (!in.array(k.parts[part], limit, SessionStreamPiece{2, j, part, 0})) return false;
+        }
     }
     return true;
 }
@@ -1026,13 +1273,23 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
 namespace {
 bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                 const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                SessionStatus& st) {
+                SessionStatus& st, const StreamedParts* streamed = nullptr) {
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    if (streamed) {   // QuantLab (10/29): the checkpoints and the live GDN rows come apart from the image, and only so
+        if (!sources || !streamed->checkpoints || !streamed->live_gdn || !image.checkpoints.empty() ||
+            !image.live.gdn.empty()) {
+            error = "session file: a streamed save takes its checkpoints and live GDN rows apart from the image";
+            return false;
+        }
+        for (const ConversationCheckpoint* c : *streamed->checkpoints)
+            if (c == nullptr || !c->stage_parts.empty()) { error = "session file: layer-split state cannot be saved"; return false; }
+    }
     Out sizing;
-    put_payload(sizing, image, sources);
+    if (streamed) put_payload_streamed(sizing, image, *streamed, *sources);
+    else put_payload(sizing, image, sources);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1054,7 +1311,17 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     Publisher pub;
     if (!pub.open(path, error)) { st.error = pub.kind(); return false; }
     RawFile raw;
-    if (!pub.create_temp(raw, error)) {
+#ifdef _WIN32
+    if (opt.unbuffered) raw.want_direct(pub.sectors_fit());   // QuantLab (10/29): FILE_FLAG_NO_BUFFERING
+#endif
+    bool created = pub.create_temp(raw, error);
+#ifdef _WIN32
+    if (!created && raw.wants_direct()) {   // QuantLab (10/29): a volume that refuses it at creation: buffered, as before
+        raw.want_direct(false);
+        created = pub.create_temp(raw, error);
+    }
+#endif
+    if (!created) {
         st.error = raw.kind();
         error = "session file: cannot create a temporary file beside " + path + ": " + error;
         return false;
@@ -1075,7 +1342,10 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_payload(out, image, sources);
+    if (ok) {
+        if (streamed) put_payload_streamed(out, image, *streamed, *sources);
+        else put_payload(out, image, sources);
+    }
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
@@ -1091,6 +1361,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         if (opt.phase) opt.phase("publish", total);
         if (pub.publish(why, opt.durable, st, fault)) {
             st.error = SessionError::none;
+            st.unbuffered = raw.direct();   // QuantLab (10/29): for the caller's log
             bytes = (size_t) total;
             return true;
         }
@@ -1102,11 +1373,11 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
 
 bool write_guarded(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                    const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                   SessionStatus* status) {
+                   SessionStatus* status, const StreamedParts* streamed = nullptr) {
     SessionStatus st;
     bool ok = false;
     try {
-        ok = write_impl(path, image, sources, id, bytes, error, opt, st);
+        ok = write_impl(path, image, sources, id, bytes, error, opt, st, streamed);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while writing " + path;
         st.error = SessionError::memory;
@@ -1168,6 +1439,25 @@ bool session_file_write(const std::string& path, const SavedConversation& meta, 
 bool session_file_write(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
                         size_t& bytes, std::string& error, const SessionWriteOptions& options, SessionStatus* status) {
     return write_guarded(path, image, nullptr, id, bytes, error, options, status);
+}
+
+// QuantLab (10/29): the bounded-RAM save (STRATA_QL_SESSION_STREAM=1)
+bool session_file_write_streamed(const std::string& path, const SavedConversation& meta,
+                                 const std::vector<const ConversationCheckpoint*>& checkpoints,
+                                 const SessionKvSource& live_gdn, const std::vector<SessionKvSource>& kv,
+                                 const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                                 const SessionWriteOptions& options, SessionStatus* status) {
+    const StreamedParts parts{&checkpoints, &live_gdn};
+    return write_guarded(path, meta, &kv, id, bytes, error, options, status, &parts);
+}
+
+uint64_t session_save_stream_peak_bytes(const SessionSaveLive& live) {
+    uint64_t n = sat_add(kBlock, uint64_t(1) << 20);                                   // write block, small vectors
+    n = sat_add(n, live.state_bytes);                                                  // the live small arrays
+    n = sat_add(n, sat_mul(live.tokens, sizeof(int32_t)));                             // its token list
+    n = sat_add(n, sat_mul(live.images, sizeof(ConversationImageKey)));                // its pictures
+    n = sat_add(n, sat_mul(sat_add(live.kv_layers, 1), sizeof(SessionKvSource) + 256));   // the K/V and GDN sources
+    return n;
 }
 
 namespace {
@@ -1252,5 +1542,239 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     if (status) *status = st;
     return ok;
 }
+
+// ---- QuantLab (10/29): streamed session files (STRATA_QL_SESSION_STREAM=1) -----------------------------------------
+bool session_stream_requested() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QL_SESSION_STREAM");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+uint64_t session_stream_read_peak_bytes(uint64_t file_bytes, const SessionReadLimits& l) {
+    // the token and picture lists the limits allow (the live state's and each checkpoint's; max_tokens bounds both, 4 +
+    // 16 bytes each, as session_read_max_file_bytes counts them), at most the file
+    const uint64_t per_token = sizeof(int32_t) + sizeof(ConversationImageKey);
+    const uint64_t lists = sat_mul(sat_add(l.max_checkpoints, 1), sat_mul(l.max_tokens, per_token));
+    return sat_add(sat_add(kBlock, uint64_t(1) << 20), std::min(lists, file_bytes));
+}
+
+uint64_t session_stream_restore_peak_bytes(const SessionFileLayout& f, size_t reused) {
+    uint64_t n = sat_add(kBlock, uint64_t(1) << 20);   // pass 2's block (pass 1's is gone), the small vectors
+    for (size_t part = 1; part < 5; ++part) n = sat_add(n, f.live.state[part].bytes);   // the live small arrays
+    for (size_t i = reused; i < f.checkpoints.size(); ++i)   // the checkpoints no dropped storage holds
+        for (const SessionFileArray& a : f.checkpoints[i].state) n = sat_add(n, a.bytes);
+    return n;
+}
+
+struct SessionFileStream::Impl {
+    RawFile raw;
+    SessionStreamOptions opt;
+    std::vector<StreamSegment> segments;   // the arrays pass 1 located, in file order
+    uint8_t header[kHeader] = {};
+    uint64_t size = 0, payload = 0, hash = 0;
+    bool verified = false;
+
+    // read_impl's checks in its order, the payload walked by stream_payload
+    bool verify(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
+                SessionFileLayout& layout, size_t& bytes, std::string& error, SessionStatus& st) {
+        error.clear();
+        st = {};
+        st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+        uint64_t n = 0;
+        if (!raw.open_session(path, n)) {
+            st.error = raw.refused() ? SessionError::invalid : raw.kind();
+            error = "session file: " + path + ": " + raw.error();
+            return false;
+        }
+        if (n < kHeader + kTrailer) { error = "session file: size " + std::to_string(n) + " is below the minimum"; return false; }
+        const uint64_t max_size = session_read_max_file_bytes(limits);
+        if (n > max_size || n > (uint64_t) std::numeric_limits<size_t>::max()) {
+            error = "session file: size " + std::to_string(n) + " exceeds this engine's limit" +
+                    (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
+            return false;
+        }
+        if (opt.unbuffered) raw.go_direct();
+        FileSource f(raw);
+        if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
+        if (opt.progress) {   // this pass is the first half of the transfer
+            const SessionProgress report = opt.progress;
+            const uint64_t total = sat_mul(2, n);
+            f.progress.emplace(SessionProgress([report, total](uint64_t done, uint64_t) { report(done, total); }));
+        }
+        f.expected = n;
+        uint8_t h[kHeader];
+        if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+        uint32_t version = 0, hsize = 0;
+        uint64_t model = 0, config = 0, payload_len = 0, r0 = 0, r1 = 0, hh = 0;
+        std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+        std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload_len, h + 32, 8);
+        std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+        if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+        if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
+        if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
+        if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+        if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
+        if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
+        if (payload_len > n || n - kHeader - kTrailer != payload_len) {
+            error = "session file: size " + std::to_string(n) + " does not match the header (" +
+                    std::to_string(kHeader + payload_len + kTrailer) + ")";
+            return false;
+        }
+        if (limits.admit) {
+            std::string why;
+            if (!limits.admit(session_stream_read_peak_bytes(n, limits), why)) {
+                st.error = SessionError::memory;
+                error = "session file: " + why;
+                return false;
+            }
+        }
+        SessionFileLayout parsed;
+        segments.clear();
+        StreamIn in{&f, SessionHasher(0), payload_len, kHeader, error, limits, &segments};
+        if (!stream_payload(in, parsed)) { st.error = in.kind; return false; }
+        if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
+        uint8_t t[kTrailer];
+        if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
+        uint64_t ph = 0;
+        std::memcpy(&ph, t, 8);
+        if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
+        if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+        parsed.file_bytes = n;
+        layout = std::move(parsed);
+        std::memcpy(header, h, kHeader);
+        size = n;
+        payload = payload_len;
+        hash = ph;
+        verified = true;
+        bytes = (size_t) n;
+        st.error = SessionError::none;
+        return true;
+    }
+
+    // the same bytes again from the file's start: the header must be the one checked, every located array goes to
+    // the sink, everything else is only hashed, and the payload hash must still be pass 1's
+    bool deliver(const SessionStreamSink& sink, std::string& error, SessionStatus& st) {
+        error.clear();
+        st = {};
+        st.error = SessionError::io;
+        if (!verified || !raw.is_open()) {
+            st.error = SessionError::invalid;
+            error = "session file: no verified file to deliver";
+            return false;
+        }
+        verified = false;   // one delivery per verification
+        if (!raw.rewind()) { st.error = raw.kind(); error = "session file: rewinding: " + raw.error(); return false; }
+        FileSource f(raw);
+        if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
+        if (opt.progress) {   // the second half of the transfer
+            const SessionProgress report = opt.progress;
+            const uint64_t base = size, total = sat_mul(2, size);
+            f.progress.emplace(SessionProgress([report, base, total](uint64_t done, uint64_t) {
+                report(std::min(sat_add(base, done), total), total);
+            }));
+        }
+        f.expected = size;
+        const auto read_failed = [&](const char* what) {
+            st.error = f.kind();
+            const std::string why = f.error();
+            error = std::string("session file: ") + what + ": " + (why.empty() ? std::string("file ends early") : why);
+            return false;
+        };
+        uint8_t h[kHeader];
+        if (!f.read(h, kHeader)) return read_failed("header read error");
+        if (std::memcmp(h, header, kHeader) != 0) {
+            st.error = SessionError::invalid;
+            error = "session file: the file changed after it was checked (header)";
+            return false;
+        }
+        SessionHasher again(0);
+        uint64_t pos = kHeader;
+        const auto hash_to = [&](uint64_t to) {
+            if (to < pos) return false;
+            const bool ok = f.pass(to - pos, [&](const uint8_t* p, size_t c) { again.update(p, c); return true; });
+            if (ok) pos = to;
+            return ok;
+        };
+        bool sink_failed = false;
+        for (const StreamSegment& s : segments) {
+            if (!hash_to(s.offset)) return read_failed("read error");
+            SessionStreamPiece piece = s.piece;
+            piece.at = 0;
+            const bool ok = f.pass(s.bytes, [&](const uint8_t* p, size_t c) {
+                again.update(p, c);
+                if (!sink(piece, p, c)) { sink_failed = true; return false; }
+                piece.at += c;
+                return true;
+            });
+            if (!ok) {
+                if (!sink_failed) return read_failed("read error");
+                st.error = SessionError::io;
+                if (error.empty()) error = "session file: the state could not be delivered";
+                return false;
+            }
+            pos += s.bytes;
+        }
+        if (!hash_to(kHeader + payload)) return read_failed("read error");
+        uint8_t t[kTrailer];
+        if (!f.read(t, kTrailer)) return read_failed("trailer read error");
+        uint64_t ph = 0;
+        std::memcpy(&ph, t, 8);
+        if (ph != hash || again.digest() != hash || std::memcmp(t + 8, kEnd, 8) != 0) {
+            st.error = SessionError::invalid;
+            error = "session file: the file changed after it was checked (payload checksum mismatch)";
+            return false;
+        }
+        st.error = SessionError::none;
+        return true;
+    }
+};
+
+SessionFileStream::SessionFileStream() = default;
+SessionFileStream::~SessionFileStream() = default;
+
+bool SessionFileStream::verify(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
+                               const SessionStreamOptions& options, SessionFileLayout& layout, size_t& bytes,
+                               std::string& error, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        impl_.reset();   // a file verified before is closed first
+        impl_ = std::make_unique<Impl>();
+        impl_->opt = options;
+        ok = impl_->verify(path, id, limits, layout, bytes, error, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (!ok) impl_.reset();   // closed: nothing to deliver
+    if (status) *status = st;
+    return ok;
+}
+
+bool SessionFileStream::deliver(const SessionStreamSink& sink, std::string& error, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    if (!impl_) {
+        error = "session file: no verified file to deliver";
+        st.error = SessionError::invalid;
+    } else {
+        try {
+            ok = impl_->deliver(sink, error, st);
+        } catch (const std::bad_alloc&) {
+            error = "session file: out of memory while reading the session again";
+            st.error = SessionError::memory;
+            ok = false;
+        }
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool SessionFileStream::unbuffered() const { return impl_ && impl_->raw.direct(); }
+
+void SessionFileStream::close() { impl_.reset(); }
 
 } // namespace strata::core
