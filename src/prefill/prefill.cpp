@@ -1339,6 +1339,13 @@ bool ql_mmq_mixed() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_MMQ_MIXED"); return v && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (10/29): STRATA_QL_PREFILL_GATHER=1 (opt-in) - the streamed walk of a mixed MMQ layer gathers its experts in
+// batches (one copy wait, one gather launch per class group, one release event per batch) instead of one wait, launch
+// and release event per expert; the same bytes into the same group slots (the walk's `mx_flush`)
+bool ql_prefill_gather() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_PREFILL_GATHER"); return v && std::atoi(v) != 0; }();
+    return on;
+}
 // Volta (sm_70): MMQ runs on dp4a there (no int8 tensor cores).  pf_wmma(): the layers MMQ would take, and the IQ1_M
 // ones the FP16 path would, run as one launch per expert group on FP16 tensor-core tiles instead
 // (strata::kernels::gemm_iq_f16_grouped: each weight superblock dequantized once into shared memory by the FP16 path's
@@ -2775,13 +2782,16 @@ namespace {
 // the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
 // are folded at every MoE layer's host sync, after which all of them have completed.
+// QuantLab (10/29): kPfMixFill ("mixed batch fill") is marked only by STRATA_QL_PREFILL_GATHER=1: in a mixed layer's
+// streamed walk, from the end of one batch's work to the next batch's flush - the GPU waiting while the host fills the
+// next batch (the issuer, the stager), which the per-expert walk charged to "dequant".  Unmarked phases are not printed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
-               kPfCount };
+               kPfMixFill, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write"};
+                                        "gdn recurrence", "gdn out proj", "hc write", "mixed batch fill"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -3017,6 +3027,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
+    // QuantLab (10/29): STRATA_QL_PREFILL_GATHER's batches in this run - flushes, gather launches, experts (the timing line)
+    int64_t ql_batches = 0, ql_batch_launches = 0, ql_batch_experts = 0;
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
     static const bool kv_prefetch_on = [] {
@@ -5310,6 +5322,74 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             gg_nslots = 0;
                             gg.first = gg.n;
                         };
+                        // QuantLab (10/29): STRATA_QL_PREFILL_GATHER=1 - a mixed MMQ layer's streamed walk gathers in
+                        // batches, as `flush` does an MMQ group.  Without it every expert puts a copy wait, a gather launch
+                        // and a release event on the compute stream (two timing events more under STRATA_PREFILL_TIMING):
+                        // the per-expert waits and records the group gather above was made to avoid (~10 us of GPU bubble
+                        // each under WDDM); the timer charged the gaps to "dequant" (~38 us an expert on an 8K prompt, for
+                        // a copy of about 1 MB).  A class group fills across the whole id range (its experts are in (class, id)
+                        // order, the walk meets them in id order), so a batch is the experts met since the last flush:
+                        // per class, its open group's run of positions [first, n), one gather_native_group launch each.  A
+                        // batch is flushed when a group completes (its products follow), when it holds MMQ_GROUP ring slots
+                        // (no more held back from the issuer than a group gather holds) and before a skipped ring entry
+                        // is given back.  The same bytes into the same slots of the same class regions: MMQ's bits as before.
+                        const bool mx_batch = mixed_mmq && stream_all && ql_prefill_gather();
+                        if (mx_batch) {
+                            if (static bool said_mx = false; !said_mx) {
+                                said_mx = true;
+                                std::fprintf(stderr, "strata: QuantLab: a mixed layer's streamed prompt experts are gathered in "
+                                                     "batches (STRATA_QL_PREFILL_GATHER=1)\n");
+                            }
+                        }
+                        struct MxPend {
+                            mmq::GatherGroup g;   // the class's open group: its positions [g.first, g.n) await their gather
+                            int32_t gi = -1;      // that group (-1: none open)
+                        };
+                        std::vector<MxPend> mxp(mx_batch ? lay.cls_fmt[(size_t) l].size() : 0);   // per class
+                        int mxp_slots[MMQ_GROUP];
+                        size_t mxp_ents[MMQ_GROUP];   // their entries (wait_copied)
+                        int mxp_nslots = 0;   // ring slots the next mx_flush releases
+                        int mxp_n = 0;        // experts in the batch
+                        auto mx_flush = [&]() {
+                            if (mxp_n == 0) return;
+                            if (mxp_nslots > 0) {   // the copies land in order: the last one covers the others
+                                pt.mark(kPfWaitCopy, cs);
+                                wait_copied(mxp_ents[mxp_nslots - 1], (size_t) mxp_slots[mxp_nslots - 1]);
+                            }
+                            pt.mark(kPfDequant, cs);
+                            for (size_t c = 0; c < mxp.size(); ++c) {
+                                MxPend& pc = mxp[c];
+                                if (pc.g.n <= pc.g.first) continue;
+                                const auto& fe = lay.cls_fmt[(size_t) l][c];   // = fmt_of(l, e) for every e of class c
+                                const size_t gub = mmq::matrix_bytes(fe.gu_type, 1280, N), db = mmq::matrix_bytes(fe.d_type, N, 640);
+                                uint8_t* bgu = m.grp_gu + c * grp_gu_region(mmq_plan());
+                                uint8_t* bd = m.grp_d + c * grp_d_region(mmq_plan());
+                                // the group's last expert is in: the MMQ tail after its slot too (the per-expert `last`)
+                                const size_t zero = pc.g.n == mx.gsize[(size_t) pc.gi] ? MMQ_TAIL : 0;
+                                if (mmq::gather_native_group(pc.g, fe.up_off, gub / 2, fe.down_off, db, bgu, gub, bd, db, m.cs,
+                                                             0, nullptr, zero)) {
+                                    ++ql_batch_launches;
+                                } else {
+                                    for (int q = pc.g.first; q < pc.g.n; ++q) {   // not 16-byte aligned: one at a time
+                                        const uint8_t* b = pc.g.blob[q];
+                                        mmq::gather_native(b, b + fe.up_off, gub / 2, b + fe.down_off, db, bgu + (size_t) q * gub,
+                                                           bd + (size_t) q * db, m.cs, nullptr, nullptr, q + 1 == pc.g.n ? zero : 0);
+                                        ++ql_batch_launches;
+                                    }
+                                }
+                                pc.g.first = pc.g.n;
+                                if (zero != 0) pc.gi = -1;
+                            }
+                            if (mxp_nslots > 0) {   // one event releases the batch's ring slots
+                                const int rel = mxp_slots[mxp_nslots - 1];
+                                cudaEventRecord(m.used[rel], m.cs);
+                                for (int i = 0; i < mxp_nslots; ++i) m.used_of[mxp_slots[i]] = rel;
+                            }
+                            ++ql_batches;
+                            ql_batch_experts += mxp_n;
+                            mxp_nslots = 0;
+                            mxp_n = 0;
+                        };
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                         // expert) is released once the blob is read; `cslot`: the expert-cache slot the blob is in (-1:
                         // a ring slot or the peer's), which STRATA_MMQ_DIRECT reads in place
@@ -5326,7 +5406,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                     : cslot < 0 ? "an expert not in this GPU's slots (streamed or the peer's)"
                                                                 : "the MMQ group buffers are not the blob's [gate | up] and down");
 #endif
-                            pt.mark(kPfDequant, cs);
+                            if (!mx_batch) pt.mark(kPfDequant, cs);   // QuantLab (10/29): a batch marks it in mx_flush
                             if (mixed_mmq) {
                                 // QuantLab: the expert into its class group's slot (its own [gate | up] and down, at its
                                 // class's sizes; the class's region of grp_gu / grp_d); the group launches once complete -
@@ -5340,10 +5420,45 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 uint8_t* bgu = m.grp_gu + (size_t) c * grp_gu_region(mmq_plan());
                                 uint8_t* bd = m.grp_d + (size_t) c * grp_d_region(mmq_plan());
                                 const bool last = (int32_t) q + 1 == mx.gsize[(size_t) gi];
+                                if (mx_batch) {
+                                    // QuantLab (10/29): the expert joins the batch at its group position (gathered by
+                                    // mx_flush); a class's experts arrive in position order, so its batch run stays contiguous
+                                    if (c < 0 || (size_t) c >= mxp.size()) {
+                                        err = "prefill: STRATA_QL_PREFILL_GATHER: a mixed expert's class is out of range";
+                                        return false;
+                                    }
+                                    MxPend& pc = mxp[(size_t) c];
+                                    if (pc.gi != gi) {   // the class's next group: the previous one completed and was flushed
+                                        if (pc.g.n > pc.g.first) {
+                                            err = "prefill: STRATA_QL_PREFILL_GATHER: a class group was left half gathered";
+                                            return false;
+                                        }
+                                        pc.g = mmq::GatherGroup{};
+                                        pc.g.first = pc.g.n = (int) q;
+                                        pc.gi = gi;
+                                    }
+                                    if ((int) q != pc.g.n) {
+                                        err = "prefill: STRATA_QL_PREFILL_GATHER: a class group's experts came out of order";
+                                        return false;
+                                    }
+                                    pc.g.blob[q] = blob_dev;
+                                    pc.g.n = (int) q + 1;
+                                    ++mxp_n;
+                                    if (slot >= 0) { mxp_ents[mxp_nslots] = cur_entry; mxp_slots[mxp_nslots++] = slot; }
+                                    if (++mx.gfill[(size_t) gi] < mx.gsize[(size_t) gi]) {
+                                        if (mxp_nslots == MMQ_GROUP) {   // as many ring slots held back as a group gather holds
+                                            mx_flush();
+                                            pt.mark(kPfMixFill, cs);
+                                        }
+                                        return true;
+                                    }
+                                    mx_flush();   // the group is complete: the batch (with it) is gathered before its products
+                                } else {
                                 mmq::gather_native(blob_dev, blob_dev + fe.up_off, gub / 2, blob_dev + fe.down_off, db,
                                                    bgu + q * gub, bd + q * db, m.cs, nullptr, nullptr, last ? MMQ_TAIL : 0);
                                 if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                                 if (++mx.gfill[(size_t) gi] < mx.gsize[(size_t) gi]) return true;
+                                }
                                 const size_t j0 = (size_t) mx.gstart[(size_t) gi], n = mx.corder.size();
                                 const int ngx = mx.gsize[(size_t) gi];
                                 const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j0 + (size_t) ngx] - r0;
@@ -5368,6 +5483,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
                                 m.mmq_ctx->run(dn, m.cs);
+                                if (mx_batch) pt.mark(kPfMixFill, cs);   // QuantLab (10/29): the walk fills the next batch
                                 return true;
                             }
                             if (use_mmq) {
@@ -5583,6 +5699,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
                                     if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
+                                    if (mxp_nslots > 0) {          // QuantLab (10/29): so do the batch's
+                                        mx_flush();
+                                        pt.mark(kPfMixFill, cs);
+                                    }
                                     const int sl = (int) (k % (size_t) m.ring);
                                     cudaEventRecord(m.used[sl], m.cs);
                                     m.used_of[sl] = sl;
@@ -5590,20 +5710,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     give_back(consumed);
                                 }
                             };
+                            if (mx_batch) pt.mark(kPfMixFill, cs);   // QuantLab (10/29): the walk fills the first batch
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 release_to(e);
                                 if (k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);
                                     wait_issued(k);
-                                    if (!group_gather) {
+                                    if (!group_gather && !mx_batch) {   // QuantLab (10/29): a batch waits once, in mx_flush
                                         pt.mark(kPfWaitCopy, cs);
                                         wait_copied(k, (size_t) sl);
                                     }
                                     cur_entry = k;
                                     if (!compute(j, m.stage_dev[sl], sl, -1)) return false;
                                     consumed = ++k;
-                                    if (!group_gather || gg_nslots == 0) give_back(consumed);   // its group was gathered
+                                    // its group was gathered (QuantLab (10/29): or the batch that held its slot was)
+                                    if (mx_batch ? mxp_nslots == 0 : (!group_gather || gg_nslots == 0)) give_back(consumed);
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                     const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
@@ -5612,9 +5734,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     ++stats_.experts_resident;
                                     if (!compute(j, bp, -1, r0 ? m.host_res[(size_t) l * m.g->n_expert + e] : -1)) return false;
                                     if (group_gather && gg_nslots == 0) give_back(consumed);
+                                    if (mx_batch && mxp_nslots == 0) give_back(consumed);   // QuantLab (10/29): as above
                                 }
                             }
                             release_to(m.g->n_expert);
+                            if (mx_batch && mxp_n > 0) {   // QuantLab (10/29): every class group flushes at its last expert
+                                err = "prefill: STRATA_QL_PREFILL_GATHER left experts of a mixed layer ungathered";
+                                return false;
+                            }
                         }
                     }
                     pt.mark(kPfCombine, cs);
@@ -5934,6 +6061,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        if (ql_batches > 0)   // QuantLab (10/29): the mixed layers' batched gathers (none without the switch)
+            std::fprintf(stderr, "strata prefill timing: QuantLab mixed-layer gathers: %lld experts in %lld batches, %lld "
+                                 "gather launches (STRATA_QL_PREFILL_GATHER)\n", (long long) ql_batch_experts,
+                         (long long) ql_batches, (long long) ql_batch_launches);
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;
