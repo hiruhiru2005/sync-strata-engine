@@ -10870,7 +10870,8 @@ int main(int argc, char** argv) {
                         pk.i64("mtime", ec ? (int64_t) 0 : (int64_t) when.time_since_epoch().count());
                     };
                     if (!o.pack.empty())
-                        for (const char* n : {"native_experts.txt", "index.txt", "dense.bin", "experts.bin", "manifest.json"})
+                        for (const char* n : {"native_experts.txt", "index.txt", "dense.bin", "experts.bin", "manifest.json",
+                                              "experts_k.txt", "hadamard.txt", "r1q2.txt"})   // QuantLab (10/31): + the tables
                             stamp(o.pack + "/" + n);
                     if (srcp != nullptr)
                         for (const auto& input : srcp->model_inputs()) stamp(input.second);
