@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace strata::kernels::cpu;
@@ -338,9 +340,64 @@ void check_r1q2(int type, int n) {
     if (!okg) fail("R1Q2 gate/up rows differ", type, n);
 }
 
+// QuantLab (10/31): tqp_cpu_test --bench - the old rows against the R1Q2 rows on the same codes, every ISA this CPU
+// has, ns per 128-value block and row (the decode's CPU experts: n 2560 gate/up rows, n 640 down rows)
+void bench(int type, int n, int rows) {
+    const int K = tq_kbits(type), nb = n / 128, qbytes = (nb + 3) / 4;
+    std::mt19937 rng(7u + (uint32_t) type);
+    std::uniform_int_distribution<int> byte(0, 255);
+    const size_t cb = (size_t) 4 * K, rb_new = cb * nb, rb_old = (2 + cb) * nb;
+    std::vector<uint8_t> wn(rb_new * rows), wo(rb_old * rows), q((size_t) qbytes * rows);
+    for (auto& v : wn) v = (uint8_t) byte(rng);
+    for (auto& v : q) v = (uint8_t) byte(rng);
+    for (int r = 0; r < rows; ++r)
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* dd = &wo[(size_t) r * rb_old + (size_t) b * (2 + cb)];
+            const uint16_t h = 0x2000;
+            std::memcpy(dd, &h, 2);
+            std::memcpy(dd + 2, &wn[(size_t) r * rb_new + (size_t) b * cb], cb);
+        }
+    std::vector<uint16_t> rbase(rows, 0x3c00), cscale(nb, 0x2000);
+    tq_detail::TqScales sc;
+    sc.p2[0] = 0.84f; sc.p2[1] = 0.95f; sc.p2[2] = 1.07f; sc.p2[3] = 1.2f;
+    sc.rowbase = rbase.data(); sc.colscale = cscale.data(); sc.q = q.data(); sc.qbytes = qbytes;
+    std::vector<std::vector<uint8_t>> act(NT);
+    std::vector<std::vector<float>> d(NT);
+    std::vector<std::vector<int>> qq(NT);
+    const void* ap[NT];
+    for (int t = 0; t < NT; ++t) { act[t] = random_q8_0(n, rng, d[t], qq[t]); ap[t] = act[t].data(); }
+    std::vector<float> o((size_t) NT * rows);
+    float* po[NT];
+    for (int t = 0; t < NT; ++t) po[t] = o.data() + (size_t) t * rows;
+    auto time_ns = [&](auto&& fn) {
+        fn();
+        using clk = std::chrono::steady_clock;
+        const auto t0 = clk::now();
+        int it = 0;
+        double el = 0;
+        do { fn(); ++it; el = std::chrono::duration<double>(clk::now() - t0).count(); } while (el < 0.4);
+        return el * 1e9 / ((double) it * rows * nb);
+    };
+    for (TqIsa isa : {TqIsa::scalar, TqIsa::avx2, TqIsa::avx512}) {
+        if (!tq_isa_ok(isa)) continue;
+        for (int nt : {1, 2, 3}) {
+            if (nt > NT) continue;
+            const double t_old = time_ns([&] { tq_rows(isa, type, wo.data(), rb_old, n, ap, nt, po, 0, rows); });
+            const double t_new = time_ns([&] { tq_rows_r1q2(isa, type, wn.data(), rb_new, n, ap, nt, po, 0, rows, sc); });
+            std::printf("bench type %d n %4d %-6s nt %d: old %6.1f ns/block, R1Q2 %6.1f ns/block (%+.0f%%)\n", type, n,
+                        tq_isa_name(isa), nt, t_old, t_new, 100.0 * (t_new / t_old - 1.0));
+        }
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        for (int type : {145, 146, 170, 171})
+            for (int n : {2560, 640}) bench(type, n, n == 2560 ? 640 : 2560);
+        return 0;
+    }
     check_predicates();
     for (int type : {147, 148, 149}) check_type(type, true);
     for (int type : {144, 145, 146}) check_type(type, false);

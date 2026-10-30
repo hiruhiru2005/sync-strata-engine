@@ -83,11 +83,53 @@ void rows_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, con
     }
 }
 
+// QuantLab (10/31): rows_t for R1Q2 blocks (4K code bytes; the block scale colscale[b] * p2[q], rowbase at the end)
+template <int KB>
+void rows_r1_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+               float* const* out, int r0, int r1, const TqScales& sc) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 4 * KB;
+    const long long* tab = (const long long*) table;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        const uint8_t* qr = sc.q + (size_t) r * sc.qbytes;
+        __m128 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* qs = x + (size_t) i * bsz;
+            const uint64_t wr = tq_wrap<KB>(qs);
+            const __m512i w0 = rows8<KB>(tab, qs, wr, 0), w1 = rows8<KB>(tab, qs, wr, 8);
+            const __m512i w2 = rows8<KB>(tab, qs, wr, 16), w3 = rows8<KB>(tab, qs, wr, 24);
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(sc.colscale[i]) * sc.p2[(qr[i >> 2] >> (2 * (i & 3))) & 3]);
+            for (int t = 0; t < nt; ++t) {
+                const __m512i* q = (const __m512i*) (a[t]->q + 128 * i);
+                const __m512i z = _mm512_setzero_si512();
+                const __m128i s = reduce4(_mm512_dpwssd_epi32(z, w0, _mm512_load_si512(q + 0)),
+                                          _mm512_dpwssd_epi32(z, w1, _mm512_load_si512(q + 1)),
+                                          _mm512_dpwssd_epi32(z, w2, _mm512_load_si512(q + 2)),
+                                          _mm512_dpwssd_epi32(z, w3, _mm512_load_si512(q + 3)));
+                const __m128 scl = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), scl, acc[t]);
+            }
+        }
+        const float rb = tq_half_to_float(sc.rowbase[r]);
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = (((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f)) * rb;
+        }
+    }
+}
+
 }  // namespace
 
 void tq_rows_avx512(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1) {
     STRATA_TQ_DISPATCH_K(kb, rows_t, table, w, row_bytes, n, a, nt, out, r0, r1)
+}
+void tq_rows_avx512_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                         int nt, float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, rows_r1_t, table, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
 
 }  // namespace strata::kernels::cpu::tq_detail

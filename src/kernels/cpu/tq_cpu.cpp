@@ -316,11 +316,15 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
     rows_on(isa, tq_kbits(ggml_type), tab, w, row_bytes, n, s.ptr, nt, out, r0, r1);
 }
 
-// QuantLab (10/31): R1Q2 blocks (4K bytes, tq_detail::TqScales).  AVX-512 takes the AVX2 kernel (exact) for now.
+// QuantLab (10/31): R1Q2 blocks (4K bytes, tq_detail::TqScales), each ISA its own kernel as rows_on
 void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n,
                 const tq_detail::TqAct* const* a, int nt, float* const* out, int r0, int r1, const tq_detail::TqScales& sc) {
 #if defined(STRATA_TQ_X86)
-    if (isa == TqIsa::avx512 || isa == TqIsa::avx2) {
+    if (isa == TqIsa::avx512) {
+        tq_detail::tq_rows_avx512_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        return;
+    }
+    if (isa == TqIsa::avx2) {
         tq_detail::tq_rows_avx2_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
     }

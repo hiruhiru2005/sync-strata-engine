@@ -81,7 +81,7 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
                 const void* const* act, int nt, float* const* ff, int r0, int r1);
 namespace tq_detail { struct TqScales; }   // QuantLab (10/31): defined below
 // QuantLab (10/31): the same rows for R1Q2 blocks (4K bytes each, no fp16 d; tq_detail::TqScales per matrix).  The pair
-// layout (147-149) has no R1Q2 form.  AVX-512 runs the AVX2 kernel for now (exact; AVX-512 is only a speed variant there).
+// layout (147-149) has no R1Q2 form.  Every ISA bitwise equal to the scalar R1Q2 kernel (tqp_cpu_test).
 void tq_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                   float* const* out, int r0, int r1, const tq_detail::TqScales& sc);
 void tq_gu_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
@@ -112,6 +112,8 @@ void tq_rows_scalar_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t ro
                          int nt, float* const* out, int r0, int r1, const TqScales& sc);
 void tq_rows_avx2_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
                        int nt, float* const* out, int r0, int r1, const TqScales& sc);
+void tq_rows_avx512_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                         int nt, float* const* out, int r0, int r1, const TqScales& sc);
 // the per-ISA row kernels (dot products only; `out[t][r]` for rows [r0, r1))
 void tq_rows_scalar(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);
