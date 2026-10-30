@@ -27,6 +27,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -997,6 +998,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
+        // QuantLab (10/31): the trellis projections' rotated input and its q8_1 blocks (STRATA_QL_DENSE_TQ only)
+        tqr_x_ = strata::core::ql_dense_tq_active() ? b.take<float>(T * (uint64_t) max_in) : nullptr;
+        tqr_q_ = strata::core::ql_dense_tq_active() ? b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T)) : nullptr;
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
@@ -1258,7 +1262,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
     const int side_mixer_mode = g_side_mixer();
     const bool side_mixer = side_mixer_mode >= 1;
-    const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
+    const bool side_proj = side_mixer_mode >= 2 && !batch_rec_ && !strata::core::ql_dense_tq_active();   // fork b063c13: the GDN gate projection, the QSA queries
     auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
         if (to == side_) note_prio_fork(from);   // STRATA_GRAPH_PRIO: where the high-priority branch leaves cs
         if (cudaEventRecord(e, from) == cudaSuccess && cudaStreamWaitEvent(to, e, 0) == cudaSuccess) return true;
@@ -1292,7 +1296,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
     // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
     // nor under the stage profiler (whose stamps are on `cs`).
-    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
+    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer && !strata::core::ql_dense_tq_active();   // STRATA_SIDE_MIXER wins
     auto fork = [&](int i) {
         cudaEventRecord(df_fork_, cs);
         cudaStreamWaitEvent(df_side_[i], df_fork_, 0);
@@ -1516,7 +1520,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // a projection input's q8_1 blocks and their interleaved copy in one launch (native_quantize_q8_1_il, the same
         // bytes): Turing default (+0.5..+1 % decode, two launches fewer per GDN layer and per QSA layer); STRATA_QIL=0 / 1
         // forces it off / on
+        const float* tqr_src = nullptr;   // QuantLab: the input whose rotated q8_1 blocks tqr_q_ holds (this layer)
         auto quant_in = [&](const float* x, int n_in) {
+            tqr_src = nullptr;
 #if !defined(STRATA_USE_HIP)
             static const int qil_env = [] { const char* v = std::getenv("STRATA_QIL"); return v != nullptr ? std::atoi(v) : -1; }();
             const bool qil = qil_env >= 0 ? qil_env != 0 : device_is_sm75();
@@ -1539,6 +1545,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } else {
                 native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
             }
+        };
+        // QuantLab (10/31, STRATA_QL_DENSE_TQ): a trellis projection reads its input Hadamard-rotated (the width's signs)
+        // and quantized to q8_1 once per input; every other type is mm on xq_ as before
+        auto mmr = [&](const WeightRef* w, const float* xsrc, float* out, int n_in, int n_out) {
+            if (!strata::kernels::native_tq_type(w->native_type)) { mm(w, out, n_in, n_out); return; }
+            if (tqr_src != xsrc) {
+                hadamard_rows(xsrc, tqr_x_, n, n_in, 128, strata::core::ql_dense_tq_signs(n_in), cs);
+                native_quantize_q8_1(tqr_x_, tqr_q_, n_in, n, cs);
+                tqr_src = xsrc;
+            }
+            native_mmvq(w->native_type, w->native_data, tqr_q_, out, n_in, n_out, n, cs);
         };
         try {
             if (!is_qsa_layer(g, l)) {
@@ -1594,7 +1611,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                if (!side_proj) mmr(wqkv, xm, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1627,7 +1644,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj) mmr(wg, xm, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -1676,7 +1693,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
-                mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                mmr(wout, y_ + (size_t) tb * ZV, bo_ + tb * N, (int) ZV, (int) N);
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1814,7 +1831,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool q_il = side_proj && g_mmvq_il() &&
                                   strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
                 auto q_chain = [&](cudaStream_t ns) -> bool {
-                    if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                    if (ns == cs) mmr(wq, xm, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
                     else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
@@ -1868,8 +1885,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                mmr(wk, xm, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                mmr(wv, xm, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -2053,7 +2070,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 14, grp);
                 quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
-                mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                mmr(wo, attn32_ + tb * NH * HD, bo_ + tb * N, (int) (NH * HD), (int) N);
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();

@@ -28,6 +28,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"   // QuantLab: native_tq_type
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -2741,9 +2742,42 @@ struct ColdTrace {
     }
 };
 ColdTrace g_cold;
+// QuantLab (10/31, STRATA_QL_DENSE_TQ): the rotated copy of a trellis projection's prompt input (grows on demand; one GPU)
+uint16_t* g_tq_x = nullptr;
+size_t g_tq_x_elems = 0;
+uint16_t* tq_x_scratch(size_t elems) {
+    if (g_tq_x != nullptr && elems <= g_tq_x_elems) return g_tq_x;
+    if (g_tq_x != nullptr) { (void) cudaDeviceSynchronize(); (void) cudaFree(g_tq_x); g_tq_x = nullptr; g_tq_x_elems = 0; }
+    void* p = nullptr;
+    if (cudaMalloc(&p, elems * sizeof(uint16_t)) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
+    g_tq_x = (uint16_t*) p;
+    g_tq_x_elems = elems;
+    return g_tq_x;
+}
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
+    if (strata::kernels::native_tq_type(w->native_type)) {
+        // the weights are W diag(s) H per 128 inputs: the GEMM reads X rotated the same way (signs first, then H)
+        const int64_t K = w->ne0;
+        const float* sg = core::ql_dense_tq_signs((int) K);
+        uint16_t* xr = tq_x_scratch((size_t) T * (size_t) K);
+        if (sg == nullptr || xr == nullptr) {
+            err = "prefill: " + name + ": no signs or no memory for its rotated input (STRATA_QL_DENSE_TQ)";
+            return false;
+        }
+        cudaStream_t s = (cudaStream_t) gm.stream();
+        if (cudaMemcpy2DAsync(xr, (size_t) K * 2, X, (size_t) (ldx > 0 ? ldx : K) * 2, (size_t) K * 2, (size_t) T,
+                              cudaMemcpyDeviceToDevice, s) != cudaSuccess) {
+            err = "prefill: " + name + ": the rotated input copy failed: " + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        strata::kernels::hadamard_rows_f16(xr, T, K, 128, sg, s);
+        const bool ctq = g_cold.begin();
+        gm.native(xr, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, 0);
+        if (ctq) g_cold.end("native-tq", name, T, w->ne1, w->ne0);
+        return true;
+    }
     const bool ct = g_cold.begin();
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);

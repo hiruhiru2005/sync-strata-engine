@@ -144,6 +144,9 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // and launch helpers; only the
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
+// QuantLab (10/31): an APR trellis type (144-146, 169-174) used as a dense matrix: its input must be Hadamard-rotated
+// per 128 values with the width's signs (strata::core::ql_dense_tq_signs) before the q8_1 quantization
+bool native_tq_type(int t) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);

@@ -423,7 +423,11 @@ bool dequant_bf16_supported(int ggml_type) noexcept {
 
 namespace {
 // plan v0.3 P6: the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
-bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
+bool iq_only(int t) {
+    // QuantLab (10/31): the trellis dense matrices (STRATA_QL_DENSE_TQ) dequantize like the i-quants (dq_dispatch)
+    if (t == 144 || t == 145 || t == 146 || (t >= 169 && t <= 174)) return true;
+    return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29;
+}
 }  // namespace
 
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,

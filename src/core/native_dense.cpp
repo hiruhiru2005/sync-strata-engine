@@ -4,6 +4,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
 
@@ -18,13 +19,60 @@
 #include <set>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <vector>
 
 namespace strata::core {
 namespace {
+// ---- QuantLab (10/31): the trellis dense matrices (STRATA_QL_DENSE_TQ), see native_dense.hpp
+struct TqEntry { int type; int64_t ne0, ne1; uint64_t offset, bytes; };
+struct TqDense {
+    bool on = false;
+    std::string dir, error;
+    std::map<std::string, TqEntry> index;
+    std::map<int, std::vector<float>> signs;     // width -> host signs (kept: the device copies are cached by it)
+    std::map<int, const float*> dsigns;          // width -> device signs, filled by NativeDense::load
+};
+TqDense& tq_dense() {
+    static TqDense t = [] {
+        TqDense d;
+        const char* env = std::getenv("STRATA_QL_DENSE_TQ");
+        if (env == nullptr || !*env) return d;
+        d.dir = env;
+        std::ifstream idx(d.dir + "/dense_tq.txt");
+        if (!idx) { d.error = "STRATA_QL_DENSE_TQ: " + d.dir + "/dense_tq.txt is missing"; return d; }
+        std::string line;
+        while (std::getline(idx, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            std::string name;
+            TqEntry e{};
+            if (!(ss >> name >> e.type >> e.ne0 >> e.ne1 >> e.offset >> e.bytes)) { d.error = "STRATA_QL_DENSE_TQ: bad line: " + line; return d; }
+            d.index[name] = e;
+        }
+        std::ifstream sg(d.dir + "/dense_signs.txt");
+        if (!sg) { d.error = "STRATA_QL_DENSE_TQ: " + d.dir + "/dense_signs.txt is missing"; return d; }
+        while (std::getline(sg, line)) {
+            std::istringstream ss(line);
+            std::string key;
+            if (!(ss >> key) || key != "signs") continue;
+            int w = 0;
+            ss >> w;
+            std::vector<float> v;
+            float x;
+            while (ss >> x) v.push_back(x);
+            if (w <= 0 || (int) v.size() != w) { d.error = "STRATA_QL_DENSE_TQ: bad signs line for width " + std::to_string(w); return d; }
+            d.signs[w] = std::move(v);
+        }
+        d.on = !d.index.empty();
+        return d;
+    }();
+    return t;
+}
 // `load` makes one cudaMalloc per projection matrix, and the driver backs each call with 2 MiB granules
 // (measured on the RTX 5060: 300 buffers of 6.73 MiB asked 2019 MiB and cost 2400).  So a stage's real
 // footprint is the granule-rounded sum, not the payload sum.  This rule - a granule for every matrix of a
@@ -175,6 +223,13 @@ struct Pending {
 };
 }
 
+bool ql_dense_tq_active() { return tq_dense().on && tq_dense().error.empty(); }
+const float* ql_dense_tq_signs(int width) {
+    auto& t = tq_dense();
+    auto it = t.dsigns.find(width);
+    return it == t.dsigns.end() ? nullptr : it->second;
+}
+
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
                                std::set<std::string>& out, std::string& err) {
     try {
@@ -226,7 +281,10 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     err = "native dense: incompatible matrix " + tensor.name;
                     return false;
                 }
-                total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
+                const auto tq = tq_dense().index.find(tensor.name);   // QuantLab: the trellis matrix replaces it
+                total += alloc_bytes(tq_dense().on && tq != tq_dense().index.end()
+                                         ? tq->second.bytes
+                                         : strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
             }
         }
         out = total;
@@ -271,6 +329,18 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     };
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+    if (!tq_dense().error.empty()) { err = tq_dense().error; return false; }
+    std::ifstream tq_bin;
+    uint64_t tq_count = 0, tq_bytes = 0, tq_replaced = 0;
+    if (tq_dense().on) {
+        tq_bin.open(tq_dense().dir + "/dense_tq.bin", std::ios::binary);
+        if (!tq_bin) { err = "STRATA_QL_DENSE_TQ: " + tq_dense().dir + "/dense_tq.bin is missing"; return false; }
+        for (auto& [w, host] : tq_dense().signs) {
+            const float* d = strata::kernels::hadamard_device_signs(host.data(), w);
+            if (d == nullptr) { err = "STRATA_QL_DENSE_TQ: the signs of width " + std::to_string(w) + " could not be uploaded"; return false; }
+            tq_dense().dsigns[w] = d;
+        }
+    }
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
@@ -361,13 +431,36 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
-                const auto bytes = strata::kernels::native_mmvq_weight_bytes(
-                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                // QuantLab (10/31): a matrix STRATA_QL_DENSE_TQ names is uploaded from dense_tq.bin in its trellis type
+                const auto tqe = tq_dense().on ? tq_dense().index.find(tensor.name) : tq_dense().index.end();
+                const bool tq_this = tq_dense().on && tqe != tq_dense().index.end();
+                std::vector<uint8_t> tq_host;
+                if (tq_this) {
+                    const TqEntry& e = tqe->second;
+                    if (!strata::kernels::native_tq_type(e.type) || e.ne0 != ref.ne0 || e.ne1 != ref.ne1 ||
+                        e.bytes != strata::kernels::native_mmvq_weight_bytes(e.type, (int) ref.ne0, (int) ref.ne1) ||
+                        ql_dense_tq_signs((int) ref.ne0) == nullptr) {
+                        err = "STRATA_QL_DENSE_TQ: " + tensor.name + " does not match (type " + std::to_string(e.type) +
+                              ", " + std::to_string(e.ne0) + " x " + std::to_string(e.ne1) + ", or no signs for its width)";
+                        return false;
+                    }
+                    tq_host.resize(e.bytes);
+                    tq_bin.seekg((std::streamoff) e.offset);
+                    if (!tq_bin.read((char*) tq_host.data(), (std::streamsize) e.bytes)) {
+                        err = "STRATA_QL_DENSE_TQ: dense_tq.bin is short at " + tensor.name; return false;
+                    }
+                    ++tq_count;
+                    tq_bytes += e.bytes;
+                    tq_replaced += strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1);
+                }
+                const int up_type = tq_this ? tqe->second.type : (int) tensor.type;
+                const auto bytes = strata::kernels::native_mmvq_weight_bytes(up_type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
                 if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                    status = cudaMemcpy(data.get(), tq_this ? (const void*) tq_host.data() : gguf.tensor_data(tensor), bytes,
+                                        cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
@@ -377,7 +470,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
                 // copy stays: the prompt path's GEMMs read it).
                 DevicePtr packed;
-                if (tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
+                if (!tq_this && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
                     strata::kernels::native_q8_0_packed_enabled() &&
                     strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1)) {
                     std::vector<uint8_t> host(bytes);
@@ -393,7 +486,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         return false;
                     }
                 }
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
+                pending.push_back(Pending{&ref, up_type, bytes, std::move(data), std::move(packed)});
             }
             if (hc_q8_env())
                 for (const auto& tensor : gguf.tensors()) {
@@ -504,6 +597,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);
+        if (tq_count)
+            std::fprintf(stderr, "strata: QuantLab: STRATA_QL_DENSE_TQ: %llu projection matrices as trellis blocks from %s "
+                                 "(%.1f MiB in place of %.1f MiB)\n", (unsigned long long) tq_count, tq_dense().dir.c_str(),
+                         tq_bytes / 1048576.0, tq_replaced / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;

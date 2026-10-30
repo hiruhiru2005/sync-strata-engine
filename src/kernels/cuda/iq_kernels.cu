@@ -882,7 +882,8 @@ STRATA_TQ_MIX_FMT(170) STRATA_TQ_MIX_FMT(171) STRATA_TQ_MIX_FMT(172) STRATA_TQ_M
 #else
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+// QuantLab (10/31): K 9..14 (169..174) too, for the trellis dense matrices (STRATA_QL_DENSE_TQ; native_mmvq routes them here)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149) X(169) X(170) X(171) X(172) X(173) X(174)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -5478,6 +5479,13 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 147: return (size_t) (n / 128) * sizeof(block_tqp5);
         case 148: return (size_t) (n / 128) * sizeof(block_tqp6);
         case 149: return (size_t) (n / 128) * sizeof(block_tqp7);
+        // QuantLab (10/31): the per-expert K rates (2 + 4K bytes per 128-value block), for the trellis dense matrices
+        // (STRATA_QL_DENSE_TQ) that native_mmvq / dequant_f16 hand to iq_mmvq / iq_dequant_f16
+        case 150: return (size_t) (n / 128) * (2 + 4 * 5);
+        case 151: return (size_t) (n / 128) * (2 + 4 * 4);
+        case 162: return (size_t) (n / 128) * (2 + 4 * 2);
+        case 163: return (size_t) (n / 128) * (2 + 4 * 3);
+        case 169: case 170: case 171: case 172: case 173: case 174: return (size_t) (n / 128) * (2 + 4 * (t - 160));
         default: return 0;
     }
 }

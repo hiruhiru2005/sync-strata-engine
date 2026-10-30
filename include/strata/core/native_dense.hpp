@@ -6,6 +6,15 @@
 #include <vector>
 
 namespace strata::core {
+
+// QuantLab (10/31), STRATA_QL_DENSE_TQ=<dir> (opt-in; unset: byte-identical): the projection matrices (attn_qkv, attn_gate,
+// ssm_out, attn_q/k/v, attn_output, the shared experts) come from <dir>/dense_tq.bin as APR trellis blocks (types 144-146,
+// 169-174, 2 + 4K bytes per 128 values) instead of the GGUF.  Their weights are stored Hadamard-rotated along the input
+// (W' = W diag(s) H, per 128 values, signs s per input width from <dir>/dense_signs.txt), so a reader rotates its input
+// the same way first (strata::kernels::hadamard_rows with ql_dense_tq_signs(width)).  Index <dir>/dense_tq.txt:
+// "name type ne0 ne1 offset bytes" per line (ne0 = n_in).
+bool ql_dense_tq_active();
+const float* ql_dense_tq_signs(int width);   // device signs (loaded with the matrices); nullptr when absent
 class WeightTable;
 struct WeightRef;
 
