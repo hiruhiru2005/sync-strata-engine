@@ -86,6 +86,41 @@ void rows_scalar_t(const int16_t* tab, const uint8_t* w, size_t row_bytes, int n
     }
 }
 
+// QuantLab (10/31): rows_scalar_t for R1Q2 blocks (4K code bytes, the scale from tq_detail::TqScales)
+template <int KB>
+void rows_scalar_r1_t(const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const tq_detail::TqAct* const* a, int nt,
+                      float* const* out, int r0, int r1, const tq_detail::TqScales& sc) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 4 * KB;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        const uint8_t* qr = sc.q + (size_t) r * sc.qbytes;
+        float acc[kTqMaxTokens][4] = {};
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * bsz;
+            const float dx = tq_detail::tq_half_to_float(sc.colscale[i]) * sc.p2[(qr[i >> 2] >> (2 * (i & 3))) & 3];
+            uint32_t st[32];
+            tq_detail::tq_states<KB>(blk, st);
+            for (int t = 0; t < nt; ++t) {
+                const int16_t* q = a[t]->q + 128 * i;
+                for (int k = 0; k < 4; ++k) {
+                    int32_t s = 0;
+                    for (int j = 0; j < 8; ++j) {
+                        const int16_t* wv = tab + 4 * st[8 * k + j];
+                        const int16_t* qv = q + 32 * k + 4 * j;
+                        s += wv[0] * qv[0] + wv[1] * qv[1] + wv[2] * qv[2] + wv[3] * qv[3];
+                    }
+                    const float scl = dx * a[t]->d[4 * i + k];
+                    acc[t][k] = std::fma((float) s, scl, acc[t][k]);
+                }
+            }
+        }
+        const float rb = tq_detail::tq_half_to_float(sc.rowbase[r]);
+        for (int t = 0; t < nt; ++t)
+            out[t][r] = (((acc[t][0] + acc[t][1]) + (acc[t][2] + acc[t][3])) * (1.0f / 8192.0f)) * rb;
+    }
+}
+
 // TQP (Gyro-L): 64 pair-trellis steps of 2 weights; a 32-value group is 16 steps.  The table row holds the
 // TQ2_T state's two pairs; TQP uses the first pair only (weight 2t+j = lut[2*hyb(2*s)+j]).
 template <int KB>
@@ -209,6 +244,10 @@ void tq_rows_scalar(int kb, const int16_t* tab, const uint8_t* w, size_t row_byt
     STRATA_TQ_DISPATCH_K(kb, rows_scalar_t, tab, w, row_bytes, n, a, nt, out, r0, r1)
 }
 
+void tq_rows_scalar_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                         int nt, float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, rows_scalar_r1_t, tab, w, row_bytes, n, a, nt, out, r0, r1, sc)
+}
 void tq_rows_scalar_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                         float* const* out, int r0, int r1) {
     if (kb == 5) rows_scalar_tqp_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
@@ -275,6 +314,49 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
         return;
     }
     rows_on(isa, tq_kbits(ggml_type), tab, w, row_bytes, n, s.ptr, nt, out, r0, r1);
+}
+
+// QuantLab (10/31): R1Q2 blocks (4K bytes, tq_detail::TqScales).  AVX-512 takes the AVX2 kernel (exact) for now.
+void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n,
+                const tq_detail::TqAct* const* a, int nt, float* const* out, int r0, int r1, const tq_detail::TqScales& sc) {
+#if defined(STRATA_TQ_X86)
+    if (isa == TqIsa::avx512 || isa == TqIsa::avx2) {
+        tq_detail::tq_rows_avx2_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        return;
+    }
+#endif
+    (void) isa;
+    tq_detail::tq_rows_scalar_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
+}
+void tq_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                  float* const* out, int r0, int r1, const tq_detail::TqScales& sc) {
+    if (!tq_isa_ok(isa) || (ggml_type >= 147 && ggml_type <= 149)) std::abort();   // a caller bug
+    const ActSet& s = unpack_all(act, n, nt);
+    rows_r1_on(isa, tq_kbits(ggml_type), tq_state_table_for(ggml_type), w, row_bytes, n, s.ptr, nt, out, r0, r1, sc);
+}
+void tq_gu_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                     const void* const* act, int nt, float* const* ff, int r0, int r1, const tq_detail::TqScales& g,
+                     const tq_detail::TqScales& u) {
+    if (!tq_isa_ok(isa) || (ggml_type >= 147 && ggml_type <= 149)) std::abort();
+    const int16_t* tab = tq_state_table_for(ggml_type);
+    const ActSet& s = unpack_all(act, n, nt);
+    thread_local std::vector<float> gbuf, ubuf;
+    const size_t nr = (size_t) r1;
+    if (gbuf.size() < nr * kTqMaxTokens) { gbuf.resize(nr * kTqMaxTokens); ubuf.resize(nr * kTqMaxTokens); }
+    float* gp[kTqMaxTokens];
+    float* up[kTqMaxTokens];
+    for (int t = 0; t < nt; ++t) {
+        gp[t] = gbuf.data() + (size_t) t * nr;
+        up[t] = ubuf.data() + (size_t) t * nr;
+    }
+    const int kb = tq_kbits(ggml_type);
+    rows_r1_on(isa, kb, tab, blob, gu_row, n, s.ptr, nt, gp, r0, r1, g);
+    rows_r1_on(isa, kb, tab, blob + up_off, gu_row, n, s.ptr, nt, up, r0, r1, u);
+    for (int t = 0; t < nt; ++t)
+        for (int r = r0; r < r1; ++r) {
+            const float gv = gp[t][r], uv = up[t][r];
+            ff[t][r] = (gv / (1.f + std::exp(-gv))) * uv;   // tq_gu_rows' SwiGLU expression
+        }
 }
 
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,

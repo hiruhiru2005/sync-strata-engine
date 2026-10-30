@@ -75,6 +75,54 @@ void rows_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, con
     }
 }
 
+// QuantLab (10/31): rows_t for R1Q2 blocks (4K code bytes; the block scale colscale[b] * p2[q], rowbase at the end)
+template <int KB>
+void rows_r1_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+               float* const* out, int r0, int r1, const TqScales& sc) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 4 * KB;
+    const long long* tab = (const long long*) table;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        const uint8_t* qr = sc.q + (size_t) r * sc.qbytes;
+        __m128 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* qs = x + (size_t) i * bsz;
+            const uint64_t wr = tq_wrap<KB>(qs);
+            __m256i wv[8];
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+            for (int m = 0; m < 8; ++m)
+                wv[m] = rows4(tab, tq_state<KB>(qs, wr, 4 * m), tq_state<KB>(qs, wr, 4 * m + 1),
+                              tq_state<KB>(qs, wr, 4 * m + 2), tq_state<KB>(qs, wr, 4 * m + 3));
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(sc.colscale[i]) * sc.p2[(qr[i >> 2] >> (2 * (i & 3))) & 3]);
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(wv[0], _mm256_load_si256(q + 0)),
+                                                    _mm256_madd_epi16(wv[1], _mm256_load_si256(q + 1)));
+                const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(wv[2], _mm256_load_si256(q + 2)),
+                                                    _mm256_madd_epi16(wv[3], _mm256_load_si256(q + 3)));
+                const __m256i p2 = _mm256_add_epi32(_mm256_madd_epi16(wv[4], _mm256_load_si256(q + 4)),
+                                                    _mm256_madd_epi16(wv[5], _mm256_load_si256(q + 5)));
+                const __m256i p3 = _mm256_add_epi32(_mm256_madd_epi16(wv[6], _mm256_load_si256(q + 6)),
+                                                    _mm256_madd_epi16(wv[7], _mm256_load_si256(q + 7)));
+                const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(p0, p1), _mm256_hadd_epi32(p2, p3));
+                const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
+                const __m128 scl = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), scl, acc[t]);
+            }
+        }
+        const float rb = tq_half_to_float(sc.rowbase[r]);
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = (((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f)) * rb;
+        }
+    }
+}
+
 // TQP (147-149): 64 pair-steps per 128-value block.  A step's two weights are the FIRST pair of its state
 // table row, so 8 states make one YMM of 16 int16 weights, and a 32-value group (16 steps) is two YMM of
 // weights against two YMM of activations: VPMADDWD, one exact int32 sum per group, then the four group sums
@@ -151,6 +199,10 @@ void tq_rows_avx2_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const T
 void tq_rows_avx2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1) {
     STRATA_TQ_DISPATCH_K(kb, rows_t, table, w, row_bytes, n, a, nt, out, r0, r1)
+}
+void tq_rows_avx2_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                       float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, rows_r1_t, table, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
 
 }  // namespace strata::kernels::cpu::tq_detail

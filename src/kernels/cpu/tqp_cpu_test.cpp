@@ -226,12 +226,117 @@ void check_type(int type, bool reference) {
     }
 }
 
+// ---- QuantLab (10/31): R1Q2 blocks (4K code bytes; d = colscale[b] * p2[q[r][b]], rowbase[r] at the end) against the
+// same codes in the old layout with d = fp16(colscale * p2) per block and the row's result times rowbase: equal up to the
+// fp16 rounding of d (relative 2^-11 a block).  Every ISA bitwise equal to the scalar R1Q2 kernel, fused gate/up too.
+uint16_t to_half(float f) {
+    // round to nearest even through the float bits (normal positive values only here)
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int e = (int) ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t m = x & 0x7FFFFFu;
+    if (e <= 0 || e >= 31) return (uint16_t) sign;   // not used for out-of-range values
+    uint32_t h = sign | ((uint32_t) e << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
+    return (uint16_t) h;
+}
+
+void check_r1q2(int type, int n) {
+    const int K = tq_kbits(type), nb = n / 128, rows = 37, qbytes = (nb + 3) / 4;
+    std::mt19937 rng(4242u + (uint32_t) type + (uint32_t) n);
+    std::uniform_int_distribution<int> byte(0, 255), qv(0, 3), ex(13, 16), man(0, 1023);
+    const size_t cb = (size_t) 4 * K, rb_new = cb * nb, rb_old = (2 + cb) * nb;
+    std::vector<uint8_t> wn(rb_new * rows), wo(rb_old * rows), q((size_t) qbytes * rows, 0);
+    std::vector<uint16_t> rbase(rows), cscale(nb);
+    tq_detail::TqScales sc;
+    sc.p2[0] = 0.5f; sc.p2[1] = 0.7071067f; sc.p2[2] = 1.0f; sc.p2[3] = 1.4142135f;
+    for (auto& h : rbase) h = (uint16_t) ((ex(rng) << 10) | man(rng));   // 0.5 .. 4
+    for (auto& h : cscale) h = (uint16_t) (((ex(rng) - 4) << 10) | man(rng));   // ~ 2^-6 .. 2^-3
+    for (int r = 0; r < rows; ++r)
+        for (int b = 0; b < nb; ++b) {
+            const int code = qv(rng);
+            q[(size_t) r * qbytes + b / 4] |= (uint8_t) (code << (2 * (b % 4)));
+            uint8_t* dn = &wn[(size_t) r * rb_new + (size_t) b * cb];
+            uint8_t* dd = &wo[(size_t) r * rb_old + (size_t) b * (2 + cb)];
+            for (size_t j = 0; j < cb; ++j) dn[j] = (uint8_t) byte(rng);
+            std::memcpy(dd + 2, dn, cb);
+            const uint16_t h = to_half(tq_detail::tq_half_to_float(cscale[b]) * sc.p2[code]);
+            std::memcpy(dd, &h, 2);
+        }
+    sc.rowbase = rbase.data(); sc.colscale = cscale.data(); sc.q = q.data(); sc.qbytes = qbytes;
+    std::vector<std::vector<uint8_t>> act(NT);
+    std::vector<std::vector<float>> d(NT);
+    std::vector<std::vector<int>> qq(NT);
+    const void* ap[NT];
+    for (int t = 0; t < NT; ++t) { act[t] = random_q8_0(n, rng, d[t], qq[t]); ap[t] = act[t].data(); }
+    std::vector<float> o_new((size_t) NT * rows), o_old((size_t) NT * rows), o_isa((size_t) NT * rows);
+    float* pn[NT]; float* po[NT]; float* pi[NT];
+    for (int t = 0; t < NT; ++t) {
+        pn[t] = o_new.data() + (size_t) t * rows; po[t] = o_old.data() + (size_t) t * rows; pi[t] = o_isa.data() + (size_t) t * rows;
+    }
+    tq_rows_r1q2(TqIsa::scalar, type, wn.data(), rb_new, n, ap, NT, pn, 0, rows / 3, sc);
+    tq_rows_r1q2(TqIsa::scalar, type, wn.data(), rb_new, n, ap, NT, pn, rows / 3, rows, sc);
+    tq_rows(TqIsa::scalar, type, wo.data(), rb_old, n, ap, NT, po, 0, rows);
+    double worst = 0;
+    int bad = 0;
+    for (int t = 0; t < NT; ++t)
+        for (int r = 0; r < rows; ++r) {
+            const double want = (double) po[t][r] * tq_detail::tq_half_to_float(rbase[r]);
+            const double got = pn[t][r];
+            const double rel = std::fabs(got - want) / (std::fabs(want) + 1e-6);
+            worst = std::fmax(worst, rel);
+            if (rel > 4e-3) ++bad;
+        }
+    std::printf("type %d n %d R1Q2 scalar vs the old layout (d = fp16 of the scale) x rowbase: %d of %d outside 4e-3, worst %.2e\n",
+                type, n, bad, NT * rows, worst);
+    if (bad) fail("R1Q2 scalar differs from the old layout", type, n);
+    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx512}) {
+        if (!tq_isa_ok(isa)) { std::printf("type %d R1Q2 %-6s not on this CPU: skipped\n", type, tq_isa_name(isa)); continue; }
+        bool ok = true;
+        for (int nt = 1; nt <= NT; ++nt) {
+            tq_rows_r1q2(isa, type, wn.data(), rb_new, n, ap, nt, pi, 0, rows, sc);
+            ok = ok && same_bits(o_isa.data(), o_new.data(), (size_t) nt * rows);
+        }
+        std::printf("type %d n %d R1Q2 %-6s vs the scalar R1Q2 kernel: %s\n", type, n, tq_isa_name(isa), ok ? "bitwise equal" : "DIFFERENT");
+        if (!ok) fail("R1Q2 ISA differs from scalar", type, n);
+    }
+    // fused gate/up: the same rows as gate and up (own scales each: up uses rowbase reversed)
+    std::vector<uint8_t> blob = wn;
+    blob.insert(blob.end(), wn.begin(), wn.end());
+    std::vector<uint16_t> rb_up(rbase.rbegin(), rbase.rend());
+    tq_detail::TqScales su = sc;
+    su.rowbase = rb_up.data();
+    std::vector<float> f0((size_t) NT * rows), f1((size_t) NT * rows);
+    float* q0[NT]; float* q1[NT];
+    for (int t = 0; t < NT; ++t) { q0[t] = f0.data() + (size_t) t * rows; q1[t] = f1.data() + (size_t) t * rows; }
+    tq_gu_rows_r1q2(TqIsa::scalar, type, blob.data(), rb_new, wn.size(), n, ap, NT, q0, 0, rows, sc, su);
+    bool okg = true;
+    for (int t = 0; t < NT && okg; ++t)
+        for (int r = 0; r < rows; ++r) {
+            const float g = pn[t][r], u = o_new[(size_t) t * rows + r] / tq_detail::tq_half_to_float(rbase[r]) *
+                                              tq_detail::tq_half_to_float(rb_up[r]);
+            const float want = (g / (1.f + std::exp(-g))) * u;
+            if (std::fabs(q0[t][r] - want) > 1e-4f * (std::fabs(want) + 1e-3f)) { okg = false; break; }
+        }
+    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx512}) {
+        if (!tq_isa_ok(isa)) continue;
+        tq_gu_rows_r1q2(isa, type, blob.data(), rb_new, wn.size(), n, ap, NT, q1, 0, rows, sc, su);
+        okg = okg && same_bits(f0.data(), f1.data(), f0.size());
+    }
+    std::printf("type %d n %d R1Q2 gate/up rows (own scales, every ISA): %s\n", type, n, okg ? "ok" : "DIFFERENT");
+    if (!okg) fail("R1Q2 gate/up rows differ", type, n);
+}
+
 }  // namespace
 
 int main() {
     check_predicates();
     for (int type : {147, 148, 149}) check_type(type, true);
     for (int type : {144, 145, 146}) check_type(type, false);
+    for (int type : {145, 146, 144, 172, 174})   // QuantLab (10/31): R1Q2 blocks (K 6, 7, 8, 12, 14)
+        for (int n : {2560, 640}) check_r1q2(type, n);
     std::printf("tqp_cpu_test: %d failures\n", g_fail);
     return g_fail ? 1 : 0;
 }
