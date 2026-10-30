@@ -10874,6 +10874,9 @@ int main(int argc, char** argv) {
                             stamp(o.pack + "/" + n);
                     if (srcp != nullptr)
                         for (const auto& input : srcp->model_inputs()) stamp(input.second);
+                    // QuantLab (10/31): the trellis dense matrices change every K/V a conversation holds
+                    if (const char* tqd = std::getenv("STRATA_QL_DENSE_TQ"); tqd != nullptr && *tqd)
+                        for (const char* n : {"dense_tq.txt", "dense_tq.bin", "dense_signs.txt"}) stamp(std::string(tqd) + "/" + n);
                     c.switches.push_back({"ql.pack_files", (int64_t) pk.digest()});
                 }
                 config_fp = strata::core::session_config_fingerprint(c);
