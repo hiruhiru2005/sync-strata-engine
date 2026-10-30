@@ -279,18 +279,27 @@ void check_r1q2(int type, int n) {
     tq_rows_r1q2(TqIsa::scalar, type, wn.data(), rb_new, n, ap, NT, pn, 0, rows / 3, sc);
     tq_rows_r1q2(TqIsa::scalar, type, wn.data(), rb_new, n, ap, NT, pn, rows / 3, rows, sc);
     tq_rows(TqIsa::scalar, type, wo.data(), rb_old, n, ap, NT, po, 0, rows);
+    // relative to |want| + the outputs' RMS: a row whose blocks cancel to ~0 keeps the blocks' own error (fp16 of d,
+    // 2^-11 a block), which is not small against the row's tiny result
+    double ss = 0;
+    for (int t = 0; t < NT; ++t)
+        for (int r = 0; r < rows; ++r) {
+            const double w = (double) po[t][r] * tq_detail::tq_half_to_float(rbase[r]);
+            ss += w * w;
+        }
+    const double rms = std::sqrt(ss / (NT * rows)) + 1e-12;
     double worst = 0;
     int bad = 0;
     for (int t = 0; t < NT; ++t)
         for (int r = 0; r < rows; ++r) {
             const double want = (double) po[t][r] * tq_detail::tq_half_to_float(rbase[r]);
             const double got = pn[t][r];
-            const double rel = std::fabs(got - want) / (std::fabs(want) + 1e-6);
+            const double rel = std::fabs(got - want) / (std::fabs(want) + rms);
             worst = std::fmax(worst, rel);
-            if (rel > 4e-3) ++bad;
+            if (rel > 2e-3) ++bad;
         }
-    std::printf("type %d n %d R1Q2 scalar vs the old layout (d = fp16 of the scale) x rowbase: %d of %d outside 4e-3, worst %.2e\n",
-                type, n, bad, NT * rows, worst);
+    std::printf("type %d n %d R1Q2 scalar vs the old layout (d = fp16 of the scale) x rowbase: %d of %d outside 2e-3 of "
+                "|want| + RMS, worst %.2e\n", type, n, bad, NT * rows, worst);
     if (bad) fail("R1Q2 scalar differs from the old layout", type, n);
     for (TqIsa isa : {TqIsa::avx2, TqIsa::avx512}) {
         if (!tq_isa_ok(isa)) { std::printf("type %d R1Q2 %-6s not on this CPU: skipped\n", type, tq_isa_name(isa)); continue; }
