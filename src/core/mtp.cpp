@@ -19,6 +19,8 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -436,6 +438,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); y_ = b.take<float>(T * N);
         sample_ = b.take<float>(T * N);
+        trot_ = strata::core::ql_dense_tq_active() ? b.take<float>(T * N) : nullptr;   // QuantLab
         {
             const strata::kernels::GrShapes gsh{g.n_embd, g.hc, g.hc_lr};
             uint8_t* gr_mem = b.take<uint8_t>(strata::kernels::gr_workspace_bytes(gsh));
@@ -1235,6 +1238,10 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
                         sample_ + t * N, dummy_inj_, cs);
         }
         g_mp.stamp(13, cs);
+        if (strata::kernels::native_tq_type(dhead_ != nullptr ? dhead_type_ : head_->type())) {   // QuantLab: trellis head
+            strata::kernels::hadamard_rows(sample_, trot_, T, N, 128, strata::core::ql_dense_tq_signs((int) N), cs);
+            native_quantize_q8_1(trot_, xq_, (int) N, T, cs);
+        } else
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;

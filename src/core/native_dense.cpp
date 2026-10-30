@@ -224,6 +224,28 @@ struct Pending {
 }
 
 bool ql_dense_tq_active() { return tq_dense().on && tq_dense().error.empty(); }
+bool ql_dense_tq_read(const std::string& name, int64_t ne0, int64_t ne1, int& type, std::vector<uint8_t>& out,
+                      std::string& err) {
+    auto& t = tq_dense();
+    if (!t.on) return false;
+    auto it = t.index.find(name);
+    if (it == t.index.end()) return false;
+    const TqEntry& e = it->second;
+    if (!strata::kernels::native_tq_type(e.type) || e.ne0 != ne0 || e.ne1 != ne1 ||
+        e.bytes != strata::kernels::native_mmvq_weight_bytes(e.type, (int) ne0, (int) ne1)) {
+        err = "STRATA_QL_DENSE_TQ: " + name + " does not match its expected shape or type";
+        return false;
+    }
+    std::ifstream f(t.dir + "/dense_tq.bin", std::ios::binary);
+    out.resize(e.bytes);
+    f.seekg((std::streamoff) e.offset);
+    if (!f || !f.read((char*) out.data(), (std::streamsize) e.bytes)) {
+        err = "STRATA_QL_DENSE_TQ: dense_tq.bin is short at " + name;
+        return false;
+    }
+    type = e.type;
+    return true;
+}
 const float* ql_dense_tq_signs(int width) {
     auto& t = tq_dense();
     auto it = t.dsigns.find(width);

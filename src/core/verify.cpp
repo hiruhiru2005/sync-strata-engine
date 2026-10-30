@@ -2502,6 +2502,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (head_ != nullptr && head_->loaded()) {
             try {
+                if (strata::kernels::native_tq_type(head_->type())) {   // QuantLab: a trellis head reads a rotated input
+                    hadamard_rows(head_mixed_, tqr_x_, T, N, 128, strata::core::ql_dense_tq_signs((int) N), cs);
+                    native_quantize_q8_1(tqr_x_, xq_, (int) N, T, cs);
+                } else
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
                     if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);

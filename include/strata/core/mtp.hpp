@@ -314,6 +314,7 @@ private:
     /// and with --pipeline-windows a chain and that stage's window can run on the card at once)
     strata::kernels::GrWorkspace own_gr_;
     uint8_t* xq_ = nullptr;
+    float* trot_ = nullptr;   // QuantLab (10/31): the draft head's rotated input when the head is trellis (STRATA_QL_DENSE_TQ)
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *y_ = nullptr, *sample_ = nullptr;

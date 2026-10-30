@@ -2,6 +2,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -22,8 +23,10 @@ void NativeHead::unload() {
     if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
+    if (rot_) cudaFree(rot_);
     scratch_ = nullptr;
     weights_ = nullptr;
+    rot_ = nullptr;
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
@@ -46,9 +49,16 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
             return false;
         }
-        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        // QuantLab (10/31): STRATA_QL_DENSE_TQ may name output.weight: its trellis bytes replace the GGUF's
+        int tq_type = -1;
+        std::vector<uint8_t> tq_host;
+        const bool tq = ql_dense_tq_read("output.weight", n_in, n_out, tq_type, tq_host, err);
+        if (!err.empty()) return false;
+        if (tq && ql_dense_tq_signs((int) n_in) == nullptr) { err = "native head: no trellis signs for its width"; return false; }
+        const int up_type = tq ? tq_type : (int) tensor->type;
+        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes(up_type, (int) n_in, (int) n_out);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
-        if (tensor->offset > payload || bytes > payload - tensor->offset) {
+        if (!tq && (tensor->offset > payload || bytes > payload - tensor->offset)) {
             err = "native head: truncated output.weight payload";
             return false;
         }
@@ -57,9 +67,15 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         cudaError_t status = cudaMalloc(&weights, bytes);
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+        if (status == cudaSuccess && tq) {
+            void* r = nullptr;
+            status = cudaMalloc(&r, (size_t) n_in * sizeof(float));
+            rot_ = (float*) r;
+        }
+        if (!tq) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status == cudaSuccess)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+            status = cudaMemcpy(weights, tq ? (const void*) tq_host.data() : gguf.tensor_data(*tensor), bytes,
+                                cudaMemcpyHostToDevice);
         if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
@@ -72,7 +88,10 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         bytes_ = bytes;
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
-        type_ = (int) tensor->type;
+        type_ = up_type;
+        if (tq)
+            std::fprintf(stderr, "strata: QuantLab: STRATA_QL_DENSE_TQ: the output head as trellis type %d (%.1f MiB)\n",
+                         type_, bytes / 1048576.0);
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
@@ -92,6 +111,10 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
     try {
         if (type_ == 13) {
             strata::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
+        } else if (strata::kernels::native_tq_type(type_)) {   // QuantLab: the input rotated like the trellis head
+            strata::kernels::hadamard_rows(mixed, rot_, 1, n_in_, 128, ql_dense_tq_signs(n_in_), stream);
+            strata::kernels::native_quantize_q8_1(rot_, scratch_, n_in_, 1, stream);
+            strata::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);
         } else {
             strata::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
             strata::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);

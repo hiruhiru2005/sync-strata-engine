@@ -35,6 +35,7 @@ public:
 private:
     void* weights_ = nullptr;
     void* scratch_ = nullptr;
+    float* rot_ = nullptr;   // QuantLab (10/31): the rotated input of a trellis head (STRATA_QL_DENSE_TQ), n_in floats
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;

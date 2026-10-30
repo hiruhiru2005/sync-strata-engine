@@ -15,6 +15,10 @@ namespace strata::core {
 // "name type ne0 ne1 offset bytes" per line (ne0 = n_in).
 bool ql_dense_tq_active();
 const float* ql_dense_tq_signs(int width);   // device signs (loaded with the matrices); nullptr when absent
+// the trellis bytes of `name` (n_in ne0, n_out ne1) when the folder names it: true with type/out filled; false with err
+// empty when it does not, false with err set when it does but does not match
+bool ql_dense_tq_read(const std::string& name, int64_t ne0, int64_t ne1, int& type, std::vector<uint8_t>& out,
+                      std::string& err);
 class WeightTable;
 struct WeightRef;
 
