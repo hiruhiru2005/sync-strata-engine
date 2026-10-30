@@ -470,6 +470,20 @@ static bool ql_kv_grow_demote() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_KV_GROW_DEMOTE"); return v == nullptr || std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (10/31): past the slots below the loan, the elastic K/V takes the loan's lowest slots (kvg_ensure) instead of new
+// VRAM; the loan keeps room for STRATA_QL_KV_LOAN_MIN_CHUNK-token chunks (default 1024).  STRATA_QL_KV_LOAN=0: as 10/29.
+static bool ql_kv_loan() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_KV_LOAN"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+static int64_t ql_kv_loan_min_chunk() {
+    static const int64_t c = [] {
+        const char* v = std::getenv("STRATA_QL_KV_LOAN_MIN_CHUNK");
+        const int64_t n = v != nullptr ? std::atoll(v) : 1024;
+        return std::max<int64_t>(256, n / 256 * 256);
+    }();
+    return c;
+}
 static bool ql_kv_grow_moves() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_KV_GROW_MOVES"); return v == nullptr || std::atoi(v) != 0; }();
     return on;
@@ -8853,12 +8867,20 @@ int main(int argc, char** argv) {
         // kvg_trim, `demote` the given-back experts go into the RAM copy, `moves` hotter experts move into colder slots
         bool ql = false, demote = false, moves = true;
         int64_t ql_demoted = 0, ql_in_ram = 0, ql_on_file = 0;   // the experts given back, by where they are read from
+        // QuantLab (10/31), STRATA_QL_KV_LOAN (on by default beside STRATA_QL_KV_GROW_RESIDENT): once the slots below the
+        // prompt path's loan are gone, the K/V goes on into the loan's lowest slots (`top` moves up, at most to `top_cap`)
+        // instead of mapping new VRAM, which the cache sized at start had already taken (the unmapped K/V was counted as
+        // expert slots).  The loan then starts at `top` or above: a request reads its prompt in smaller chunks (lend's
+        // halving), down to the chunk `top_cap` keeps room for.  `top0`: where the loan started; kvg_trim moves back to it.
+        bool loan = false;
+        int64_t top0 = 0, top_cap = 0, loan_min_chunk = 0, loan_taken = 0;
     } kvg;
-    auto kvg_start = [&](int64_t top) {
+    auto kvg_start = [&](int64_t top, int64_t top_cap = -1) {
         kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
                  !host_res.empty() && srcp != nullptr && top > kvg.floor;
         if (!kvg.on) return;
-        kvg.top = kvg.lo = top;
+        kvg.top = kvg.lo = kvg.top0 = top;
+        kvg.top_cap = std::max<int64_t>(top, top_cap);
         kvg.cells = strata::core::qsa_kv_elastic_cells();
         if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::atoll(v) > 0) kvg.step = std::atoll(v);
         // tests: the cache keeps this many slots (its size: the K/V grows into new VRAM only)
@@ -8916,11 +8938,33 @@ int main(int argc, char** argv) {
                          kvg.demote ? "go into the RAM copy in place of colder ones (the copy does not grow)"
                                     : "are read from the drive (STRATA_QL_KV_GROW_DEMOTE=0, or no RAM copy)",
                          kvg.moves ? "" : "; no moves into colder slots (STRATA_QL_KV_GROW_MOVES=0)");
-            if (reach < o.max_context)
+            // QuantLab (10/31): the loan's lowest slots too, up to top_cap (STRATA_QL_KV_LOAN=0: below the loan only)
+            kvg.loan = ql_kv_loan() && kvg.top_cap > kvg.top;
+            int64_t reach_loan = reach;
+            if (kvg.loan) {
+                const int64_t c1l = (int64_t) (xcache.slot_offset(kvg.top_cap) / G);
+                const int64_t room_l = std::max<int64_t>(0, c1l - c0);
+                int64_t lo = 1, hi = (o.max_context + kvg.step - 1) / kvg.step;
+                while (lo <= hi) {
+                    const int64_t mid = lo + (hi - lo) / 2;
+                    if (strata::core::qsa_kv_elastic_need(target_of(mid)) <= room_l) {
+                        reach_loan = std::max<int64_t>(reach_loan, target_of(mid));
+                        lo = mid + 1;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                std::fprintf(stderr, "strata generate: QuantLab: past %lld cells the K/V goes on into the prompt path's loan "
+                                     "(STRATA_QL_KV_LOAN): up to %lld of its %lld slots, so the loan keeps room for %lld-token "
+                                     "chunks; with them the K/V reaches %lld of %lld cells without new VRAM\n",
+                             (long long) reach, (long long) (kvg.top_cap - kvg.top), (long long) (xcache.slots() - kvg.top),
+                             (long long) kvg.loan_min_chunk, (long long) reach_loan, (long long) o.max_context);
+            }
+            if (reach_loan < o.max_context)
                 std::fprintf(stderr, "strata generate: QuantLab: WARNING: past %lld cells the K/V needs more VRAM than the cache "
-                                     "can give below the prompt path's loan: it maps new VRAM, and the engine stops (\"the K/V "
+                                     "can give %s: it maps new VRAM, and the engine stops (\"the K/V "
                                      "cannot grow\") when there is none - a smaller --max-context or prompt chunk keeps it inside\n",
-                             (long long) reach);
+                             (long long) reach_loan, kvg.loan ? "below and out of the prompt path's loan" : "below the prompt path's loan");
         }
     };
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
@@ -9016,7 +9060,7 @@ int main(int argc, char** argv) {
             }
             q_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
         };
-        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
+        auto init_owner = [&]() {
             if (owner.empty()) {
                 owner.assign((size_t) xcache.slots(), -1);
                 for (size_t i = 0; i < host_res.size(); ++i)
@@ -9028,9 +9072,10 @@ int main(int argc, char** argv) {
                     if (host_res[i] >= kvg.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
                 std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             }
-            --kvg.lo;
-            ++gave;
-            if (const int32_t oi = owner[(size_t) kvg.lo]; oi >= 0) {
+        };
+        // the slot `s` gives its expert up (or moves it into a colder slot of the loan region) for the K/V
+        auto give = [&](int32_t s) {
+            if (const int32_t oi = owner[(size_t) s]; oi >= 0) {
                 const int64_t layer = oi / g.n_expert;
                 int32_t vi = -1;
                 if (kvg.ql) {
@@ -9048,18 +9093,19 @@ int main(int argc, char** argv) {
                         const int32_t vs = host_res[(size_t) ci_i];
                         nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
                         const int32_t qv = ql_stage(ci_i, vs);   // read back before the move overwrites the slot
-                        if (cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo), (size_t) own,
+                        if (cudaMemcpy(xcache.device_slot(vs), xcache.device_slot(s), (size_t) own,
                                        cudaMemcpyDeviceToDevice) == cudaSuccess) {
                             vi = ci_i;
                             cold.erase(cold.begin() + (ptrdiff_t) ci);
                             host_res[(size_t) oi] = vs;
                             host_res[(size_t) vi] = strata::core::kNotResident;
+                            owner[(size_t) vs] = oi;   // QuantLab (10/31): the loan's slots may be given up later in this call
                             ++moved;
                             if (qv >= 0) ql_install(vi, qv);
                         }
                     }
-                    if (vi < 0) {   // oi gives its slot up: its bytes stay in slot lo until the unmap below
-                        const int32_t qv = ql_stage(oi, (int32_t) kvg.lo);
+                    if (vi < 0) {   // oi gives its slot up: its bytes stay in slot s until the unmap below
+                        const int32_t qv = ql_stage(oi, s);
                         if (qv >= 0) ql_install(oi, qv);
                     }
                 } else if (!cold.empty() && cold.back().first < heat(oi)) {
@@ -9068,19 +9114,43 @@ int main(int argc, char** argv) {
                     nib::guard_raw(layer, "the elastic K/V's slot move (kvg_ensure)");
                     const uint64_t own = lay.expert_bytes(layer, oi % g.n_expert);   // QuantLab: the moved expert's own size
                     if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < own ||
-                        cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
+                        cudaMemcpy(xcache.device_slot(vs), xcache.device_slot(s),
                                    (size_t) own, cudaMemcpyDeviceToDevice) != cudaSuccess)
                         vi = -1;
                     else {
                         cold.pop_back();
                         host_res[(size_t) oi] = vs;
                         host_res[(size_t) vi] = strata::core::kNotResident;
+                        owner[(size_t) vs] = oi;
                         ++moved;
                     }
                 }
                 if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;
                 ++kvg.evicted;
             }
+            owner[(size_t) s] = -1;
+        };
+        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
+            init_owner();
+            --kvg.lo;
+            ++gave;
+            give((int32_t) kvg.lo);
+        }
+        // QuantLab (10/31), STRATA_QL_KV_LOAN: past the floor, the loan's lowest slots (it starts higher: `top` moves up)
+        int64_t took = 0;
+        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.loan && kvg.top < kvg.top_cap) {
+            init_owner();
+            const int32_t s = (int32_t) kvg.top;
+            if (const int32_t so = owner[(size_t) s]; so >= 0)   // it is no colder slot to move into any more
+                for (size_t k = 0; k < cold.size(); ++k)
+                    if (cold[k].second == so) {
+                        cold.erase(cold.begin() + (ptrdiff_t) k);
+                        break;
+                    }
+            ++kvg.top;
+            ++gave;
+            ++took;
+            give(s);
         }
         // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given up, and a
         // chunk unmapped under a copy faults it (the error then sticks to whatever runs next)
@@ -9122,6 +9192,14 @@ int main(int argc, char** argv) {
                      (long long) gave, (long long) moved, (long long) (kvg.lo + (xcache.slots() - kvg.top)),
                      (long long) xcache.slots(),
                      fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
+        if (took > 0) {   // QuantLab (10/31), STRATA_QL_KV_LOAN
+            kvg.loan_taken += took;
+            std::fprintf(stderr, "strata: QuantLab: %lld of those slots came out of the prompt path's loan (STRATA_QL_KV_LOAN): "
+                                 "it starts at slot %lld now (%lld slots; %lld of %lld may still go), and a prompt reads in "
+                                 "chunks that fit it\n",
+                         (long long) took, (long long) kvg.top, (long long) (xcache.slots() - kvg.top),
+                         (long long) (kvg.top_cap - kvg.top), (long long) (kvg.top_cap - kvg.top0));
+        }
         if (kvg.ql && q_demoted + q_in_ram + q_on_file > 0) {   // QuantLab (10/29): where the experts given up are read now
             kvg.ql_demoted += q_demoted;
             kvg.ql_in_ram += q_in_ram;
@@ -9250,6 +9328,12 @@ int main(int argc, char** argv) {
         ++kvg.trims;
         std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
                              "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+        // QuantLab (10/31), STRATA_QL_KV_LOAN: every slot back (the loan's too): the loan starts where it did at start again
+        if (kvg.lo >= kvg.top && kvg.top > kvg.top0) {
+            std::fprintf(stderr, "strata: QuantLab: the K/V gave the prompt path's loan its %lld slots back: it starts at "
+                                 "slot %lld again\n", (long long) (kvg.top - kvg.top0), (long long) kvg.top0);
+            kvg.top = kvg.lo = kvg.top0;
+        }
         if (kvg.ql)   // QuantLab (10/29): where the refills came from (a given-back expert in the RAM copy stays there too)
             std::fprintf(stderr, "strata: QuantLab: K/V trim: %zu of those slots refilled with the hottest experts the GPU "
                                  "did not hold that fit them, %lld from the RAM copy, %lld from the drive\n",
@@ -10207,7 +10291,21 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
+        {
+            // QuantLab (10/31), STRATA_QL_KV_LOAN: how far the K/V may go into CUDA0's loan - the loan keeps room for every
+            // chunk of up to STRATA_QL_KV_LOAN_MIN_CHUNK tokens (lend's halving lands on a multiple of 256 at or below it;
+            // the slots a chunk needs are not monotonic in the chunk, #2090, so each one is asked)
+            int64_t top_cap = -1;
+            if (borrow != nullptr && !pf_parts.empty() && pf_parts[0].cache == &xcache && pf_parts.size() == 1 &&
+                !o.prefill_head_alias && ql_kv_grow_resident() && o.resident_cpu_experts && ql_kv_loan()) {
+                const int64_t mc = std::min<int64_t>(ql_kv_loan_min_chunk(), std::max<int64_t>(256, o.prefill_chunk));
+                int64_t keep = 0;
+                for (int64_t c = 256; c <= mc; c += 256) keep = std::max<int64_t>(keep, part_slots(pf_parts[0], c));
+                if (keep > 0 && keep + 128 <= xcache.slots()) top_cap = std::max<int64_t>(lend_first, xcache.slots() - keep);
+                kvg.loan_min_chunk = mc;
+            }
+            kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots(), top_cap);
+        }
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
