@@ -1340,6 +1340,23 @@ bool ql_mmq_mixed() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_MMQ_MIXED"); return v && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (10/31): R1Q2 classes in the mixed MMQ groups (gathered as the old blocks by mmq::gather_r1q2); on by default,
+// STRATA_QL_MMQ_R1Q2=0 sends them to the FP16 path
+bool ql_mmq_r1q2() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_MMQ_R1Q2"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+// the trellis K of a type (tq_cpu.hpp's tq_kbits): 144 K8, 145 K6, 146 K7, 150 K5, 151 K4, 160 + K otherwise
+int ql_tq_kbits(int t) {
+    switch (t) {
+        case 144: return 8;
+        case 145: return 6;
+        case 146: return 7;
+        case 150: return 5;
+        case 151: return 4;
+        default: return t - 160;
+    }
+}
 // QuantLab (10/29): STRATA_QL_PREFILL_GATHER=1 (opt-in) - the streamed walk of a mixed MMQ layer gathers its experts in
 // batches (one copy wait, one gather launch per class group, one release event per batch) instead of one wait, launch
 // and release event per expert; the same bytes into the same group slots (the walk's `mx_flush`)
@@ -1393,10 +1410,12 @@ const MmqPlan& mmq_plan() {
                 bool ok = ql_mmq_mixed() && !cls.empty();
                 size_t gu = 0, dn = 0;
                 for (const auto& c : cls) {
-                    // QuantLab (10/31): R1Q2 blocks have no tile loader yet - the FP16 path (iq_dequant_expert_r1q2_f16)
-                    ok = ok && !c.r1q2 && c.tail_off == 0 && mmq::fits(c.gu_type, 1280) && mmq::fits(c.d_type, N) &&
-                         c.up_off == mmq::matrix_bytes(c.gu_type, 1280, N) / 2 &&
-                         c.bytes - c.down_off == mmq::matrix_bytes(c.d_type, N, 640);
+                    // QuantLab (10/31): R1Q2 classes are gathered as the old blocks (mmq::gather_r1q2), so their own
+                    // sizes are not MMQ's; STRATA_QL_MMQ_R1Q2=0: the FP16 path (iq_dequant_expert_r1q2_f16) instead
+                    ok = ok && (c.r1q2 ? ql_mmq_r1q2()
+                                       : (c.up_off == mmq::matrix_bytes(c.gu_type, 1280, N) / 2 &&
+                                          c.bytes - c.down_off == mmq::matrix_bytes(c.d_type, N, 640))) &&
+                         c.tail_off == 0 && mmq::fits(c.gu_type, 1280) && mmq::fits(c.d_type, N);
                     gu = std::max(gu, mmq::matrix_bytes(c.gu_type, 1280, N));
                     dn = std::max(dn, mmq::matrix_bytes(c.d_type, N, 640));
                 }
@@ -5401,8 +5420,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 uint8_t* bd = m.grp_d + c * grp_d_region(mmq_plan());
                                 // the group's last expert is in: the MMQ tail after its slot too (the per-expert `last`)
                                 const size_t zero = pc.g.n == mx.gsize[(size_t) pc.gi] ? MMQ_TAIL : 0;
-                                if (mmq::gather_native_group(pc.g, fe.up_off, gub / 2, fe.down_off, db, bgu, gub, bd, db, m.cs,
-                                                             0, nullptr, zero)) {
+                                if (fe.r1q2) {   // QuantLab (10/31): R1Q2 blobs, expanded to the old blocks
+                                    for (int q = pc.g.first; q < pc.g.n; ++q) {
+                                        mmq::gather_r1q2(pc.g.blob[q], ql_tq_kbits(fe.gu_type), ql_tq_kbits(fe.d_type), N, 640,
+                                                         fe.up_off, fe.down_off, fe.sc_off, fe.p2, bgu + (size_t) q * gub,
+                                                         bd + (size_t) q * db, m.cs, q + 1 == pc.g.n ? zero : 0);
+                                        ++ql_batch_launches;
+                                    }
+                                } else if (mmq::gather_native_group(pc.g, fe.up_off, gub / 2, fe.down_off, db, bgu, gub, bd, db, m.cs,
+                                                                    0, nullptr, zero)) {
                                     ++ql_batch_launches;
                                 } else {
                                     for (int q = pc.g.first; q < pc.g.n; ++q) {   // not 16-byte aligned: one at a time
@@ -5489,6 +5515,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     }
                                     mx_flush();   // the group is complete: the batch (with it) is gathered before its products
                                 } else {
+                                if (fe.r1q2)   // QuantLab (10/31): an R1Q2 blob, expanded to the old blocks
+                                    mmq::gather_r1q2(blob_dev, ql_tq_kbits(fe.gu_type), ql_tq_kbits(fe.d_type), N, 640, fe.up_off,
+                                                     fe.down_off, fe.sc_off, fe.p2, bgu + q * gub, bd + q * db, m.cs,
+                                                     last ? MMQ_TAIL : 0);
+                                else
                                 mmq::gather_native(blob_dev, blob_dev + fe.up_off, gub / 2, blob_dev + fe.down_off, db,
                                                    bgu + q * gub, bd + q * db, m.cs, nullptr, nullptr, last ? MMQ_TAIL : 0);
                                 if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }

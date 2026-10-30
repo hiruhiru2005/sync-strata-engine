@@ -112,6 +112,12 @@ struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};
     int first = 0, n = 0;
 };
+/// QuantLab (10/31): an R1Q2 expert blob (cpu::NativeFmt::r1q2: 4K code bytes a block, the scales after the codes)
+/// gathered for MMQ as the old trellis blocks: each block's fp16 d = fp16(colscale[b] * p2[m][q[r][b]] * rowbase[r])
+/// before its codes, [gate | up] to gu_dst and down to d_dst - what gather_native copies from an old-layout blob.
+/// zero_bytes are zeroed after both (the MMQ tail of a group's last expert).
+void gather_r1q2(const uint8_t* blob, int kg, int kd, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
+                 size_t sc_off, const float (&p2)[3][4], void* gu_dst, void* d_dst, void* stream, size_t zero_bytes = 0);
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream,
                          size_t tail_off = 0, void* tail_dst = nullptr, size_t zero_bytes = 0);

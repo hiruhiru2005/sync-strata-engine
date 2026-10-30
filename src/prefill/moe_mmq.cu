@@ -682,6 +682,71 @@ void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail
 #endif
 }
 
+// QuantLab (10/31): gather_r1q2's kernel - one thread per output uint16 word; a block's word 0 is its fp16 d, words
+// 1 .. 2K its codes.  Gate and up codes are contiguous in an R1Q2 blob (up_off = gate's codes), so a gate/up block
+// index runs over both matrices.
+__global__ void gather_r1q2_kernel(const uint8_t* __restrict__ blob, int kg, int kd, int nbe, int nbf, long long n_ff,
+                                   long long n_embd, long long down_off, long long sc_off, float4 pg, float4 pu, float4 pd,
+                                   uint16_t* __restrict__ gu_dst, uint16_t* __restrict__ d_dst) {
+    const long long wg = 1 + 2LL * kg, wd = 1 + 2LL * kd;              // uint16 words per block
+    const long long ngu = 2 * n_ff * nbe, nd = n_embd * nbf;            // blocks
+    const long long total = ngu * wg + nd * wd;
+    const int qge = (nbe + 3) / 4, qdf = (nbf + 3) / 4;
+    const long long g_sc = n_ff * 2 + (long long) nbe * 2 + n_ff * qge;  // gate's (and up's) scale bytes
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
+        const bool down = i >= ngu * wg;
+        const long long k = down ? i - ngu * wg : i;
+        const long long w = down ? wd : wg;
+        const long long blk = k / w, j = k - blk * w;
+        const int K = down ? kd : kg;
+        uint16_t* dst = down ? d_dst : gu_dst;
+        if (j > 0) {
+            const uint16_t* src = (const uint16_t*) (down ? blob + down_off : blob);
+            dst[k] = src[blk * 2LL * K + (j - 1)];
+            continue;
+        }
+        int m, nb, qb;
+        long long r, rows, base;
+        int b;
+        if (down) {
+            m = 2; nb = nbf; qb = qdf; rows = n_embd; r = blk / nbf; b = (int) (blk % nbf); base = sc_off + 2 * g_sc;
+        } else {
+            m = blk >= n_ff * nbe ? 1 : 0;
+            const long long bb = blk - m * n_ff * nbe;
+            nb = nbe; qb = qge; rows = n_ff; r = bb / nbe; b = (int) (bb % nbe); base = sc_off + m * g_sc;
+        }
+        const uint8_t* sc = blob + base;
+        const float rb = __half2float(__ushort_as_half(((const uint16_t*) sc)[r]));
+        const float cs = __half2float(__ushort_as_half(((const uint16_t*) (sc + rows * 2))[b]));
+        const int q = (sc[rows * 2 + (long long) nb * 2 + r * qb + (b >> 2)] >> (2 * (b & 3))) & 3;
+        const float4 p = m == 0 ? pg : m == 1 ? pu : pd;
+        const float pq = q == 0 ? p.x : q == 1 ? p.y : q == 2 ? p.z : p.w;
+        dst[k] = __half_as_ushort(__float2half(cs * pq * rb));
+    }
+}
+
+void gather_r1q2(const uint8_t* blob, int kg, int kd, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
+                 size_t sc_off, const float (&p2)[3][4], void* gu_dst, void* d_dst, void* stream, size_t zero_bytes) {
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int nbe = (int) (n_embd / 128), nbf = (int) (n_ff / 128);
+    if (up_off != (size_t) n_ff * nbe * 4 * kg || down_off != 2 * up_off || kg < 2 || kg > 14 || kd < 2 || kd > 14) {
+        std::fprintf(stderr, "gather_r1q2: not an R1Q2 blob (K %d / %d, up_off %zu, down_off %zu)\n", kg, kd, up_off, down_off);
+        std::exit(1);
+    }
+    const long long total = 2LL * n_ff * nbe * (1 + 2LL * kg) + (long long) n_embd * nbf * (1 + 2LL * kd);
+    const float4 pg = make_float4(p2[0][0], p2[0][1], p2[0][2], p2[0][3]);
+    const float4 pu = make_float4(p2[1][0], p2[1][1], p2[1][2], p2[1][3]);
+    const float4 pd = make_float4(p2[2][0], p2[2][1], p2[2][2], p2[2][3]);
+    gather_r1q2_kernel<<<blocks(total), 256, 0, s>>>(blob, kg, kd, nbe, nbf, (long long) n_ff, (long long) n_embd,
+                                                     (long long) down_off, (long long) sc_off, pg, pu, pd,
+                                                     (uint16_t*) gu_dst, (uint16_t*) d_dst);
+    if (zero_bytes) {
+        cudaMemsetAsync((uint8_t*) gu_dst + (size_t) 2 * n_ff * nbe * (2 + 4 * kg), 0, zero_bytes, s);
+        cudaMemsetAsync((uint8_t*) d_dst + (size_t) n_embd * nbf * (2 + 4 * kd), 0, zero_bytes, s);
+    }
+    ck(cudaGetLastError(), "gather_r1q2");
+}
+
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream, const void* tail, void* tail_dst, size_t zero_bytes) {
     const cudaStream_t s = (cudaStream_t) stream;
