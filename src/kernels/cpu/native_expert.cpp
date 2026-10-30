@@ -228,6 +228,51 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     return true;
 }
 
+size_t ql_r1q2_matrix_off(const NativeFmt& f, int m) {
+    const size_t nbe = (size_t) (f.n_embd / kTqBlock), qge = (nbe + 3) / 4;
+    const size_t g = (size_t) f.n_ff * 2 + nbe * 2 + (size_t) f.n_ff * qge;   // gate's (and up's) scale bytes
+    return m == 0 ? 0 : m == 1 ? g : 2 * g;
+}
+size_t ql_r1q2_scale_bytes(const NativeFmt& f) {
+    const size_t nbf = (size_t) (f.n_ff / kTqBlock), qdf = (nbf + 3) / 4;
+    return ql_r1q2_matrix_off(f, 2) + (size_t) f.n_embd * 2 + nbf * 2 + (size_t) f.n_embd * qdf;
+}
+bool ql_r1q2_fmt(NativeFmt& f, const float (&p2)[3][4], std::string& err) {
+    if (!tq_supported(f.gu_type) || !tq_supported(f.d_type) || (f.gu_type >= 147 && f.gu_type <= 149) ||
+        (f.d_type >= 147 && f.d_type <= 149) || f.tail_off != 0) {
+        err = "native experts: R1Q2 (r1q2.txt) needs a trellis layer (types 144-146, 150, 151, 162-174)";
+        return false;
+    }
+    const int kg = tq_kbits(f.gu_type), kd = tq_kbits(f.d_type);
+    const size_t nbe = (size_t) (f.n_embd / kTqBlock), nbf = (size_t) (f.n_ff / kTqBlock);
+    f.gu_row = nbe * (size_t) (4 * kg);
+    f.d_row = nbf * (size_t) (4 * kd);
+    f.up_off = f.gu_row * (size_t) f.n_ff;
+    f.down_off = 2 * f.up_off;
+    const size_t codes = f.down_off + f.d_row * (size_t) f.n_embd;
+    f.sc_off = (codes + 15) / 16 * 16;
+    f.bytes = (f.sc_off + ql_r1q2_scale_bytes(f) + 255) / 256 * 256;
+    f.r1q2 = true;
+    for (int m = 0; m < 3; ++m)
+        for (int q = 0; q < 4; ++q) f.p2[m][q] = p2[m][q];
+    return true;
+}
+
+namespace {
+// QuantLab (10/31): one R1Q2 matrix's scales inside an expert blob
+tq_detail::TqScales r1q2_scales(const NativeFmt& f, const uint8_t* blob, int m) {
+    const int64_t rows = m < 2 ? f.n_ff : f.n_embd, nb = (m < 2 ? f.n_embd : f.n_ff) / kTqBlock;
+    const uint8_t* p = blob + f.sc_off + ql_r1q2_matrix_off(f, m);
+    tq_detail::TqScales s;
+    s.rowbase = (const uint16_t*) p;
+    s.colscale = (const uint16_t*) (p + (size_t) rows * 2);
+    s.q = p + (size_t) rows * 2 + (size_t) nb * 2;
+    s.qbytes = (int) ((nb + 3) / 4);
+    for (int q = 0; q < 4; ++q) s.p2[q] = f.p2[m][q];
+    return s;
+}
+}  // namespace
+
 namespace {
 // Q8_K (the activations of every i-quant row): ggml-cpu's x86 quantizer is the scalar reference, ~3 us per token
 // and layer on the host before the pool can start; q8k_quant_avx2 writes the same bytes.  cpu_avx2_ok() too:
@@ -447,6 +492,11 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // The trellis types (TQ2_T / TQK6 / TQK7): Strata's own kernels (tq_cpu.hpp), for every group size - they decode
     // a block once for all the tokens and give each token the same bits whatever the group (no #152 rule needed).
     if (tq_rows_own(f.gu_type)) {
+        if (f.r1q2) {   // QuantLab (10/31): R1Q2 blocks
+            tq_gu_rows_r1q2(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1,
+                            r1q2_scales(f, blob, 0), r1q2_scales(f, blob, 1));
+            return;
+        }
         tq_gu_rows(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
@@ -530,6 +580,11 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
     if (tq_rows_own(f.d_type)) {   // the trellis types, as in native_gu_rows
+        if (f.r1q2) {   // QuantLab (10/31): R1Q2 blocks
+            tq_rows_r1q2(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1,
+                         r1q2_scales(f, blob, 2));
+            return;
+        }
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }

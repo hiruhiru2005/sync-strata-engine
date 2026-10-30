@@ -1393,7 +1393,8 @@ const MmqPlan& mmq_plan() {
                 bool ok = ql_mmq_mixed() && !cls.empty();
                 size_t gu = 0, dn = 0;
                 for (const auto& c : cls) {
-                    ok = ok && c.tail_off == 0 && mmq::fits(c.gu_type, 1280) && mmq::fits(c.d_type, N) &&
+                    // QuantLab (10/31): R1Q2 blocks have no tile loader yet - the FP16 path (iq_dequant_expert_r1q2_f16)
+                    ok = ok && !c.r1q2 && c.tail_off == 0 && mmq::fits(c.gu_type, 1280) && mmq::fits(c.d_type, N) &&
                          c.up_off == mmq::matrix_bytes(c.gu_type, 1280, N) / 2 &&
                          c.bytes - c.down_off == mmq::matrix_bytes(c.d_type, N, 640);
                     gu = std::max(gu, mmq::matrix_bytes(c.gu_type, 1280, N));
@@ -5658,11 +5659,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 // (QuantLab v6: by this expert's own format; = the layer's unless it mixes them)
                                 const auto& f = lay.fmt_of(l, e);
+                                if (f.r1q2) {   // QuantLab (10/31): R1Q2 blocks
+                                    strata::kernels::iq_dequant_expert_r1q2_f16(f.gu_type, f.d_type, (const uint8_t*) blob_dev,
+                                                                                f.n_ff, f.n_embd, f.up_off, f.down_off, f.sc_off,
+                                                                                f.p2, m.dq_gu[q], m.dq_d[q], m.cs);
+                                } else {
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs,
                                                                    f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);
                                 strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
                                                                 f.tail_off ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
+                                }
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
@@ -6796,11 +6803,17 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 if (j == 0 || ents[j - 1].e != e) {   // the expert's FP16 matrices, once (run_impl's dequant)
                     dq = (dq + 1) % DQ;
                     if (lay.native) {
-                        const auto& f = lay.fmt[(size_t) l];
+                        const auto& f = lay.fmt_of(l, e);   // QuantLab (10/31): the expert's own (R1Q2 too)
+                        if (f.r1q2) {
+                            strata::kernels::iq_dequant_expert_r1q2_f16(f.gu_type, f.d_type, (const uint8_t*) blob_dev, f.n_ff,
+                                                                        f.n_embd, f.up_off, f.down_off, f.sc_off, f.p2,
+                                                                        m.dq_gu[dq], m.dq_d[dq], cs);
+                        } else {
                         strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                            m.dq_gu[dq], cs, nullptr);
                         strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
                                                         nullptr);
+                        }
                     } else {
                         blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], cs);
                     }

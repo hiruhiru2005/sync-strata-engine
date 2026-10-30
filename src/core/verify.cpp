@@ -2274,6 +2274,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 // QuantLab v6: a per-expert K layer - each group's pointer carries its K (the host plan tags it)
                 if (lay.layer_mixed(l)) L.gu_type = L.d_type = strata::kernels::kTqMixedType;
+                if (f.r1q2) {   // QuantLab (10/31): R1Q2 blocks (the mixed-layer kernels read the scales)
+                    L.r1q2 = true;
+                    for (int m = 0; m < 3; ++m)
+                        for (int q = 0; q < 4; ++q) L.p2[m][q] = f.p2[m][q];
+                }
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
             } else {
@@ -2317,7 +2322,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     // rebase keeps the tag (rebase_ptrs keeps every pointer's top byte)
                     const auto& f = lay.fmt[(size_t) l];
                     const int64_t gu_unit = 2 * f.n_ff * (f.n_embd / 128), d_unit = f.n_embd * (f.n_ff / 128);
-                    fetch_blobs_mixed(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), gu_unit, d_unit, (int) per, cs);
+                    // QuantLab (10/31): an R1Q2 blob's own size is its codes, 16-aligned, its scales (the same bytes
+                    // at every K), 256-aligned
+                    const int64_t sc_bytes = f.r1q2 ? (int64_t) strata::kernels::cpu::ql_r1q2_scale_bytes(f) : 0;
+                    fetch_blobs_mixed(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), gu_unit, d_unit, (int) per, cs,
+                                      sc_bytes);
                 } else {
                     fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
                 }

@@ -30,6 +30,12 @@ void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_i
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale = nullptr);
+/// QuantLab (10/31): an R1Q2 expert blob (cpu::NativeFmt::r1q2: 4K code bytes a block, the scales from sc_off) to the
+/// FP16 matrices iq_dequant_gu_f16 (gate/up interleaved) and iq_dequant_f16 (down) give: the codes as dq_tq decodes
+/// them, each block's scale colscale[b] * p2[m][q[r][b]] * rowbase[r].  Trellis types of tq_mix's rates only.
+void iq_dequant_expert_r1q2_f16(int gu_type, int d_type, const uint8_t* blob, int64_t n_ff, int64_t n_embd, size_t up_off,
+                                size_t down_off, size_t sc_off, const float (&p2)[3][4], uint16_t* dst_gu, uint16_t* dst_d,
+                                void* stream);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
 /// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
 /// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
@@ -56,6 +62,10 @@ struct NativeExpertLayout {
     bool gu_nib = false;                // STRATA_EXPERT_NIBBLE: gate/up as 4-bit codes (strata/core/expert_nibble.hpp's
                                         // slot); set only by native_expert_layout_nib
     const float* d_signs = nullptr;
+    // QuantLab (10/31): R1Q2 blocks (cpu::NativeFmt::r1q2): 4K code bytes a block, the scales after the codes; p2[m][q] =
+    // 2^(lo + q*step) of matrix m (0 gate, 1 up, 2 down).  Only the mixed-layer kernels (kTqMixedType) read them.
+    bool r1q2 = false;
+    float p2[3][4] = {};
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:

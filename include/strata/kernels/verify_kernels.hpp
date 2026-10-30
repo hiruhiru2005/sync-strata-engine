@@ -139,8 +139,10 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 /// QuantLab: the same for a per-expert K (mixed) layer - src[k] carries its (K gate/up, K down) in the top byte
 /// (tq_mix_tag); blob k is gu_unit * (2 + 4 K gate/up) + d_unit * (2 + 4 K down) bytes (its own size, a multiple of 16)
 /// and lands at dst + k * slot_bytes (the layer's largest).
+/// QuantLab (10/31): sc_bytes > 0 - R1Q2 blobs (cpu::NativeFmt::r1q2): gu_unit * 4 K + d_unit * 4 K code bytes,
+/// 16-aligned, then sc_bytes of scales (cpu::ql_r1q2_scale_bytes), 256-aligned.
 void fetch_blobs_mixed(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
-                       int64_t d_unit, int cap, void* stream);
+                       int64_t d_unit, int cap, void* stream, int64_t sc_bytes = 0);
 /// table[pairs[2k]] = pairs[2k + 1] for k < n, `pairs` in mapped host memory: a residency table's changed entries,
 /// stream-ordered before the window that reads it, without the copy engine (where the tier's swaps may queue).
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream);

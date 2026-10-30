@@ -42,7 +42,20 @@ struct NativeFmt {
     int layer = -1;                     ///< the layer this format belongs to (set by expert_layout_load; STRATA_ACT_DUMP only)
     const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
     const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
+    /// QuantLab (10/31): R1Q2 blocks (r1q2.txt beside the pack lists the layer): the gate/up/down rows hold 4K code bytes
+    /// a block (no fp16 d), and the scales sit from sc_off, matrix by matrix (gate, up, down): rowbase fp16[rows],
+    /// colscale fp16[n_in / 128], q 2-bit [rows][ceil(n_in / 512)] (block b at bits 2 * (b % 4) of byte b / 4).
+    /// A block's scale is colscale[b] * p2[m][q]; a row's dot is multiplied by rowbase[r] at the end.
+    bool r1q2 = false;
+    size_t sc_off = 0;
+    float p2[3][4] = {};
 };
+/// QuantLab (10/31): turn a trellis layer format into its R1Q2 form (sizes, offsets, the scale section, p2)
+bool ql_r1q2_fmt(NativeFmt& f, const float (&p2)[3][4], std::string& err);
+/// the byte offset of matrix m's scales (0 gate, 1 up, 2 down) from sc_off
+size_t ql_r1q2_matrix_off(const NativeFmt& f, int m);
+/// the scale section's bytes (gate, up, down; no padding) - the same at every K pair
+size_t ql_r1q2_scale_bytes(const NativeFmt& f);
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;
 

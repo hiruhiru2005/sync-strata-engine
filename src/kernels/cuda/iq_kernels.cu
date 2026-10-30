@@ -2467,6 +2467,43 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
     }
 }
 
+// ---------------------------------------------------------------- QuantLab (10/31): R1Q2 blocks (4K code bytes, no fp16 d)
+// tq_load without the block's d: the same states and codebook ints from a code-only block (its K's sizeof - 2 bytes)
+template<int TY>
+__device__ __forceinline__ TqLane tq_load_codes(const uint8_t* __restrict__ qs, int iqs) {
+    uint32_t s[4];
+    tq_states4<TY>(qs, iqs / 4, s);
+    TqLane r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+        r.q[i] = (int) ((uint32_t) tq_lut_i8[x >> 21] | ((uint32_t) tq_lut_i8[(x >> 10) & 2047u] << 16));
+    }
+    r.d = 0.0f;
+    return r;
+}
+// row_dot_multi for one R1Q2 row: block kbx's scale colscale[kbx] * p2[q]; the caller multiplies by the row's rowbase
+template<int TY, int NC>
+__device__ __forceinline__ void row_dot_multi_r1(const uint8_t* row, const uint16_t* __restrict__ colscale,
+                                                 const uint8_t* __restrict__ qrow, const float* __restrict__ p2,
+                                                 const block_q8_1* x, const int (&off)[NC], int n, int nb, int lane,
+                                                 float (&s)[NC]) {
+    constexpr int CB = (int) sizeof(typename TqInfo<TY>::block_t) - 2;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    for (int k = lane; k < nb * 8; k += 32) {
+        const int kbx = k >> 3, iqs = 4 * (k & 7);
+        TqLane w = tq_load_codes<TY>(row + (size_t) kbx * CB, iqs);
+        w.d = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3];
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < n) s[c] += tq_apply(w, x + off[c] + kbx * 4, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < n) s[c] = warp_sum(s[c]);
+}
+
 // ---------------------------------------------------------------- QuantLab: per-expert trellis K (v6 packs, tq_mix.hpp)
 // A mixed layer's groups each carry their expert's (K gate/up, K down) in the top byte of their blob pointer; one
 // launch per role, and each group's rows run that K's row_dot_multi.  The warp layout is native_gu_kernel's and
@@ -2504,6 +2541,47 @@ __device__ __forceinline__ void tqmix_down_rows(const uint8_t* wr, const block_q
     }
 }
 
+template<int TY>
+__device__ __forceinline__ void tqmix_gu_rows_r1(const uint8_t* wr, const uint16_t* colscale, const uint8_t* qrow,
+                                                 const float* p2, float rbase, const block_q8_1* __restrict__ xq,
+                                                 const int32_t* __restrict__ ent_tok, int e0, int e1, int xb, int nb,
+                                                 int lane, float* __restrict__ dst, int64_t n_ff, int r) {
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        int off[GRP_NC];
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
+        float s[GRP_NC];
+        row_dot_multi_r1<TY, GRP_NC>(wr, colscale, qrow, p2, xq, off, n, nb, lane, s);
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c)
+            if (c < n && lane == c) dst[(size_t) (e + c) * n_ff + r] = s[c] * rbase;
+    }
+}
+template<int TY>
+__device__ __forceinline__ void tqmix_down_rows_r1(const uint8_t* wr, const uint16_t* colscale, const uint8_t* qrow,
+                                                   const float* p2, float rbase, const block_q8_1* __restrict__ hq,
+                                                   const int32_t* __restrict__ ent_dst, int e0, int e1, int hb, int nb,
+                                                   int lane, float* __restrict__ out, int64_t n_embd, int r) {
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        int off[GRP_NC];
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
+        float s[GRP_NC];
+        row_dot_multi_r1<TY, GRP_NC>(wr, colscale, qrow, p2, hq, off, n, nb, lane, s);
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c)
+            if (c < n && lane == c) out[(size_t) ent_dst[e + c] * n_embd + r] = s[c] * rbase;
+    }
+}
+// the R1Q2 scale section of a blob with this K pair (cpu::ql_r1q2_fmt's layout): codes, then 16-aligned, the scales
+__device__ __forceinline__ const uint8_t* r1q2_scales_at(const uint8_t* blob, int kg, int kd, int64_t n_embd, int64_t n_ff) {
+    const size_t codes = 2 * (size_t) (n_embd / 128) * (size_t) (4 * kg) * (size_t) n_ff +
+                         (size_t) (n_ff / 128) * (size_t) (4 * kd) * (size_t) n_embd;
+    return blob + (codes + 15) / 16 * 16;
+}
+
 __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
@@ -2522,9 +2600,29 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const unsigned long long p = grp_ptr[g];
         const int kg = (int) (p >> kTqTagShift) & 15;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        if (L.r1q2) {   // QuantLab (10/31): R1Q2 blocks - the scales after the codes, matrix gate (0) or up (1)
+            const int kd = (int) (p >> (kTqTagShift + 4)) & 15;
+            const uint8_t* blob = (const uint8_t*) (p & kTqAddrMask);
+            const size_t row_c = (size_t) nb * (size_t) (4 * kg), qge = (size_t) (nb + 3) / 4;
+            const uint8_t* wr = blob + (is_up ? row_c * (size_t) L.n_ff : 0) + (size_t) r * row_c;
+            const uint8_t* sc = r1q2_scales_at(blob, kg, kd, L.n_embd, L.n_ff) +
+                                (is_up ? (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) L.n_ff * qge : 0);
+            const uint16_t* rb = (const uint16_t*) sc;
+            const uint16_t* cs = (const uint16_t*) (sc + (size_t) L.n_ff * 2);
+            const uint8_t* qrow = sc + (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) r * qge;
+            const float* p2 = L.p2[is_up ? 1 : 0];
+            const float rbase = tq_h2f(rb[r]);
+            switch (kg) {
+#define STRATA_TQ_MIX_GU_R1(K, T) case K: tqmix_gu_rows_r1<T>(wr, cs, qrow, p2, rbase, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r); break;
+                STRATA_TQ_MIX_KS(STRATA_TQ_MIX_GU_R1)
+#undef STRATA_TQ_MIX_GU_R1
+                default: break;
+            }
+            continue;
+        }
         const size_t gu_row = (size_t) nb * (size_t) (2 + 4 * kg);
         const uint8_t* wr = (const uint8_t*) (p & kTqAddrMask) + (is_up ? gu_row * (size_t) L.n_ff : 0) + (size_t) r * gu_row;
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
         switch (kg) {   // block-uniform: one group per block row
 #define STRATA_TQ_MIX_GU(K, T) case K: tqmix_gu_rows<T>(wr, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r); break;
             STRATA_TQ_MIX_KS(STRATA_TQ_MIX_GU)
@@ -2549,9 +2647,28 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const unsigned long long p = grp_ptr[g];
         const int kg = (int) (p >> kTqTagShift) & 15, kd = (int) (p >> (kTqTagShift + 4)) & 15;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        if (L.r1q2) {   // QuantLab (10/31): R1Q2 blocks - the down matrix's scales after gate's and up's
+            const uint8_t* blob = (const uint8_t*) (p & kTqAddrMask);
+            const size_t gu_c = (size_t) nbg * (size_t) (4 * kg), d_c = (size_t) nb * (size_t) (4 * kd);
+            const size_t qge = (size_t) (nbg + 3) / 4, qdf = (size_t) (nb + 3) / 4;
+            const uint8_t* wr = blob + 2 * gu_c * (size_t) L.n_ff + (size_t) r * d_c;
+            const uint8_t* sc = r1q2_scales_at(blob, kg, kd, L.n_embd, L.n_ff) +
+                                2 * ((size_t) L.n_ff * 2 + (size_t) nbg * 2 + (size_t) L.n_ff * qge);
+            const uint16_t* rb = (const uint16_t*) sc;
+            const uint16_t* cs = (const uint16_t*) (sc + (size_t) L.n_embd * 2);
+            const uint8_t* qrow = sc + (size_t) L.n_embd * 2 + (size_t) nb * 2 + (size_t) r * qdf;
+            const float rbase = tq_h2f(rb[r]);
+            switch (kd) {
+#define STRATA_TQ_MIX_DOWN_R1(K, T) case K: tqmix_down_rows_r1<T>(wr, cs, qrow, L.p2[2], rbase, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r); break;
+                STRATA_TQ_MIX_KS(STRATA_TQ_MIX_DOWN_R1)
+#undef STRATA_TQ_MIX_DOWN_R1
+                default: break;
+            }
+            continue;
+        }
         const size_t gu_row = (size_t) nbg * (size_t) (2 + 4 * kg), d_row = (size_t) nb * (size_t) (2 + 4 * kd);
         const uint8_t* wr = (const uint8_t*) (p & kTqAddrMask) + 2 * gu_row * (size_t) L.n_ff + (size_t) r * d_row;
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
         switch (kd) {
 #define STRATA_TQ_MIX_DOWN(K, T) case K: tqmix_down_rows<T>(wr, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r); break;
             STRATA_TQ_MIX_KS(STRATA_TQ_MIX_DOWN)
@@ -3497,6 +3614,36 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
             const int j = threadIdx.x * 8 + k;
             dst[j] = __float2half(__half2float(dst[j]) * sc);
         }
+    }
+}
+
+// QuantLab (10/31): R1Q2 blocks (4K code bytes, the scales apart) to FP16.  One 32-thread block per 256 values (two
+// 128-blocks, global block g = 2 i + blk of the row-major matrix), lanes as dq_tq; the scale of block g (row g / nb,
+// column block g % nb) is colscale * p2[q] * rowbase.  per_row > 0: gate/up, superblock i of a role matrix to the
+// interleaved row 2 r + parity (dequant_gu_kernel's layout); per_row == 0: flat (down), superblock i to y + 256 i.
+struct R1Mat { const uint8_t* codes; const uint16_t* rb; const uint16_t* cs; const uint8_t* q; float p2[4]; };
+template<int TY>
+__global__ void dequant_r1q2_kernel(R1Mat m0, R1Mat m1, int nb, int qb, int64_t per_row, __half* __restrict__ y) {
+    constexpr int CB = (int) sizeof(typename TqInfo<TY>::block_t) - 2;
+    const int64_t i = blockIdx.x;
+    const int parity = blockIdx.y;
+    const R1Mat& m = parity ? m1 : m0;
+    const int tid = threadIdx.x, blk = tid >> 4, l = (tid >> 1) & 7, half = tid & 1;
+    const int64_t g = 2 * i + blk, r = g / nb;
+    const int b = (int) (g % nb);
+    const float d = tq_h2f(m.cs[b]) * m.p2[(m.q[r * qb + (b >> 2)] >> (2 * (b & 3))) & 3] * tq_h2f(m.rb[r]);
+    uint32_t s[4];
+    tq_states4<TY>(m.codes + (size_t) g * CB, l, s);
+    __half* dst = (per_row > 0 ? y + ((2 * (i / per_row) + parity) * per_row + i % per_row) * QK_K : y + i * QK_K) +
+                  blk * 128 + 16 * l + 8 * half;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        float2 a, c;
+        tq_step(s[2 * half + k], a, c);
+        dst[4 * k + 0] = __float2half(d * a.x);
+        dst[4 * k + 1] = __float2half(d * a.y);
+        dst[4 * k + 2] = __float2half(d * c.x);
+        dst[4 * k + 3] = __float2half(d * c.y);
     }
 }
 
@@ -5540,6 +5687,49 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst, nullptr);
     check("iq_dequant_f32");
+}
+
+void iq_dequant_expert_r1q2_f16(int gu_type, int d_type, const uint8_t* blob, int64_t n_ff, int64_t n_embd, size_t up_off,
+                                size_t down_off, size_t sc_off, const float (&p2)[3][4], uint16_t* dst_gu, uint16_t* dst_d,
+                                void* stream) {
+    if (n_embd % 256 != 0 || (n_embd * n_ff) % 256 != 0 || n_ff % 128 != 0) {
+        std::fprintf(stderr, "iq_dequant_expert_r1q2_f16: widths %lld / %lld\n", (long long) n_embd, (long long) n_ff);
+        std::exit(1);
+    }
+    const int nbe = (int) (n_embd / 128), nbf = (int) (n_ff / 128), qge = (nbe + 3) / 4, qdf = (nbf + 3) / 4;
+    const size_t g = (size_t) n_ff * 2 + (size_t) nbe * 2 + (size_t) n_ff * qge;   // gate's (and up's) scale bytes
+    auto mat = [&](const uint8_t* codes, size_t off, int64_t rows, int nb, int qb, int m) {
+        R1Mat r;
+        const uint8_t* sc = blob + sc_off + off;
+        r.codes = codes;
+        r.rb = (const uint16_t*) sc;
+        r.cs = (const uint16_t*) (sc + (size_t) rows * 2);
+        r.q = sc + (size_t) rows * 2 + (size_t) nb * 2;
+        for (int k = 0; k < 4; ++k) r.p2[k] = p2[m][k];
+        return r;
+    };
+    const R1Mat mg = mat(blob, 0, n_ff, nbe, qge, 0), mu = mat(blob + up_off, g, n_ff, nbe, qge, 1),
+                md = mat(blob + down_off, 2 * g, n_embd, nbf, qdf, 2);
+    const int64_t per_row = n_embd / 256, nsb_d = n_embd * n_ff / 256;
+    cudaStream_t s = (cudaStream_t) stream;
+    bool ok_g = false, ok_d = false;
+    switch (gu_type) {
+#define STRATA_R1_GU(K, T) case T: dequant_r1q2_kernel<T><<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, s>>>(mg, mu, nbe, qge, per_row, (__half*) dst_gu); ok_g = true; break;
+        STRATA_TQ_MIX_KS(STRATA_R1_GU)
+#undef STRATA_R1_GU
+        default: break;
+    }
+    switch (d_type) {
+#define STRATA_R1_D(K, T) case T: dequant_r1q2_kernel<T><<<dim3((unsigned) nsb_d, 1), 32, 0, s>>>(md, md, nbf, qdf, 0, (__half*) dst_d); ok_d = true; break;
+        STRATA_TQ_MIX_KS(STRATA_R1_D)
+#undef STRATA_R1_D
+        default: break;
+    }
+    if (!ok_g || !ok_d) {
+        std::fprintf(stderr, "iq_dequant_expert_r1q2_f16: types %d / %d are not trellis rates\n", gu_type, d_type);
+        std::exit(1);
+    }
+    check("iq_dequant_expert_r1q2_f16");
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream,

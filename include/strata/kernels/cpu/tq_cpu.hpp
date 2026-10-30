@@ -79,6 +79,7 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
 /// of native_gu_rows.
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                 const void* const* act, int nt, float* const* ff, int r0, int r1);
+namespace tq_detail { struct TqScales; }   // QuantLab (10/31): defined below
 // QuantLab (10/31): the same rows for R1Q2 blocks (4K bytes each, no fp16 d; tq_detail::TqScales per matrix).  The pair
 // layout (147-149) has no R1Q2 form.  AVX-512 runs the AVX2 kernel for now (exact; AVX-512 is only a speed variant there).
 void tq_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,

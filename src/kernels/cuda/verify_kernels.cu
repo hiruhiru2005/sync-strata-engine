@@ -626,14 +626,18 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
 // QuantLab: a mixed layer's PCIe share - blob k's own size from its tag, copied to slot k (slot_per uint4 apart); the
 // flat index walks every slot's largest size and skips past the blob's end
 __global__ void fetch_blobs_mixed_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
-                                         uint4* __restrict__ dst, long long slot_per, long long gu_unit, long long d_unit) {
+                                         uint4* __restrict__ dst, long long slot_per, long long gu_unit, long long d_unit,
+                                         long long sc_bytes) {
     const long long total = (long long) *n * slot_per;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
          i += (long long) gridDim.x * blockDim.x) {
         const long long k = i / slot_per, off = i - k * slot_per;
         const unsigned long long p = src[k];
         const unsigned tag = (unsigned) (p >> 56);
-        const long long own = gu_unit * (2 + 4 * (long long) (tag & 15u)) + d_unit * (2 + 4 * (long long) (tag >> 4));
+        // QuantLab (10/31): sc_bytes > 0 - R1Q2 blobs: 4K code bytes a block, 16-aligned, the scales, 256-aligned
+        const long long own = sc_bytes > 0
+            ? (((gu_unit * 4 * (long long) (tag & 15u) + d_unit * 4 * (long long) (tag >> 4)) + 15) / 16 * 16 + sc_bytes + 255) / 256 * 256
+            : gu_unit * (2 + 4 * (long long) (tag & 15u)) + d_unit * (2 + 4 * (long long) (tag >> 4));
         if (off * 16 < own) dst[i] = ((const uint4*) (p & ((1ull << 56) - 1)))[off];
     }
 }
@@ -739,14 +743,15 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 }
 
 void fetch_blobs_mixed(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
-                       int64_t d_unit, int cap, void* stream) {
+                       int64_t d_unit, int cap, void* stream, int64_t sc_bytes) {
     if (cap <= 0) return;
     if (slot_bytes % 16 != 0 || gu_unit % 8 != 0 || d_unit % 8 != 0) {   // (2 + 4K) is even: unit * 2 is a multiple of 16
         std::fprintf(stderr, "fetch_blobs_mixed: sizes must be multiples of 16\n");
         std::exit(1);
     }
     fetch_blobs_mixed_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (slot_bytes / 16),
-                                                                       (long long) gu_unit, (long long) d_unit);
+                                                                       (long long) gu_unit, (long long) d_unit,
+                                                                       (long long) sc_bytes);
     check("fetch_blobs_mixed");
 }
 

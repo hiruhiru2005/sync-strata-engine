@@ -15,6 +15,9 @@
 #endif
 #include <fstream>
 #include <sstream>
+#include <array>
+#include <cmath>
+#include <map>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -454,6 +457,33 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     return false;
 #else
     L.native = true;
+    // QuantLab (10/31): R1Q2 layers (r1q2.txt): their formats are turned into the R1Q2 form right after native_fmt
+    std::map<int64_t, std::array<std::array<float, 4>, 3>> r1q2;
+    {
+        std::ifstream rin(pack_dir + "/r1q2.txt");
+        std::string rl;
+        while (rin && std::getline(rin, rl)) {
+            if (rl.empty() || rl[0] == '#') continue;
+            std::istringstream rs(rl);
+            long long l = -1;
+            double v[6];
+            if (!(rs >> l >> v[0] >> v[1] >> v[2] >> v[3] >> v[4] >> v[5]) || l < 0 || l >= n_layers) {
+                err = "r1q2.txt: a malformed line: " + rl;
+                return false;
+            }
+            auto& t = r1q2[l];
+            for (int m = 0; m < 3; ++m)
+                for (int q = 0; q < 4; ++q) t[m][q] = (float) std::exp2(v[2 * m] + q * v[2 * m + 1]);
+        }
+    }
+    auto r1q2_apply = [&](int64_t l, NativeFmt& f) -> bool {
+        auto it = r1q2.find(l);
+        if (it == r1q2.end()) return true;
+        float p2[3][4];
+        for (int m = 0; m < 3; ++m)
+            for (int q = 0; q < 4; ++q) p2[m][q] = it->second[m][q];
+        return ql_r1q2_fmt(f, p2, err);
+    };
     L.fmt.resize((size_t) n_layers);
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
@@ -491,6 +521,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         }
         NativeFmt f;
         if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!r1q2_apply(l, f)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -586,6 +617,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                         if (c >= 255) { err = "experts_k.txt: layer " + std::to_string(l) + " has too many formats"; return false; }
                         NativeFmt f;
                         if (!native_fmt(gt, dt, H, FF, f, err)) return false;
+                        if (!r1q2_apply(l, f)) return false;
                         cls.push_back(f);
                     }
                     const size_t i = (size_t) l * ne + e;
@@ -668,6 +700,13 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 }
         }
     }
+    // QuantLab (10/31): the GPU reads R1Q2 blocks in the mixed-layer kernels only (the daily packs mix every layer)
+    for (const auto& kv : r1q2)
+        if (!L.layer_mixed(kv.first)) {
+            err = "r1q2.txt: layer " + std::to_string(kv.first) + " is not a per-expert K layer (experts_k.txt); "
+                  "R1Q2 blocks are read by the mixed-layer kernels only";
+            return false;
+        }
     g_layout = L;
     return true;
 #endif
