@@ -10909,6 +10909,7 @@ int main(int argc, char** argv) {
                                             "--vram-reserve-mib 1900 keeps it. The MTP drafts instead."
                                           : "It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, a draft head 0.2 GiB); "
                                             "--vram-reserve-mib 1900 keeps it. Only the lookup drafts.";
+            df2.set_max_drafts(std::min({o.spec, 8, df2_cap > 0 ? df2_cap : o.spec}) - 1);   // upstream d7e50a51: the widest DFlash2 window - 1 (the serve loop's S_df2: --spec, 8 rows, --draft-cap), the head and the walk run for that many rows (before the graphs)
             if (n_stages != 1 || pipe || o.batch > 0 || !ver.tapping()) {
                 std::fprintf(stderr, "strata serve: --draft dflash2: the verifier keeps no taps here (one card, no --batch); %s\n",
                              use_mtp ? "the MTP drafts instead" : "only the lookup drafts");
@@ -19765,6 +19766,7 @@ int main(int argc, char** argv) {
         }
         // QuantLab (11/16): the graphs on the drafter's own 8-row taps (prepare_own / draft_from): a window wider than 8 rows (--lookup-max-t,
         // suffix drafts) puts its rows past the last 8 into the ring first instead of failing ("draft rows out of range", engine 2)
+        if (use_df2) df2.set_max_drafts(std::min(o.spec, 8) - 1);   // upstream d7e50a51: the widest window - 1 (--spec, already lowered to --draft-cap; before the graphs)
         if (use_df2 && !df2.prepare_own(err)) {
             std::fprintf(stderr, "strata generate: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring "
                                  "0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about 2.5%% of its experts "
