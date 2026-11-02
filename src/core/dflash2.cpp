@@ -187,6 +187,8 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
             if (cudaMemcpy(tmp, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
             kernels::df2_q8_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols, (int) t.cols, t.rows * t.cols / 32, nullptr);
             if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash2: weight conversion failed"; return false; }
+        } else if (t.dtype == "q4_0" && t.name.find("_codebook") != std::string::npos) {   // the selector's Q4_0 rows stay in block order (read row by row)
+            if (cudaMemcpy(blob_ + t.off, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
         } else if (t.dtype == "q4_0") {   // GGML Q4_0 blocks -> the tiled nibble plane at the tensor's offset, then the d plane (same total bytes)
             if (cudaMemcpy(tmp, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
             kernels::df2_q4_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols / 2, (int) t.cols, t.rows * t.cols / 32, nullptr);
@@ -303,7 +305,9 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         }
     };
     std::vector<int32_t> vocab;
-    if (!vocab_file.empty()) {
+    // STRATA_DF2_HEAD=native: the drafter runs its head on the target's own resident head (every vocabulary row, no 213 MiB pruned copy, no vocabulary file read)
+    static const bool head_native = [] { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && std::string(e) == "native"; }();
+    if (!vocab_file.empty() && !head_native) {
         if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
             std::fseek(vf, 0, SEEK_END);
             const long size = std::ftell(vf);
@@ -455,7 +459,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
-                   out_prob_, cs);
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0");
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -525,6 +529,8 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
 }
 
 uint64_t Dflash2Drafter::bind_bytes_for(const std::string& vocab_file, uint64_t head_row_bytes, int64_t n_vocab) {
+    // QuantLab (11/17, upstream 8ec2c8a9): STRATA_DF2_HEAD=native binds no head copy (the target's head, every row's logits)
+    if (head_native()) return (uint64_t) kDrafts * (uint64_t) std::max<int64_t>(0, n_vocab) * 4;
     int64_t rows = 0;
     if (!vocab_file.empty())
         if (std::FILE* f = std::fopen(vocab_file.c_str(), "rb")) {

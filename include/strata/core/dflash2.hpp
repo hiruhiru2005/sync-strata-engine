@@ -15,6 +15,7 @@
 // it, so a rejected draft leaves nothing to roll back.  One CUDA graph per context-row count n = 1..8 holds the context update and the
 // block; the host stages the positions and the anchor and waits for the 7 drafts.
 #pragma once
+#include <cstdlib>
 
 #include "strata/core/session.hpp"
 
@@ -45,6 +46,8 @@ public:
     bool load(const std::string& pack_path, int device, std::string& err);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err);
+    /// STRATA_DF2_HEAD=native (CUDA / HIP): bind() ignores the vocabulary file and runs the draft head on the target's whole head (no pruned copy).
+    static bool head_native() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'n'; }
     /// Tests: an embedding callback and a head given as raw rows of `head_type` (a native_mmvq type).
     using EmbedFn = std::function<void(const int32_t* tokens_dev, int n, float* out, cudaStream_t)>;
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
