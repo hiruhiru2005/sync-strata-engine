@@ -509,6 +509,27 @@ static uint64_t ql_session_stream_floor(int64_t cache_floor_mib) {
     const long long mib = env >= 0 ? env : std::min<long long>(64, std::max<long long>(0, (long long) cache_floor_mib));
     return (uint64_t) mib << 20;
 }
+// QuantLab (11/3): the RAM a streamed save / restore is judged by.  What it holds (the 16 MiB _aligned_malloc block, the
+// token lists, the small arrays) is pageable, so on Windows it needs commit, not free pages: Windows makes the physical
+// room by trimming the other processes (the experts are locked).  sample_host_memory() takes the smaller of the free
+// physical RAM and the commit room, and the free physical RAM sits at 16-100 MiB for minutes after the other apps take
+// RAM back, which refused about 1 restore in 10 (the prompt then read again from token 0).  Here, on Windows without
+// --memory-limit-mib: the commit room alone.  STRATA_QL_SESSION_STREAM_PHYS=1 keeps the old reading.
+static std::optional<strata::core::HostMemoryReading> ql_session_stream_memory() {
+    auto mem = strata::core::sample_host_memory();
+#if defined(_WIN32)
+    static const bool phys = [] {
+        const char* v = std::getenv("STRATA_QL_SESSION_STREAM_PHYS");
+        return v != nullptr && *v == '1';
+    }();
+    if (!phys && mem && mem->source == strata::core::MemorySource::meminfo && strata::core::memory_limit_bytes() == 0) {
+        MEMORYSTATUSEX st{};
+        st.dwLength = sizeof st;
+        if (GlobalMemoryStatusEx(&st)) mem->available = st.ullAvailPageFile;
+    }
+#endif
+    return mem;
+}
 // The adaptive tier's pairs for layer `l`: `cand` (not in the GPU tier: usage, expert) and `vict` (in it), the best
 // candidate against the coldest victim while the gain clears `min_gain`; push(gain, in, out) for each pair.  Every
 // layer that is not mixed pairs exactly as the tier always did.
@@ -14014,7 +14035,7 @@ int main(int argc, char** argv) {
                             }
                             need = strata::core::session_save_stream_peak_bytes(sl);
                             {
-                                const auto mem = strata::core::sample_host_memory();
+                                const auto mem = ql_session_stream_memory();   // QuantLab (11/3): the commit room on Windows
                                 const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                                 if (!strata::core::conversation_memory_admit(avail, need, floor)) {
                                     refuse("not enough RAM to save the session (" +
@@ -14175,7 +14196,7 @@ int main(int argc, char** argv) {
                             peak_commit = std::max(peak_commit, mem_sample().commit_mib);
                         };
                         auto admit_text = [floor](uint64_t need, std::string& why) {
-                            const auto mem = strata::core::sample_host_memory();
+                            const auto mem = ql_session_stream_memory();   // QuantLab (11/3): the commit room on Windows
                             const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
