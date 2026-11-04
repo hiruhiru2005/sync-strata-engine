@@ -29,7 +29,11 @@
 
 namespace strata::kernels::cpu {
 
-enum class TqIsa : int { scalar = 0, avx2 = 1, avx512 = 2 };
+/// QuantLab (11/4): avx2vnni - the AVX2 rows with AVX-VNNI's VEX VPDPWSSD (cpu_avxvnni_ok: Alder Lake / Raptor Lake and
+/// later, Zen 5), chosen by default on a CPU with AVX-VNNI and without AVX-512; avx2e - the same rows with the EVEX
+/// VPDPWSSD ymm of AVX512-VL/VNNI, only when STRATA_TQ_ISA=avx2e asks (to test the VNNI copy on an AVX-512 CPU).
+/// STRATA_TQ_ISA=scalar|avx2|avxvnni|avx2e|avx512: avx2 is the plain AVX2 rows (no VNNI) even where AVX-VNNI exists.
+enum class TqIsa : int { scalar = 0, avx2 = 1, avx512 = 2, avx2vnni = 3, avx2e = 4 };
 
 /// EXPERIMENTAL lower-rate versions of the TQK rule (tools/trellis/tqenc.hpp, version 1; Strata-internal ids, not ggml
 /// types, not in any GGUF): TQK5X = 22 bytes / 128 weights (1.375 bpw), TQK4X = 18 bytes (1.125 bpw).  Same hash,
@@ -114,6 +118,16 @@ void tq_rows_avx2_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_
                        int nt, float* const* out, int r0, int r1, const TqScales& sc);
 void tq_rows_avx512_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
                          int nt, float* const* out, int r0, int r1, const TqScales& sc);
+// QuantLab (11/4): the AVX-VNNI copies of the AVX2 rows (tq_avx2.cpp) and their EVEX test copies (tq_avx512.cpp)
+bool tq_avxvnni_built();
+void tq_rows_avxvnni(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                     float* const* out, int r0, int r1);
+void tq_rows_avxvnni_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                          int nt, float* const* out, int r0, int r1, const TqScales& sc);
+void tq_rows_avx2e(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                   float* const* out, int r0, int r1);
+void tq_rows_avx2e_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                        int nt, float* const* out, int r0, int r1, const TqScales& sc);
 // the per-ISA row kernels (dot products only; `out[t][r]` for rows [r0, r1))
 void tq_rows_scalar(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);

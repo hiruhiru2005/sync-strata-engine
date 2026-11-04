@@ -50,7 +50,9 @@ int env_isa_cap() {
     if (e == nullptr || *e == 0) return 2;
     const std::string v(e);
     if (v == "scalar") return 0;
-    if (v == "avx2") return 1;
+    if (v == "avx2") return 1;      // the plain AVX2 rows, also where AVX-VNNI exists
+    if (v == "avxvnni") return 3;   // QuantLab (11/4): AVX2 with AVX-VNNI where the CPU has it, never AVX-512
+    if (v == "avx2e") return 4;     // QuantLab (11/4): the VNNI rows' EVEX test copy (AVX-512 CPUs)
     return 2;
 }
 
@@ -197,6 +199,8 @@ bool tq_isa_ok(TqIsa isa) {
     switch (isa) {
         case TqIsa::avx512: return cpu_avx512_ok();
         case TqIsa::avx2: return cpu_avx2_ok();
+        case TqIsa::avx2vnni: return cpu_avx2_ok() && tq_detail::tq_avxvnni_built() && cpu_avxvnni_ok();
+        case TqIsa::avx2e: return cpu_avx512_ok();   // AVX512-VL + VNNI are part of what cpu_avx512_ok checks
         default: return true;
     }
 #else
@@ -207,7 +211,9 @@ bool tq_isa_ok(TqIsa isa) {
 TqIsa tq_isa() {
     static const TqIsa isa = [] {
         const int cap = env_isa_cap();
-        if (cap >= 2 && tq_isa_ok(TqIsa::avx512)) return TqIsa::avx512;
+        if (cap == 4) return tq_isa_ok(TqIsa::avx2e) ? TqIsa::avx2e : tq_isa_ok(TqIsa::avx2) ? TqIsa::avx2 : TqIsa::scalar;
+        if (cap == 2 && tq_isa_ok(TqIsa::avx512)) return TqIsa::avx512;
+        if ((cap == 2 || cap == 3) && tq_isa_ok(TqIsa::avx2vnni)) return TqIsa::avx2vnni;   // QuantLab (11/4)
         if (cap >= 1 && tq_isa_ok(TqIsa::avx2)) return TqIsa::avx2;
         return TqIsa::scalar;
     }();
@@ -225,7 +231,8 @@ bool tq_kernels_enabled() {
 }
 
 const char* tq_isa_name(TqIsa isa) {
-    return isa == TqIsa::avx512 ? "avx512" : isa == TqIsa::avx2 ? "avx2" : "scalar";
+    return isa == TqIsa::avx512 ? "avx512" : isa == TqIsa::avx2 ? "avx2" : isa == TqIsa::avx2vnni ? "avxvnni"
+           : isa == TqIsa::avx2e ? "avx2e" : "scalar";
 }
 
 namespace tq_detail {
@@ -281,6 +288,8 @@ void rows_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t row
 #if defined(STRATA_TQ_X86)
         case TqIsa::avx512: tq_detail::tq_rows_avx512(kb, tab, w, row_bytes, n, a, nt, out, r0, r1); break;
         case TqIsa::avx2: tq_detail::tq_rows_avx2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1); break;
+        case TqIsa::avx2vnni: tq_detail::tq_rows_avxvnni(kb, tab, w, row_bytes, n, a, nt, out, r0, r1); break;
+        case TqIsa::avx2e: tq_detail::tq_rows_avx2e(kb, tab, w, row_bytes, n, a, nt, out, r0, r1); break;
 #endif
         default: tq_detail::tq_rows_scalar(kb, tab, w, row_bytes, n, a, nt, out, r0, r1); break;
     }
@@ -326,6 +335,14 @@ void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t 
     }
     if (isa == TqIsa::avx2) {
         tq_detail::tq_rows_avx2_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        return;
+    }
+    if (isa == TqIsa::avx2vnni) {   // QuantLab (11/4)
+        tq_detail::tq_rows_avxvnni_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        return;
+    }
+    if (isa == TqIsa::avx2e) {
+        tq_detail::tq_rows_avx2e_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
     }
 #endif

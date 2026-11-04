@@ -1824,6 +1824,8 @@ else()
   set(_strata_avxvnni STRATA_AVXVNNI=0)
 endif()
 set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
+# QuantLab (11/4): the trellis rows' AVX-VNNI copy (tq_avx2_rows.inl)
+set_property(SOURCE src/kernels/cpu/tq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 

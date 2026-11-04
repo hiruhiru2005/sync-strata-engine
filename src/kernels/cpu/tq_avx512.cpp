@@ -121,6 +121,14 @@ void rows_r1_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, 
     }
 }
 
+// QuantLab (11/4): the AVX2 rows' VNNI copy with the EVEX VPDPWSSD ymm (AVX512-VL/VNNI), so this CPU class tests
+// the AVX-VNNI code of tq_avx2_rows.inl (STRATA_TQ_ISA=avx2e; never chosen by default)
+namespace evex {
+#define STRATA_TQ_VNNI 2
+#define STRATA_TQ_ROWS_FN
+#include "tq_avx2_rows.inl"
+}  // namespace evex
+
 }  // namespace
 
 void tq_rows_avx512(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
@@ -130,6 +138,15 @@ void tq_rows_avx512(int kb, const int16_t* table, const uint8_t* w, size_t row_b
 void tq_rows_avx512_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
                          int nt, float* const* out, int r0, int r1, const TqScales& sc) {
     STRATA_TQ_DISPATCH_K(kb, rows_r1_t, table, w, row_bytes, n, a, nt, out, r0, r1, sc)
+}
+
+void tq_rows_avx2e(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                   float* const* out, int r0, int r1) {
+    STRATA_TQ_DISPATCH_K(kb, evex::rows_t, table, w, row_bytes, n, a, nt, out, r0, r1)
+}
+void tq_rows_avx2e_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                        int nt, float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, evex::rows_r1_t, table, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
 
 }  // namespace strata::kernels::cpu::tq_detail

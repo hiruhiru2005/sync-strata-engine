@@ -193,7 +193,7 @@ void check_type(int type, bool reference) {
                     NT * c.rows, worst);
         if (bad) fail("scalar kernel differs from the definition", type);
     }
-    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx512}) {
+    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx2vnni, TqIsa::avx2e, TqIsa::avx512}) {
         if (!tq_isa_ok(isa)) { std::printf("type %d %-6s not on this CPU: skipped\n", type, tq_isa_name(isa)); continue; }
         bool ok = true;
         for (int nt = 1; nt <= NT; ++nt)
@@ -218,7 +218,7 @@ void check_type(int type, bool reference) {
         for (int t = 0; t < NT; ++t) { p0[t] = ff0.data() + (size_t) t * c.rows; p1[t] = ff1.data() + (size_t) t * c.rows; }
         tq_gu_rows(TqIsa::scalar, type, blob.data(), c.rb, up_off, c.n, c.ap, NT, p0, 0, c.rows);
         bool ok = true;
-        for (TqIsa isa : {TqIsa::avx2, TqIsa::avx512}) {
+        for (TqIsa isa : {TqIsa::avx2, TqIsa::avx2vnni, TqIsa::avx2e, TqIsa::avx512}) {
             if (!tq_isa_ok(isa)) continue;
             tq_gu_rows(isa, type, blob.data(), c.rb, up_off, c.n, c.ap, NT, p1, 0, c.rows);
             ok = ok && same_bits(ff0.data(), ff1.data(), ff0.size());
@@ -303,7 +303,7 @@ void check_r1q2(int type, int n) {
     std::printf("type %d n %d R1Q2 scalar vs the old layout (d = fp16 of the scale) x rowbase: %d of %d outside 2e-3 of "
                 "|want| + RMS, worst %.2e\n", type, n, bad, NT * rows, worst);
     if (bad) fail("R1Q2 scalar differs from the old layout", type, n);
-    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx512}) {
+    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx2vnni, TqIsa::avx2e, TqIsa::avx512}) {
         if (!tq_isa_ok(isa)) { std::printf("type %d R1Q2 %-6s not on this CPU: skipped\n", type, tq_isa_name(isa)); continue; }
         bool ok = true;
         for (int nt = 1; nt <= NT; ++nt) {
@@ -331,7 +331,7 @@ void check_r1q2(int type, int n) {
             const float want = (g / (1.f + std::exp(-g))) * u;
             if (std::fabs(q0[t][r] - want) > 1e-4f * (std::fabs(want) + 1e-3f)) { okg = false; break; }
         }
-    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx512}) {
+    for (TqIsa isa : {TqIsa::avx2, TqIsa::avx2vnni, TqIsa::avx2e, TqIsa::avx512}) {
         if (!tq_isa_ok(isa)) continue;
         tq_gu_rows_r1q2(isa, type, blob.data(), rb_new, wn.size(), n, ap, NT, q1, 0, rows, sc, su);
         okg = okg && same_bits(f0.data(), f1.data(), f0.size());
@@ -378,7 +378,7 @@ void bench(int type, int n, int rows) {
         do { fn(); ++it; el = std::chrono::duration<double>(clk::now() - t0).count(); } while (el < 0.4);
         return el * 1e9 / ((double) it * rows * nb);
     };
-    for (TqIsa isa : {TqIsa::scalar, TqIsa::avx2, TqIsa::avx512}) {
+    for (TqIsa isa : {TqIsa::scalar, TqIsa::avx2, TqIsa::avx2vnni, TqIsa::avx2e, TqIsa::avx512}) {
         if (!tq_isa_ok(isa)) continue;
         for (int nt : {1, 2, 3}) {
             if (nt > NT) continue;

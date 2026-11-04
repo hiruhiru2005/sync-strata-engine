@@ -61,6 +61,24 @@ inline uint32_t tq_state(const uint8_t* qs, uint64_t wrap, int t) {
     }
 }
 
+/// QuantLab (11/4): tq_state with T a template argument - the same bits, the offset, branch and shift decided at
+/// compile time.  MSVC ignores `#pragma GCC unroll`, so a loop calling tq_state(qs, wrap, t) stays a loop there.
+template <int KB, int T>
+inline uint32_t tq_state_c(const uint8_t* qs, uint64_t wrap) {
+    if constexpr (KB == 8) {
+        (void) wrap;
+        return (((uint32_t) qs[(T + 31) & 31] << 8) | qs[T]) & kTqStateMask;
+    } else {
+        constexpr int NB = 4 * KB, off = (31 - T) * KB, b = off >> 3;
+        if constexpr (b + 4 <= NB) {
+            (void) wrap;
+            return (tq_ld32(qs + b) >> (off & 7)) & kTqStateMask;
+        } else {
+            return (uint32_t) (wrap >> (off - 8 * (NB - 4))) & kTqStateMask;
+        }
+    }
+}
+
 template <int KB>
 inline void tq_states(const uint8_t* qs, uint32_t* st) {
     if constexpr (KB == 8) {

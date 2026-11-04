@@ -4355,6 +4355,11 @@ int main(int argc, char** argv) {
                             ? "AVX1 128-bit (iq_avx1, the older-CPU build)"
                             : "ggml-cpu vec_dot (no AVX2: the older-CPU build)")
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+    // QuantLab (11/4): which trellis rows the CPU experts take (avxvnni on AVX-VNNI CPUs without AVX-512)
+    if (strata::kernels::cpu::tq_kernels_enabled())
+        std::fprintf(stderr, "strata generate: QuantLab: the trellis expert rows run on %s "
+                             "(STRATA_TQ_ISA=scalar|avx2|avxvnni|avx512 caps it)\n",
+                     strata::kernels::cpu::tq_isa_name(strata::kernels::cpu::tq_isa()));
     // the compiled shape; a native model's file replaces it below with its own metadata (read_geometry), which a
     // pruned variant (GSQ-RCO Coder, fewer than 512 experts) differs from
     strata::core::ModelGeometry g;
