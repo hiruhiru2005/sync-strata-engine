@@ -51,6 +51,10 @@ struct ExpertLayout;
 namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
+/// QuantLab (11/4): the pack's experts file.  experts.v2.bin where it exists (a pack with its own trellis codebook
+/// or dense replacements: an older engine finds no experts.bin and refuses it instead of decoding it wrongly), else
+/// experts.bin.
+std::string pack_experts_path(const std::string& pack_dir);
 class RemoteExperts;
 struct LoadStats;
 

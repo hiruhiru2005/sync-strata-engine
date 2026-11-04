@@ -55,10 +55,15 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         const bool tq = ql_dense_tq_read("output.weight", n_in, n_out, tq_type, tq_host, err);
         if (!err.empty()) return false;
         if (tq && ql_dense_tq_signs((int) n_in) == nullptr) { err = "native head: no trellis signs for its width"; return false; }
-        const int up_type = tq ? tq_type : (int) tensor->type;
+        // QuantLab (11/4): or dense_nq names it in another ordinary type (no rotation)
+        int nq_type = -1;
+        std::vector<uint8_t> nq_host;
+        const bool nq = !tq && ql_dense_nq_read("output.weight", n_in, n_out, nq_type, nq_host, err);
+        if (!err.empty()) return false;
+        const int up_type = tq ? tq_type : nq ? nq_type : (int) tensor->type;
         const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes(up_type, (int) n_in, (int) n_out);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
-        if (!tq && (tensor->offset > payload || bytes > payload - tensor->offset)) {
+        if (!tq && !nq && (tensor->offset > payload || bytes > payload - tensor->offset)) {
             err = "native head: truncated output.weight payload";
             return false;
         }
@@ -72,9 +77,10 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             status = cudaMalloc(&r, (size_t) n_in * sizeof(float));
             rot_ = (float*) r;
         }
-        if (!tq) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+        if (!tq && !nq) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status == cudaSuccess)
-            status = cudaMemcpy(weights, tq ? (const void*) tq_host.data() : gguf.tensor_data(*tensor), bytes,
+            status = cudaMemcpy(weights, tq ? (const void*) tq_host.data()
+                                         : nq ? (const void*) nq_host.data() : gguf.tensor_data(*tensor), bytes,
                                 cudaMemcpyHostToDevice);
         if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
@@ -92,6 +98,8 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         if (tq)
             std::fprintf(stderr, "strata: QuantLab: STRATA_QL_DENSE_TQ: the output head as trellis type %d (%.1f MiB)\n",
                          type_, bytes / 1048576.0);
+        if (nq)
+            std::fprintf(stderr, "strata: QuantLab: dense_nq: the output head as type %d (%.1f MiB)\n", type_, bytes / 1048576.0);
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix

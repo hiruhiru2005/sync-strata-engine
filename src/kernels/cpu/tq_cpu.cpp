@@ -6,8 +6,9 @@
 
 #include "tq_states.hpp"
 #include "tq_computed.hpp"
-#include "ggml-common-tq.h"
+#include "strata/kernels/tq_lut.hpp"   // QuantLab (11/4): the codebook (built-in, or a pack's tq_lut_f16.bin)
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -29,13 +30,14 @@ alignas(64) int16_t g_table[(tq_detail::kTqStateMask + 1) * 4];
 alignas(64) int16_t g_table_c[(tq_detail::kTqStateMask + 1) * 4];
 
 void fill_table() {
+    const uint16_t* lut = strata::kernels::tq_lut_f16_host();   // QuantLab (11/4): tq_lut_f16, unless a pack replaced it
     for (uint32_t s = 0; s <= tq_detail::kTqStateMask; ++s) {
         const uint32_t x = s * 0x9e3779b1u;
         const uint32_t pts[2] = {x >> 21, (x >> 10) & 2047u};   // the hash's two codebook points
         for (int h = 0; h < 2; ++h)
             for (int j = 0; j < 2; ++j) {
                 // fp16 * 2^13 is exact in float; round half away from zero, as the fork's ggml-cpu table does
-                const float v = tq_detail::tq_half_to_float(tq_lut_f16[2 * pts[h] + j]) * 8192.0f;
+                const float v = tq_detail::tq_half_to_float(lut[2 * pts[h] + j]) * 8192.0f;
                 g_table[4 * s + 2 * h + j] = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
             }
     }
@@ -161,8 +163,17 @@ void rows_scalar_tqp_t(const uint8_t* w, size_t row_bytes, int n, const tq_detai
 }  // namespace
 
 const int16_t* tq_state_table() {
-    static std::once_flag once;
-    std::call_once(once, fill_table);
+    // QuantLab (11/4): refilled when tq_lut_load changed the codebook (at start, before any kernel runs)
+    static std::mutex m;
+    static std::atomic<uint64_t> filled{~0ull};
+    const uint64_t g = strata::kernels::tq_lut_generation();
+    if (filled.load(std::memory_order_acquire) != g) {
+        std::lock_guard<std::mutex> lk(m);
+        if (filled.load(std::memory_order_relaxed) != g) {
+            fill_table();
+            filled.store(g, std::memory_order_release);
+        }
+    }
     return g_table;
 }
 

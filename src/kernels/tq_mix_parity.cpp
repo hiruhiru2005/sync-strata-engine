@@ -1,7 +1,7 @@
 // src/kernels/tq_mix_parity.cpp - QuantLab: a layer of per-expert trellis K (native_experts.txt v6, tq_mix.hpp) on the
 // GPU against the CPU, without a model.
 //
-//     build/tq_mix_parity [--hadamard] [--r1q2]
+//     build/tq_mix_parity [--hadamard] [--r1q2] [--lut <codebook>]
 //
 // Twelve random experts, (K gate/up, K down) = (2, 3) .. (13, 14), each its own group of NT tokens, in ONE grouped launch
 // of a mixed layer (kTqMixedType, the K pair in each group pointer's top byte), against the CPU's trellis kernels
@@ -14,11 +14,14 @@
 // the codes): the mixed-layer GPU kernels' R1Q2 branch against the CPU's R1Q2 rows, the prompt path's
 // iq_dequant_expert_r1q2_f16 against the host decode with d = colscale * p2[q] * rowbase, and the PCIe staging copy
 // (fetch_blobs_mixed with the R1Q2 scale bytes) copying every blob's own bytes.
+// QuantLab (11/4) --lut <file>: a pack's own codebook (tq_lut_f16.bin, strata/kernels/tq_lut.hpp) on both sides: the CPU
+// table and the host decode read it, the GPU's fp16 and int8 copies are overwritten with it (tq_lut_device_upload).
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/tq_lut.hpp"
 #include "strata/kernels/tq_mix.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -100,10 +103,11 @@ void decode_codes(const uint8_t* qs, int K, float d, float* y) {
         }
         const uint32_t x = (s & TQ_STATE_MASK) * 0x9e3779b1u;
         const uint32_t a = x >> 21, c = (x >> 10) & 2047u;
-        y[4 * t + 0] = d * h2f(tq_lut_f16[2 * a]);
-        y[4 * t + 1] = d * h2f(tq_lut_f16[2 * a + 1]);
-        y[4 * t + 2] = d * h2f(tq_lut_f16[2 * c]);
-        y[4 * t + 3] = d * h2f(tq_lut_f16[2 * c + 1]);
+        const uint16_t* L = strata::kernels::tq_lut_f16_host();   // QuantLab (11/4): tq_lut_f16 unless --lut replaced it
+        y[4 * t + 0] = d * h2f(L[2 * a]);
+        y[4 * t + 1] = d * h2f(L[2 * a + 1]);
+        y[4 * t + 2] = d * h2f(L[2 * c]);
+        y[4 * t + 3] = d * h2f(L[2 * c + 1]);
     }
 }
 
@@ -133,9 +137,25 @@ float r1q2_d(const cpu::NativeFmt& f, const uint8_t* blob, int m, int64_t r, int
 
 int main(int argc, char** argv) {
     bool had = false, r1q2 = false;
+    std::string lut;
     for (int i = 1; i < argc; ++i) {
         had = had || std::string(argv[i]) == "--hadamard";
         r1q2 = r1q2 || std::string(argv[i]) == "--r1q2";
+        if (std::string(argv[i]) == "--lut" && i + 1 < argc) lut = argv[++i];
+    }
+    if (!lut.empty()) {   // QuantLab (11/4): the codebook on both sides, as the engine sets it from a pack
+        std::string err;
+        std::vector<uint16_t> i8((size_t) strata::kernels::kTqLutPoints);
+        int copies = 0;
+        if (!strata::kernels::tq_lut_load(lut, err)) { std::printf("--lut: %s  FAIL\n", err.c_str()); return 1; }
+        strata::kernels::tq_lut_i8_from_f16(strata::kernels::tq_lut_f16_host(), i8.data());
+        if (!strata::kernels::tq_lut_device_upload(strata::kernels::tq_lut_f16_host(), i8.data(), copies, err)) {
+            std::printf("--lut: %s  FAIL\n", err.c_str());
+            return 1;
+        }
+        std::printf("tq_mix_parity: codebook %s (sha256 %.16s, %s, max |v| %.4f), %d device copies written\n", lut.c_str(),
+                    strata::kernels::tq_lut_sha256().c_str(), strata::kernels::tq_lut_builtin() ? "the built-in one" : "not built-in",
+                    (double) strata::kernels::tq_lut_max_abs(strata::kernels::tq_lut_f16_host()), copies);
     }
     std::printf("tq_mix_parity: %d experts of per-expert trellis K in one grouped launch%s%s\n", NE,
                 had ? " (Hadamard-folded down: identity signs, block 128)" : "", r1q2 ? " (R1Q2 blobs)" : "");

@@ -19,6 +19,7 @@
 #include <set>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -223,6 +224,130 @@ struct Pending {
 };
 }
 
+// ---- QuantLab (11/4): dense matrices in other ordinary ggml types (see native_dense.hpp)
+namespace {
+struct NqDense {
+    bool on = false;
+    std::string dir;
+    std::map<std::string, TqEntry> index;
+    std::set<std::string> used;
+};
+NqDense& nq_dense() {
+    static NqDense d;
+    return d;
+}
+float nq_half(uint16_t h) {
+    const uint32_t sign = (uint32_t) (h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) bits = sign;
+        else {
+            int e = -1;
+            uint32_t m = man;
+            do { ++e; m <<= 1; } while ((m & 0x400u) == 0);
+            bits = sign | ((uint32_t) (127 - 15 - e) << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 31) bits = sign | 0x7F800000u | (man << 13);
+    else bits = sign | ((exp + 112u) << 23) | (man << 13);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+// ggml's dequantize_row_q5_1: a block of 32 is {fp16 d, fp16 m, u32 qh, 16 bytes of nibbles}
+std::vector<float> nq_q5_1_floats(const uint8_t* b, uint64_t n) {
+    std::vector<float> y((size_t) n);
+    for (uint64_t k = 0; k < n / 32; ++k) {
+        const uint8_t* blk = b + k * 24;
+        uint16_t dh, mh;
+        uint32_t qh;
+        std::memcpy(&dh, blk, 2);
+        std::memcpy(&mh, blk + 2, 2);
+        std::memcpy(&qh, blk + 4, 4);
+        const float d = nq_half(dh), m = nq_half(mh);
+        const uint8_t* qs = blk + 8;
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t x0 = (qs[j] & 0x0Fu) | (((qh >> j) << 4) & 0x10u);
+            const uint32_t x1 = (qs[j] >> 4) | ((qh >> (j + 12)) & 0x10u);
+            y[(size_t) (k * 32 + j)] = (float) x0 * d + m;
+            y[(size_t) (k * 32 + j + 16)] = (float) x1 * d + m;
+        }
+    }
+    return y;
+}
+}  // namespace
+
+bool ql_dense_nq_init(const std::string& pack_dir, std::string& err) {
+    NqDense& d = nq_dense();
+    d = NqDense{};
+    const char* env = std::getenv("STRATA_QL_DENSE_NQ");
+    if (env != nullptr && (std::strcmp(env, "0") == 0 || std::strcmp(env, "off") == 0)) return true;
+    std::string dir = env != nullptr && *env ? std::string(env) : pack_dir;
+    if (dir.empty()) return true;
+    std::ifstream idx(dir + "/dense_nq.txt");
+    if (!idx) {
+        if (env != nullptr && *env) { err = "STRATA_QL_DENSE_NQ: " + dir + "/dense_nq.txt is missing"; return false; }
+        return true;   // a pack without dense replacements
+    }
+    uint64_t end = 0;
+    std::string line;
+    while (std::getline(idx, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string name;
+        TqEntry e{};
+        if (!(ss >> name >> e.type >> e.ne0 >> e.ne1 >> e.offset >> e.bytes)) { err = "dense_nq.txt: bad line: " + line; return false; }
+        if (strata::kernels::native_tq_type(e.type) || !strata::kernels::native_mmvq_supported(e.type) ||
+            e.ne0 <= 0 || e.ne0 > INT_MAX || e.ne1 <= 0 || e.ne1 > INT_MAX ||
+            e.bytes != strata::kernels::native_mmvq_weight_bytes(e.type, (int) e.ne0, (int) e.ne1)) {
+            err = "dense_nq.txt: " + name + ": type " + std::to_string(e.type) + " " + std::to_string(e.ne0) + " x " +
+                  std::to_string(e.ne1) + " is not an ordinary type the engine reads, or its byte count is wrong";
+            return false;
+        }
+        if (!d.index.emplace(name, e).second) { err = "dense_nq.txt: duplicate " + name; return false; }
+        end = (std::max)(end, e.offset + e.bytes);
+    }
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(dir + "/dense_nq.bin", ec);
+    if (ec || size < end) { err = "dense_nq.bin in " + dir + " is missing or shorter than its index"; return false; }
+    for (const auto& [name, e] : d.index)
+        if (tq_dense().on && tq_dense().index.count(name)) {
+            err = "dense_nq and STRATA_QL_DENSE_TQ both replace " + name; return false;
+        }
+    d.dir = dir;
+    d.on = !d.index.empty();
+    return true;
+}
+bool ql_dense_nq_active() { return nq_dense().on; }
+const std::string& ql_dense_nq_dir() { return nq_dense().dir; }
+bool ql_dense_nq_has(const std::string& name) { return nq_dense().on && nq_dense().index.count(name) > 0; }
+bool ql_dense_nq_read(const std::string& name, int64_t ne0, int64_t ne1, int& type, std::vector<uint8_t>& out,
+                      std::string& err) {
+    NqDense& d = nq_dense();
+    if (!d.on) return false;
+    auto it = d.index.find(name);
+    if (it == d.index.end()) return false;
+    const TqEntry& e = it->second;
+    if (e.ne0 != ne0 || e.ne1 != ne1) {
+        err = "dense_nq: " + name + " is " + std::to_string(e.ne0) + " x " + std::to_string(e.ne1) + ", the model's " +
+              std::to_string(ne0) + " x " + std::to_string(ne1);
+        return false;
+    }
+    std::ifstream f(d.dir + "/dense_nq.bin", std::ios::binary);
+    out.resize(e.bytes);
+    f.seekg((std::streamoff) e.offset);
+    if (!f || !f.read((char*) out.data(), (std::streamsize) e.bytes)) { err = "dense_nq.bin is short at " + name; return false; }
+    type = e.type;
+    d.used.insert(name);
+    return true;
+}
+std::string ql_dense_nq_unused() {
+    std::string out;
+    for (const auto& [name, e] : nq_dense().index)
+        if (!nq_dense().used.count(name)) out += (out.empty() ? "" : ", ") + name;
+    return out;
+}
+
 bool ql_dense_tq_active() { return tq_dense().on && tq_dense().error.empty(); }
 bool ql_dense_tq_read(const std::string& name, int64_t ne0, int64_t ne1, int& type, std::vector<uint8_t>& out,
                       std::string& err) {
@@ -304,9 +429,12 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     return false;
                 }
                 const auto tq = tq_dense().index.find(tensor.name);   // QuantLab: the trellis matrix replaces it
+                const auto nq = nq_dense().index.find(tensor.name);   // QuantLab (11/4): or an ordinary type does
                 total += alloc_bytes(tq_dense().on && tq != tq_dense().index.end()
                                          ? tq->second.bytes
-                                         : strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
+                                         : nq_dense().on && nq != nq_dense().index.end()
+                                               ? nq->second.bytes
+                                               : strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
             }
         }
         out = total;
@@ -354,6 +482,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (!tq_dense().error.empty()) { err = tq_dense().error; return false; }
     std::ifstream tq_bin;
     uint64_t tq_count = 0, tq_bytes = 0, tq_replaced = 0;
+    uint64_t nq_count = 0, nq_bytes = 0, nq_replaced = 0;   // QuantLab (11/4): dense_nq
     if (tq_dense().on) {
         tq_bin.open(tq_dense().dir + "/dense_tq.bin", std::ios::binary);
         if (!tq_bin) { err = "STRATA_QL_DENSE_TQ: " + tq_dense().dir + "/dense_tq.bin is missing"; return false; }
@@ -475,13 +604,24 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     tq_bytes += e.bytes;
                     tq_replaced += strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1);
                 }
-                const int up_type = tq_this ? tqe->second.type : (int) tensor.type;
+                // QuantLab (11/4): or dense_nq replaces it in another ordinary type (no rotation)
+                int nq_type = -1;
+                std::vector<uint8_t> nq_host;
+                const bool nq_this = !tq_this && ql_dense_nq_read(tensor.name, ref.ne0, ref.ne1, nq_type, nq_host, err);
+                if (!err.empty()) return false;
+                if (nq_this) {
+                    ++nq_count;
+                    nq_bytes += nq_host.size();
+                    nq_replaced += strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1);
+                }
+                const int up_type = tq_this ? tqe->second.type : nq_this ? nq_type : (int) tensor.type;
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(up_type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
                 if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), tq_this ? (const void*) tq_host.data() : gguf.tensor_data(tensor), bytes,
+                    status = cudaMemcpy(data.get(), tq_this ? (const void*) tq_host.data()
+                                                    : nq_this ? (const void*) nq_host.data() : gguf.tensor_data(tensor), bytes,
                                         cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
@@ -492,7 +632,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
                 // copy stays: the prompt path's GEMMs read it).
                 DevicePtr packed;
-                if (!tq_this && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
+                if (!tq_this && !nq_this && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
                     strata::kernels::native_q8_0_packed_enabled() &&
                     strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1)) {
                     std::vector<uint8_t> host(bytes);
@@ -527,8 +667,20 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     void* p = nullptr;
                     std::vector<uint8_t> q8;
                     if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
+                    // QuantLab (11/4): dense_nq's copy of this projection (Q8_0 as it is; Q5_1 dequantized, then Q8_0)
+                    int hq_type = -1;
+                    std::vector<uint8_t> hq;
+                    const bool hq_this = !f32_inject && ql_dense_nq_read(tensor.name, ref.ne0, ref.ne1, hq_type, hq, err);
+                    if (!err.empty()) return false;
+                    if (hq_this) {
+                        const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1;
+                        if (hq_type == 8) q8 = std::move(hq);
+                        else if (hq_type == 7) { const std::vector<float> fv = nq_q5_1_floats(hq.data(), n); q8 = q8_0_of(fv.data(), n); }
+                        else { err = "dense_nq: " + tensor.name + ": a hyper-connection projection must be Q8_0 or Q5_1"; return false; }
+                        ++nq_count;
+                    }
                     if (cudaMalloc(&p, bytes) != cudaSuccess ||
-                        cudaMemcpy(p, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
+                        cudaMemcpy(p, f32_inject || hq_this ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
                                    cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
@@ -623,6 +775,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             std::fprintf(stderr, "strata: QuantLab: STRATA_QL_DENSE_TQ: %llu projection matrices as trellis blocks from %s "
                                  "(%.1f MiB in place of %.1f MiB)\n", (unsigned long long) tq_count, tq_dense().dir.c_str(),
                          tq_bytes / 1048576.0, tq_replaced / 1048576.0);
+        if (nq_count)
+            std::fprintf(stderr, "strata: QuantLab: dense_nq: %llu matrices from %s (projections %.1f MiB in place of "
+                                 "%.1f MiB; hyper-connection ones requantized to Q8_0 for the STRATA_HC_Q8 read)\n",
+                         (unsigned long long) nq_count, ql_dense_nq_dir().c_str(), nq_bytes / 1048576.0,
+                         nq_replaced / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;

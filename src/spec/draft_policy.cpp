@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -22,7 +23,18 @@ constexpr double kPriorN = 4.0;
 constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
 // A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
 // one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
-constexpr double kStaleRounds = 300.0;
+// QuantLab (11/4): 64 rounds (upstream 300; STRATA_QL_POLICY_STALE=N sets it), and a size measured again after such a
+// stretch takes its new time instead of blending it in at kCostAlpha.  A size priced in one slow stretch (a prompt's
+// cache refill, other work on the machine) was otherwise left out for good: Sync-S's copy task kept the 6-token lookup
+// window at 114-118 ms against the 71-84 it took elsewhere, and decoded 64-66 tok/s on 4.7-token windows where the
+// same run with the price right took 5.4-token windows.
+double stale_rounds() {
+    static const double v = [] {
+        const char* e = std::getenv("STRATA_QL_POLICY_STALE");
+        return e != nullptr && *e ? std::max(1.0, std::atof(e)) : 64.0;
+    }();
+    return v;
+}
 
 }  // namespace
 
@@ -113,7 +125,7 @@ std::string DraftPolicy::cost_table_text() const {
     return out;
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
+bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > stale_rounds(); }
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -124,6 +136,20 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     Pick p;
     p.t = std::clamp(t_mtp, 1, max_t_);
     if (lookup_k <= 0) return p;
+    // QuantLab (11/4), STRATA_QL_LOOKUP_ALWAYS=1 (a test switch): a lookup proposal longer than the MTP's window is
+    // taken whole, without the cost comparison, so two packs can be timed with the same windows
+    static const bool always = [] {
+        const char* v = std::getenv("STRATA_QL_LOOKUP_ALWAYS");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (always) {
+        const int tf = std::min(lookup_k, max_t_ - 1) + 1;
+        if (tf > p.t) {
+            p.lookup = true;
+            p.t = tf;
+        }
+        return p;
+    }
     const double base = mtp_tokens(p.t) / cost_ms(p.t);
     const double q = lookup_rate(match);
     double e = 1.0, qi = 1.0, best = 0.0;
@@ -135,6 +161,16 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
         if (r > best) { best = r; best_t = k + 1; }
     }
     const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
+    static const bool trace = [] { const char* v = std::getenv("STRATA_QL_POLICY_TRACE"); return v != nullptr && v[0] == '1'; }();
+    if (trace) {   // QuantLab (11/4): why a lookup window is taken or not
+        static long long n_trace = 0;
+        if ((n_trace++ & 63) == 0)
+            std::fprintf(stderr, "strata policy: t_mtp %d k %d match %d | mtp %.3f tok / %.2f ms = %.4f | lookup q %.3f best T%d "
+                                 "%.4f (cost %.2f ms, n %.0f) full T%d (cost %.2f ms, n %.0f, tried %.0f) | margin %.3f\n",
+                         p.t, lookup_k, match, mtp_tokens(p.t), cost_ms(p.t), base, q, best_t, best,
+                         best_t > 0 ? cost_ms(best_t) : 0.0, best_t > 0 ? cost_n_[bk_][best_t] : 0.0, t_full, cost_ms(t_full),
+                         cost_n_[bk_][t_full], tried_[bk_][t_full], margin_);
+    }
     if (best_t > 0 && best > base * (1.0 + margin_)) {
         p.lookup = true;
         p.t = best_t;
@@ -154,8 +190,10 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
-        round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+        const bool was_stale = stale(t);   // QuantLab (11/4): its old time is replaced, not blended
+        round_ms = was_stale ? round_ms : clamp_sample(t, round_ms);
+        const double alpha = was_stale ? 1.0
+                             : robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
         cost_n_[bk_][t] += 1.0;
         last_[bk_][t] = rounds_;
@@ -198,8 +236,9 @@ void DraftPolicy::apply_costs(int64_t committed) {
     for (; n < held_.size() && held_[n].end < committed; ++n) {
         const HeldCost& h = held_[n];
         bk_ = h.bucket;   // observe()'s update, in the bucket the round ran in
-        const double ms = clamp_sample(h.t, h.ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][h.t] + 1.0)) : kCostAlpha;
+        const bool was_stale = stale(h.t);   // QuantLab (11/4): as observe()
+        const double ms = was_stale ? h.ms : clamp_sample(h.t, h.ms);
+        const double alpha = was_stale ? 1.0 : robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][h.t] + 1.0)) : kCostAlpha;
         cost_[bk_][h.t] = cost_n_[bk_][h.t] > 0 ? (1.0 - alpha) * cost_[bk_][h.t] + alpha * ms : ms;
         cost_n_[bk_][h.t] += 1.0;
         delayed_n_[bk_][h.t] += 1.0;   // a round already counted by observe_committed
@@ -295,8 +334,10 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
-        round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+        const bool was_stale = stale(t);   // QuantLab (11/4): its old time is replaced, not blended
+        round_ms = was_stale ? round_ms : clamp_sample(t, round_ms);
+        const double alpha = was_stale ? 1.0
+                             : robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
         cost_n_[bk_][t] += 1.0;
         last_[bk_][t] = rounds_;

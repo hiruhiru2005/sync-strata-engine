@@ -317,3 +317,11 @@ alignas(16) static const STRATA_TQ_LUT_SPACE uint16_t tq_lut_f16[4096] = {
     0xa11a, 0xc068, 0x35bb, 0xb82e, 0x3f77, 0xbbb9, 0xb386, 0x3b46, 0xb675, 0x22f3, 0x3e8b, 0xbcb2, 0xb8ba, 0xba29, 0x4235, 0xbd08,
     0x1038, 0x3f9f, 0xade8, 0x399f, 0x3363, 0xb9da, 0x3909, 0x37c8, 0x3c82, 0xbc4c, 0xbc3a, 0xb788, 0xa897, 0x39da, 0xb6d2, 0x3bee,
 };
+
+// QuantLab (11/4): a pack's own codebook (tq_lut_f16.bin, strata/kernels/tq_lut.hpp) overwrites this translation
+// unit's copy of tq_lut_f16 before the first kernel runs (tq_lut_registry.h; CUDA only)
+#if defined(__CUDACC__) && !defined(__HIPCC__) && !defined(__HIP__)
+#include "tq_lut_registry.h"
+static const ::strata_tq_lut::Register strata_tq_lut_f16_register(
+    [](const uint16_t* f16, const uint16_t*) -> int { return (int) cudaMemcpyToSymbol(tq_lut_f16, f16, sizeof(tq_lut_f16)); });
+#endif

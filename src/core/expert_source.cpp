@@ -1392,6 +1392,12 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
     return staged_blob(layer, expert);
 }
 
+std::string pack_experts_path(const std::string& pack_dir) {   // QuantLab (11/4), see expert_source.hpp
+    std::error_code ec;
+    const std::string v2 = pack_dir + "/experts.v2.bin";
+    return std::filesystem::exists(v2, ec) ? v2 : pack_dir + "/experts.bin";
+}
+
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
@@ -1441,7 +1447,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         }
         // QuantLab v6: a mixed layer reads each expert at its own place and size (blob_off / blob_len); its
         // layer_blob_bytes_ is the layer's largest blob (layout.bytes), which sizes the buffers and the RAM slots
-        if (layout.any_mixed() && !gguf_.empty() && !std::filesystem::exists(pack_dir + "/experts.bin")) {
+        if (layout.any_mixed() && !gguf_.empty() && !std::filesystem::exists(pack_experts_path(pack_dir))) {
             err = "FileExpertSource: a pack with per-expert formats (experts_k.txt) needs its experts.bin (not the GGUF in place)";
             return false;
         }
@@ -1469,7 +1475,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
             return false;
         }
     }
-    const std::string path = pack_dir + "/experts.bin";
+    const std::string path = pack_experts_path(pack_dir);   // QuantLab (11/4): or experts.v2.bin
     if (layout.native && !gguf_.empty() && !std::filesystem::exists(path)) {
         // CS-T: no experts.bin - the model's GGUF shards, read in place
         blobs_ = (int64_t) blob_count;
@@ -5931,7 +5937,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                              std::string& err, uint64_t max_pinned_bytes,
                              const std::string& shared_arena_file) {
     close();
-    const std::string path = pack_dir + "/experts.bin";
+    const std::string path = pack_experts_path(pack_dir);   // QuantLab (11/4): or experts.v2.bin
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     if (lay.n_layers != n_layers || lay.n_expert != n_expert) {

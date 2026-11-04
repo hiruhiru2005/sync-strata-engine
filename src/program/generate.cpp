@@ -50,6 +50,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/tq_lut.hpp"   // QuantLab (11/4): a pack's own trellis codebook
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"   // QuantLab: tq_kbits for the per-expert K check
 #include "strata/kernels/ngram.hpp"
@@ -708,6 +709,7 @@ struct Options {
     int pool_tasks = 0;           ///< Batched CPU expert tasks per phase; 0 keeps the existing policy
     /// #272: the pool's core layout; `all` (the default) is the layout it always had, auto / p-cores are opt-in
     strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
+    bool pool_affinity_given = false;   ///< QuantLab (11/4): --pool-affinity was given (else P-cores on a hybrid CPU)
     /// --pool-affinity measure (opt-in, hybrid CPUs, native packs): `all` and `p-cores` are timed on this pack's
     /// own experts at start and the faster layout is taken (measure_pool_affinity)
     bool pool_measure = false;
@@ -3192,6 +3194,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--pool-affinity") {
             const std::string v = next("--pool-affinity");
+            o.pool_affinity_given = true;
             if (v == "auto") o.pool_affinity = strata::kernels::cpu::PoolAffinity::Auto;
             else if (v == "p-cores" || v == "pcores") o.pool_affinity = strata::kernels::cpu::PoolAffinity::PCores;
             else if (v == "all") o.pool_affinity = strata::kernels::cpu::PoolAffinity::All;
@@ -4205,6 +4208,76 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: primary device from STRATA_PRIMARY_DEVICE: CUDA%d\n", primary_device);
     }
+    // ---- QuantLab (11/4): the pack's own trellis codebook (<pack>/tq_lut_f16.bin, strata/kernels/tq_lut.hpp), read here, on
+    // the primary device before anything is allocated or any kernel runs: the CPU state table, the GPU's fp16 copies and
+    // its int8 copy all follow it.  No file: the built-in table, nothing changes.  Every trellis source must agree: the
+    // dense matrices of STRATA_QL_DENSE_TQ carry the codebook they were quantized with beside them (none: the built-in
+    // one) and a mismatch refuses the start; so do the other GPUs (only the primary's copies are written) and a pack
+    // without experts.bin (its experts would come from the model file, quantized with the built-in codebook).
+    if (!o.pack.empty()) {
+        namespace tl = strata::kernels;
+        std::error_code lut_ec;
+        const std::string lut_path = o.pack + "/" + tl::kTqLutFile;
+        const bool pack_lut = std::filesystem::exists(lut_path, lut_ec);
+        if (pack_lut && !tl::tq_lut_load(lut_path, err)) {
+            std::fprintf(stderr, "strata generate: QuantLab: the pack's trellis codebook: %s\n", err.c_str());
+            return 1;
+        }
+        const std::string pack_sha = tl::tq_lut_sha256();
+        if (const char* dtq = std::getenv("STRATA_QL_DENSE_TQ"); dtq != nullptr && *dtq) {
+            const std::string dpath = std::string(dtq) + "/" + tl::kTqLutFile;
+            std::string dsha = tl::tq_lut_builtin_sha256();
+            if (std::filesystem::exists(dpath, lut_ec) && !tl::tq_lut_file_sha256(dpath, dsha, err)) {
+                std::fprintf(stderr, "strata generate: QuantLab: STRATA_QL_DENSE_TQ's trellis codebook: %s\n", err.c_str());
+                return 1;
+            }
+            if (dsha != pack_sha) {
+                std::fprintf(stderr, "strata generate: QuantLab: the trellis dense matrices (STRATA_QL_DENSE_TQ=%s) were quantized "
+                                     "with codebook %.12s, the pack's experts with %.12s: they must use the same one (the "
+                                     "codebook a set was quantized with goes beside it as %s)\n",
+                             dtq, dsha.c_str(), pack_sha.c_str(), tl::kTqLutFile);
+                return 1;
+            }
+        }
+        if (pack_lut && !tl::tq_lut_builtin()) {
+            bool other_gpus = !o.layer_split.empty();
+            for (int r = 0; r < 3; ++r)
+                other_gpus = other_gpus || o.expert_cache_remote[(size_t) r] > 0 || o.expert_cache_remote_auto[(size_t) r];
+            if (other_gpus) {
+                std::fprintf(stderr, "strata generate: QuantLab: %s: a pack's own trellis codebook is written to the primary "
+                                     "GPU only; --layer-split and the helper-GPU caches are not supported with it yet\n",
+                             lut_path.c_str());
+                return 1;
+            }
+            if (!std::filesystem::exists(strata::core::pack_experts_path(o.pack), lut_ec)) {
+                std::fprintf(stderr, "strata generate: QuantLab: %s: the pack has its own trellis codebook but no experts.bin "
+                                     "(experts read from the model file were quantized with the built-in one)\n",
+                             lut_path.c_str());
+                return 1;
+            }
+            std::vector<uint16_t> lut_i8((size_t) tl::kTqLutPoints);
+            tl::tq_lut_i8_from_f16(tl::tq_lut_f16_host(), lut_i8.data());
+            int copies = 0;
+            if (!tl::tq_lut_device_upload(tl::tq_lut_f16_host(), lut_i8.data(), copies, err)) {
+                std::fprintf(stderr, "strata generate: QuantLab: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: QuantLab: trellis codebook from %s (sha256 %.16s, max |v| %.4f; built-in "
+                                 "%.16s): the CPU table and %d device copies use it\n",
+                         lut_path.c_str(), pack_sha.c_str(), (double) tl::tq_lut_max_abs(tl::tq_lut_f16_host()),
+                         tl::tq_lut_builtin_sha256().c_str(), copies);
+        } else if (pack_lut) {
+            std::fprintf(stderr, "strata generate: QuantLab: %s holds the built-in trellis codebook\n", lut_path.c_str());
+        }
+    }
+    // ---- QuantLab (11/4): dense replacements in ordinary ggml types (dense_nq, strata/core/native_dense.hpp): the pack's
+    // own dense_nq.txt, or STRATA_QL_DENSE_NQ=<dir> (0: off).  Read here so the VRAM estimates below see their sizes.
+    if (!strata::core::ql_dense_nq_init(o.pack, err)) {
+        std::fprintf(stderr, "strata generate: QuantLab: %s\n", err.c_str());
+        return 1;
+    }
+    if (strata::core::ql_dense_nq_active())
+        std::fprintf(stderr, "strata generate: QuantLab: dense_nq: the index in %s\n", strata::core::ql_dense_nq_dir().c_str());
     // ---- STRATA_EXPERT_NIBBLE=1 keeps the gate/up experts of IQ2_S / IQ3_XXS / IQ3_S layers as 4-bit codes in their VRAM
     // slots (strata/core/expert_nibble.hpp).  Unset or 0: nothing here runs, no table is set, and every slot size below is
     // the GGUF blob's, as before.  On: if anything would read a converted slot as GGUF blocks or write GGUF bytes into
@@ -6475,6 +6548,13 @@ int main(int argc, char** argv) {
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
+    if (strata::core::ql_dense_nq_active() && !multi_gpu) {   // QuantLab (11/4): a misspelt or ignored name is an error
+        const std::string unused = strata::core::ql_dense_nq_unused();
+        if (!unused.empty()) {
+            std::fprintf(stderr, "strata generate: QuantLab: dense_nq names matrices nothing loaded: %s\n", unused.c_str());
+            return 1;
+        }
+    }
     std::vector<float> logits((size_t) n_vocab);
     mem_mark("the native head");
     float* d_logits = nullptr;
@@ -6880,6 +6960,18 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    // QuantLab (11/4): without --pool-affinity, a hybrid CPU's pool runs on its P-cores.  The pool waits for its slowest
+    // worker: a Core i5-14400F (6 P + 4 E) decoded Sync-S at 28.7 tok/s on its P-cores and 26.3 on all of them (the
+    // CPU experts 0.096 against 0.107 ms each); upstream's measure_pool_affinity note has a Core i7-13700K at 188-191
+    // against 148 tok/s.  --pool-affinity all keeps every core.
+    if (!o.pool_affinity_given && !o.pool_measure) {
+        const strata::kernels::cpu::CpuTopology pt = strata::kernels::cpu::detect_cpu_topology(true);
+        if (pt.is_hybrid && pt.p_cores >= 4) {
+            o.pool_affinity = strata::kernels::cpu::PoolAffinity::PCores;
+            std::fprintf(stderr, "strata generate: QuantLab: a hybrid CPU (%d P-cores, %d E-cores): the CPU pool on the "
+                                 "P-cores (--pool-affinity all keeps every core)\n", pt.p_cores, pt.e_cores);
+        }
+    }
     if (o.pool_measure)
         o.pool_affinity = measure_pool_affinity(srcp, o.pool_workers, !o.no_host_worker, o.pool_tasks);
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
@@ -10821,7 +10913,7 @@ int main(int argc, char** argv) {
                     for (const char* n : {"index.txt", "dense.bin"}) files.push_back({std::string("pack ") + n, o.pack + "/" + n});
                     for (const char* n : {"embd.bin", "extra.bin", "manifest.json"})
                         files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
-                    if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
+                    if (srcp == nullptr) files.push_back({"pack experts.bin", strata::core::pack_experts_path(o.pack), true});
                 }
                 if (!o.mtp.empty()) {
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
@@ -10899,11 +10991,22 @@ int main(int argc, char** argv) {
                         for (const char* n : {"native_experts.txt", "index.txt", "dense.bin", "experts.bin", "manifest.json",
                                               "experts_k.txt", "hadamard.txt", "r1q2.txt"})   // QuantLab (10/31): + the tables
                             stamp(o.pack + "/" + n);
+                    // QuantLab (11/4): a pack's own trellis codebook changes every K/V (stamped only where it exists:
+                    // the fingerprint of a pack without one stays what it was)
+                    if (!o.pack.empty() && std::filesystem::exists(o.pack + "/" + strata::kernels::kTqLutFile))
+                        stamp(o.pack + "/" + strata::kernels::kTqLutFile);
+                    // QuantLab (11/4): experts.v2.bin and the dense replacements, where they exist
+                    if (!o.pack.empty() && std::filesystem::exists(o.pack + "/experts.v2.bin")) stamp(o.pack + "/experts.v2.bin");
+                    if (strata::core::ql_dense_nq_active())
+                        for (const char* n : {"dense_nq.txt", "dense_nq.bin"}) stamp(strata::core::ql_dense_nq_dir() + "/" + n);
                     if (srcp != nullptr)
                         for (const auto& input : srcp->model_inputs()) stamp(input.second);
                     // QuantLab (10/31): the trellis dense matrices change every K/V a conversation holds
                     if (const char* tqd = std::getenv("STRATA_QL_DENSE_TQ"); tqd != nullptr && *tqd)
                         for (const char* n : {"dense_tq.txt", "dense_tq.bin", "dense_signs.txt"}) stamp(std::string(tqd) + "/" + n);
+                    if (const char* tqd = std::getenv("STRATA_QL_DENSE_TQ"); tqd != nullptr && *tqd &&
+                        std::filesystem::exists(std::string(tqd) + "/" + strata::kernels::kTqLutFile))
+                        stamp(std::string(tqd) + "/" + strata::kernels::kTqLutFile);
                     c.switches.push_back({"ql.pack_files", (int64_t) pk.digest()});
                 }
                 config_fp = strata::core::session_config_fingerprint(c);

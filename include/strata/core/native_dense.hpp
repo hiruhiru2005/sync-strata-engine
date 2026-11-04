@@ -19,6 +19,19 @@ const float* ql_dense_tq_signs(int width);   // device signs (loaded with the ma
 // empty when it does not, false with err set when it does but does not match
 bool ql_dense_tq_read(const std::string& name, int64_t ne0, int64_t ne1, int& type, std::vector<uint8_t>& out,
                       std::string& err);
+// QuantLab (11/4): dense matrices in other ORDINARY ggml types (Q4_K, Q5_K, Q5_1, ...: no trellis, no rotation), the
+// GGUF's own block layout: index dense_nq.txt ("name type ne0 ne1 offset bytes", ne0 = n_in), bytes dense_nq.bin.
+// From STRATA_QL_DENSE_NQ=<dir>, or else from the pack itself when it holds dense_nq.txt (STRATA_QL_DENSE_NQ=0: off).
+// Replaced: the native projection matrices, output.weight, and the hyper-connection projections the STRATA_HC_Q8
+// read takes from the GGUF (a Q5_1 one is dequantized and requantized to Q8_0 at load: the read stays Q8_0).
+bool ql_dense_nq_init(const std::string& pack_dir, std::string& err);   // true with nothing on when there is none
+bool ql_dense_nq_active();
+const std::string& ql_dense_nq_dir();
+// as ql_dense_tq_read: true with type/out filled when the index names `name` (and marks it used)
+bool ql_dense_nq_read(const std::string& name, int64_t ne0, int64_t ne1, int& type, std::vector<uint8_t>& out,
+                      std::string& err);
+bool ql_dense_nq_has(const std::string& name);
+std::string ql_dense_nq_unused();   // the names the index lists that nothing loaded ("" when none)
 class WeightTable;
 struct WeightRef;
 

@@ -12,6 +12,7 @@
 //
 // Random stream bytes are valid codes (any 15-bit state indexes the codebook).  CPU only.  Exit 0 = pass.
 #include "strata/kernels/cpu/tq_cpu.hpp"
+#include "strata/kernels/tq_lut.hpp"
 
 #include "tq_states.hpp"
 
@@ -393,7 +394,21 @@ void bench(int type, int n, int rows) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 1 && std::string(argv[1]) == "--bench") {
+    // QuantLab (11/4) --lut <file>: everything with a pack's own codebook (tq_lut_f16.bin, strata/kernels/tq_lut.hpp)
+    std::vector<std::string> args(argv + 1, argv + argc);
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == "--lut") {
+            std::string err;
+            if (!strata::kernels::tq_lut_load(args[i + 1], err)) {
+                std::printf("--lut: %s  FAIL\n", err.c_str());
+                return 1;
+            }
+            std::printf("tqp_cpu_test: codebook %s (sha256 %.16s, %s)\n", args[i + 1].c_str(),
+                        strata::kernels::tq_lut_sha256().c_str(), strata::kernels::tq_lut_builtin() ? "the built-in one" : "not built-in");
+            args.erase(args.begin() + (std::ptrdiff_t) i, args.begin() + (std::ptrdiff_t) i + 2);
+            break;
+        }
+    if (!args.empty() && args[0] == "--bench") {
         for (int type : {145, 146, 170, 171})
             for (int n : {2560, 640}) bench(type, n, n == 2560 ? 640 : 2560);
         return 0;

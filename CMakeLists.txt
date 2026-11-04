@@ -474,6 +474,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/dflash2.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/tq_lut_device.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -1785,6 +1786,8 @@ else()
               src/kernels/cpu/expert_layout.cpp src/kernels/cpu/hadamard.cpp)
 endif()
 target_include_directories(strata_kernels_cpu PUBLIC include)
+# QuantLab (11/4): the trellis codebook the engine decodes with (built-in, or a pack's tq_lut_f16.bin)
+target_sources(strata_kernels_cpu PRIVATE src/kernels/tq_lut.cpp)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 if(MSVC)
@@ -2020,6 +2023,8 @@ if(STRATA_NATIVE_EXPERTS)
   # tree leaves them to the FP16 prompt path
   if(STRATA_GGML_DIR AND EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-tqk6.cu")
     list(APPEND _strata_mmq_types tq2_t tqk6 tqk7)
+    # QuantLab (11/4): the fork's MMQ instances read the fork's own codebook, which a pack's tq_lut_f16.bin cannot replace
+    set_property(SOURCE src/kernels/cuda/tq_lut_device.cu APPEND PROPERTY COMPILE_DEFINITIONS STRATA_TQ_MMQ_FORK=1)
     # Gyro-L's pair trellis (types 147-149): the same fork's ggml has their MMQ instances
     if(EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-tqp5.cu")
       list(APPEND _strata_mmq_types tqp5 tqp6 tqp7)
@@ -2040,6 +2045,7 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_TQ_OVERLAY_OK)
       configure_file(third_party/ggml/ggml-common-tq.h "${_strata_tq_overlay_dir}/ggml-common-tq.h" COPYONLY)
       configure_file(src/kernels/cuda/tq_lut_i8.cuh "${_strata_tq_overlay_dir}/tq_lut_i8.cuh" COPYONLY)
+      configure_file(third_party/ggml/tq_lut_registry.h "${_strata_tq_overlay_dir}/tq_lut_registry.h" COPYONLY)
       set(_strata_mmq_tq ON)
       set(_strata_mmq_tqp ON)   # the overlay adds the pair-trellis enumerators and instances
       set(_strata_mmq_tq_overlay ON)
