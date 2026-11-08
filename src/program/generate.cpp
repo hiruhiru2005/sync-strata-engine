@@ -555,6 +555,46 @@ void pair_adaptive_swaps(int64_t l, std::vector<std::pair<float, int32_t>>& cand
     for (const auto& v : vict) by[lay.expert_bytes(l, v.second)].second.push_back(v);
     for (auto& kv : by) pair_sorted(kv.second.first, kv.second.second);
 }
+// QuantLab 11/8 STRATA_QL_ADAPT_STATS=1: where the adaptive VRAM tier's time goes (the serve loop's adapt / apply_pending)
+struct QlAdaptStats {
+    std::atomic<uint64_t> rounds{0}, swaps{0}, choice_us{0}, stage_us{0}, copy_us{0};
+    std::atomic<uint64_t> applies{0}, evwait_us{0}, commit_us{0}, release_us{0}, upload_us{0};
+    std::atomic<uint64_t> blob_us{0}, h2d_us{0}, cold_in{0}, h2d_first_us{0};   // inside the copies-in loop
+    uint64_t prev[14] = {0};
+};
+QlAdaptStats& ql_adapt_stats() {
+    static QlAdaptStats s;
+    return s;
+}
+bool ql_adapt_stats_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_ADAPT_STATS"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+inline uint64_t ql_us_since(std::chrono::steady_clock::time_point t) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count();
+}
+std::string ql_adapt_line() {
+    if (!ql_adapt_stats_on()) return std::string();
+    QlAdaptStats& a = ql_adapt_stats();
+    const uint64_t now[14] = {a.rounds.load(), a.swaps.load(), a.choice_us.load(), a.stage_us.load(), a.copy_us.load(),
+                              a.applies.load(), a.evwait_us.load(), a.commit_us.load(), a.release_us.load(), a.upload_us.load(),
+                              a.blob_us.load(), a.h2d_us.load(), a.cold_in.load(), a.h2d_first_us.load()};
+    uint64_t d[14];
+    for (int i = 0; i < 14; ++i) { d[i] = now[i] - a.prev[i]; a.prev[i] = now[i]; }
+    const double r = (double) std::max<uint64_t>(1, d[0]), ap = (double) std::max<uint64_t>(1, d[5]);
+    char buf[768];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: ql adapt this request: %llu rounds, %.1f swaps a round; per round: choice %.2f ms, copy back "
+                  "(D2H + sync) %.2f ms, copies in issued %.2f ms (of it: getting the sources %.2f ms, the copy calls %.2f ms, the first call %.2f ms; "
+                  "%.1f incoming experts not in the RAM copy); %llu applies, per apply: wait %.2f ms, commit_exchanges %.2f ms, "
+                  "release %.2f ms, table upload %.2f ms\n",
+                  (unsigned long long) d[0], (double) d[1] / r, (double) d[2] / r / 1e3, (double) d[3] / r / 1e3,
+                  (double) d[4] / r / 1e3, (double) d[10] / r / 1e3, (double) d[11] / r / 1e3, (double) d[13] / r / 1e3, (double) d[12] / r,
+                  (unsigned long long) d[5], (double) d[6] / ap / 1e3, (double) d[7] / ap / 1e3,
+                  (double) d[8] / ap / 1e3, (double) d[9] / ap / 1e3);
+    return std::string(buf);
+}
+
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
                           int64_t n_expert, std::vector<Swap>& swaps, Locate locate) {
@@ -11833,6 +11873,7 @@ int main(int argc, char** argv) {
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
+            const auto qa0 = std::chrono::steady_clock::now();   // QuantLab 11/8 STRATA_QL_ADAPT_STATS
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
@@ -11841,12 +11882,15 @@ int main(int argc, char** argv) {
                     else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
                 }
             for (auto& st : stages) st->adapt_live = false;
+            const auto qa1 = std::chrono::steady_clock::now();
             unpin_blobs(pin_live);
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
+            const auto qa2 = std::chrono::steady_clock::now();
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
             }
+            const auto qa3 = std::chrono::steady_clock::now();
             if (drive.d.evict_sync) {   // a failed upload leaves them to the pre-launch hook
                 for (const auto& pr : pending) drive.d.res_dirty_idx.push_back(pr.first);
                 drive.d.res_dirty = true;
@@ -11858,6 +11902,14 @@ int main(int argc, char** argv) {
             if (res_upload() == cudaSuccess) {   // the whole table: the hook has nothing left
                 drive.d.res_dirty = false;
                 drive.d.res_dirty_idx.clear();
+            }
+            if (ql_adapt_stats_on()) {
+                QlAdaptStats& qs = ql_adapt_stats();
+                qs.applies.fetch_add(1);
+                qs.evwait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(qa1 - qa0).count());
+                qs.commit_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(qa2 - qa1).count());
+                qs.release_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(qa3 - qa2).count());
+                qs.upload_us.fetch_add(ql_us_since(qa3));
             }
         };
         // Where the tier does not wait for its copies (STRATA_ADAPT_NOWAIT=1, STRATA_ADAPT_LAG > 1), its evictions reach
@@ -11965,6 +12017,8 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            const auto qd0 = std::chrono::steady_clock::now();   // QuantLab 11/8 STRATA_QL_ADAPT_STATS
+            src.ql_commit_wait();   // STRATA_QL_ASYNC_COMMIT: the last round's RAM moves before its buffers are reused
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -12001,7 +12055,9 @@ int main(int argc, char** argv) {
                 }
                 return {&xcache, adapt_stream, -1};
             };
+            const auto qd1 = std::chrono::steady_clock::now();
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+            const auto qd2 = std::chrono::steady_clock::now();
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
@@ -12042,7 +12098,10 @@ int main(int argc, char** argv) {
                 }
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
+                const auto qb0 = std::chrono::steady_clock::now();   // QuantLab 11/8 STRATA_QL_ADAPT_STATS
+                if (ql_adapt_stats_on() && !src.has_resident(s.layer, s.in)) ql_adapt_stats().cold_in.fetch_add(1);
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
+                if (ql_adapt_stats_on()) ql_adapt_stats().blob_us.fetch_add(ql_us_since(qb0));
                 nib::guard_raw(s.layer, "the adaptive tier's copy in");
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
@@ -12057,10 +12116,17 @@ int main(int argc, char** argv) {
                     pending.emplace_back((int32_t) in, slot);
                     continue;
                 }
-                if (slot < 0 || b == nullptr ||
+                const auto qh0 = std::chrono::steady_clock::now();
+                const bool h2d_bad = slot < 0 || b == nullptr ||
                     adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
                                    (size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in),   // QuantLab: own size
-                                   gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
+                                   gs ? gs->adapt_stream : adapt_stream) != cudaSuccess;
+                if (ql_adapt_stats_on()) {
+                    const uint64_t us = ql_us_since(qh0);
+                    ql_adapt_stats().h2d_us.fetch_add(us);
+                    if (si == 0) ql_adapt_stats().h2d_first_us.fetch_add(us);
+                }
+                if (h2d_bad) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
                     return false;
@@ -12094,6 +12160,14 @@ int main(int argc, char** argv) {
                 return false;
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (ql_adapt_stats_on()) {
+                QlAdaptStats& qs = ql_adapt_stats();
+                qs.rounds.fetch_add(1);
+                qs.swaps.fetch_add(swaps.size());
+                qs.choice_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(qd1 - qd0).count());
+                qs.stage_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(qd2 - qd1).count());
+                qs.copy_us.fetch_add(ql_us_since(qd2));
+            }
             // #2188: hand the copies and their landing signals to the GPU now.  WDDM batches a stream's work until a
             // driver call flushes it, and the verify window only spins on the pinned int (Linux submits at once: no-op)
             if (aov && agate.hland != nullptr && !swaps.empty()) (void) cudaStreamQuery(adapt_stream);
@@ -18178,6 +18252,8 @@ int main(int argc, char** argv) {
                 if (!qd.empty()) std::fputs(qd.c_str(), stderr);
                 const std::string qp = src.ql_path_line();
                 if (!qp.empty()) std::fputs(qp.c_str(), stderr);
+                const std::string qa = ql_adapt_line();
+                if (!qa.empty()) std::fputs(qa.c_str(), stderr);
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)

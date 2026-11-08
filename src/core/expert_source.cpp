@@ -1679,6 +1679,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    ql_commit_wait();
     ql_io_stop();
     prefetch_end();
     pr_stop();
@@ -5056,7 +5057,46 @@ void FileExpertSource::fs_hold_staged(bool hold) {
         }
 }
 
+// QuantLab 11/8 STRATA_QL_ASYNC_COMMIT=1: the same moves as below on a thread, ordered so that a reader always finds
+// a whole copy: `in` (in VRAM now) leaves the RAM table first, its place takes out's bytes, then `out` points at the
+// place, then out's exchange buffer is let go.  A reader between the last two finds the buffer (still whole: the
+// next round's copy backs wait for this thread, ql_commit_wait).  Not with the rotation or a Foresight swap space.
+void FileExpertSource::ql_commit_wait() {
+    if (commit_th_.joinable()) commit_th_.join();
+    exchanges_ += commit_bg_n_.exchange(0);
+}
+
 int64_t FileExpertSource::commit_exchanges() {
+    static const bool async = [] { const char* v = std::getenv("STRATA_QL_ASYNC_COMMIT"); return v != nullptr && std::atoi(v) != 0; }();
+    if (async && !exchange_storage_.active() && fs_swap_.load(std::memory_order_acquire) == nullptr) {
+        ql_commit_wait();
+        for (const Exchange& x : staged_)
+            if (!soft_in_.empty()) soft_in_[x.out] = SIZE_MAX;
+        commit_bg_ = std::move(staged_);
+        staged_.clear();
+        const int64_t n = (int64_t) commit_bg_.size();
+        if (n > 0)
+            commit_th_ = std::thread([this] {
+                int64_t done = 0;
+                for (const Exchange& x : commit_bg_) {
+                    const uint8_t* src = override_[x.out];
+                    const uint64_t at = complement_offsets_[x.in];
+                    if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
+                        complement_host_ != nullptr && complement_offsets_[x.out] == kNoComplement && x.in != x.out) {
+                        complement_offsets_[x.in] = kNoComplement;
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        complement_offsets_[x.out] = at;
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        ++done;
+                    }
+                    override_[x.out] = nullptr;
+                }
+                commit_bg_n_.store(done);
+            });
+        return n;
+    }
     int64_t n = 0;
     fs_hold_staged(true);   // #2134: both experts' bytes move (in's place takes out's bytes, out leaves its buffer)
     for (const Exchange& x : staged_)

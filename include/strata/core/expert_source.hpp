@@ -803,6 +803,9 @@ public:
     void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
+    /// QuantLab 11/8 STRATA_QL_ASYNC_COMMIT=1: commit_exchanges hands the RAM moves (in's place takes out's bytes,
+    /// ~96 MB a round, 4-7 ms) to a thread and returns; ql_commit_wait() before the next round's copy backs
+    void ql_commit_wait();
     /// 0.1.43 (STRATA_ADAPT_OVERLAP): BEFORE the GPU copies of the staged swaps have landed, make each staged `out` look to the
     /// planner as it will after `commit_exchanges` (pinned, with a device alias into its exchange buffer, so the PCIe share
     /// treats it exactly as a committed one) without touching `in`'s place, which the copy still reads.  `commit_exchanges`
@@ -1310,6 +1313,9 @@ private:
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
     int64_t exchanges_ = 0;
+    std::thread commit_th_;                 ///< QuantLab 11/8 STRATA_QL_ASYNC_COMMIT: the round's RAM moves
+    std::vector<Exchange> commit_bg_;
+    std::atomic<int64_t> commit_bg_n_{0};
     std::atomic<int64_t> file_reads_{0};
     std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
 #if defined(_WIN32)
