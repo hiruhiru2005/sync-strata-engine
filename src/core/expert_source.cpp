@@ -1681,6 +1681,8 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 void FileExpertSource::close() {
     ql_io_stop();
     prefetch_end();
+    pr_stop();
+    prefetch_end();
 #if defined(_WIN32)
     if (split_h_ != nullptr) { CloseHandle((HANDLE) split_h_); split_h_ = nullptr; }   // QuantLab 11/8 STRATA_QL_SPLIT
 #endif
@@ -2113,6 +2115,23 @@ QlReadTrace& ql_read_trace() {
 }
 }  // namespace
 
+// QuantLab 11/8 STRATA_QL_PATH_STATS=1: where a decode read's time goes (read_direct on Windows, the COLD_OVERLAP
+// workers, the ring's insert), summed per request and printed by ql_path_line
+namespace {
+struct QlPathStats {
+    std::atomic<uint64_t> n{0}, blobs{0}, bytes{0}, prep_ns{0}, issue_ns{0}, wait_ns{0}, copy_ns{0};
+    std::atomic<uint64_t> spawn_ns{0}, spawn_n{0}, dyn_ns{0}, dyn_n{0};
+    uint64_t prev[12] = {0};
+};
+QlPathStats& ql_path() {
+    static QlPathStats s;
+    return s;
+}
+inline uint64_t ql_ns(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+}
+}  // namespace
+
 // one batch of `k` fills read by read_direct: the in-flight count before the batch starts, and the records after
 int FileExpertSource::ql_trace_begin(size_t k) {
     QlReadTrace& t = ql_read_trace();
@@ -2372,6 +2391,27 @@ void FileExpertSource::dyn_insert(size_t index, const uint8_t* src, uint64_t byt
     dyn_ins_.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::string FileExpertSource::ql_path_line() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_PATH_STATS"); return v != nullptr && std::atoi(v) != 0; }();
+    if (!on) return std::string();
+    QlPathStats& p = ql_path();
+    const uint64_t now[11] = {p.n.load(), p.blobs.load(), p.bytes.load(), p.prep_ns.load(), p.issue_ns.load(), p.wait_ns.load(),
+                              p.copy_ns.load(), p.spawn_ns.load(), p.spawn_n.load(), p.dyn_ns.load(), p.dyn_n.load()};
+    uint64_t d[11];
+    for (int i = 0; i < 11; ++i) { d[i] = now[i] - p.prev[i]; p.prev[i] = now[i]; }
+    const double nb = (double) std::max<uint64_t>(1, d[0]);
+    char buf[512];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: ql read path this request: %llu decode batches, %.2f blobs and %.2f MB a batch; per batch: "
+                  "prep %.0f us, issue %.0f us, wait for the drive %.0f us, copy %.0f us; worker start %.0f us (%llu); "
+                  "ring insert %.0f us a blob (%llu)\n",
+                  (unsigned long long) d[0], (double) d[1] / nb, (double) d[2] / nb / 1e6, (double) d[3] / nb / 1e3,
+                  (double) d[4] / nb / 1e3, (double) d[5] / nb / 1e3, (double) d[6] / nb / 1e3,
+                  d[8] ? (double) d[7] / (double) d[8] / 1e3 : 0.0, (unsigned long long) d[8],
+                  d[10] ? (double) d[9] / (double) d[10] / 1e3 : 0.0, (unsigned long long) d[10]);
+    return std::string(buf);
+}
+
 std::string FileExpertSource::ql_dyn_line() {
     if (!dyn_on()) return std::string();
     const uint64_t now[5] = {dyn_hits_.load(), dyn_ins_.load(), dyn_skip_.load(), dyn_evict_.load(), (uint64_t) dyn_fifo_.size()};
@@ -2505,6 +2545,11 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
     file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
     // QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: a blob read from the file (after the RAM copy is built) is kept in the ring
     static const bool dyn_env = [] { const char* e = std::getenv("STRATA_QL_DYN_TIER_GIB"); return e != nullptr && std::atof(e) > 0; }();
+    // QuantLab 11/8 STRATA_QL_DYN_LATE=1: the copy into the ring after the publish below, so the layer waiting for this
+    // blob wakes first (the stage buffer is not reused for another 3 layers / 256 claims, far longer than the copy)
+    static const bool dyn_late = [] { const char* e = std::getenv("STRATA_QL_DYN_LATE"); return e != nullptr && std::atoi(e) != 0; }();
+    int64_t late_key = -1;
+    const uint8_t* late_src = nullptr;
     if (dyn_env && ok && complement_ready_ && !direct_.empty()) {
         int64_t key = -1;
         const uint8_t* src = nullptr;
@@ -2515,8 +2560,17 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
             static const bool dyn_ahead = [] { const char* e = std::getenv("STRATA_QL_DYN_AHEAD"); return e != nullptr && std::atoi(e) != 0; }();
             if (v < stage_key_.size() && (dyn_ahead || !stage_pf_[v])) { key = stage_key_[v]; src = stage_buf_[v].get(); }
         }
-        if (key >= 0 && src != nullptr && key / n_expert_ == layer)
+        if (dyn_late && key >= 0 && src != nullptr && key / n_expert_ == layer) {
+            late_key = key;
+            late_src = src;
+        } else if (key >= 0 && src != nullptr && key / n_expert_ == layer) {
+            const auto d0 = std::chrono::steady_clock::now();
             dyn_insert((size_t) key, src, blob_len(layer, key % n_expert_));
+            if (tl_decode) {
+                ql_path().dyn_ns.fetch_add(ql_ns(d0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+                ql_path().dyn_n.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
     if (ok) {
         file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
@@ -2531,6 +2585,14 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
         }
     }
     stage_cv_.notify_all();
+    if (late_key >= 0) {   // QuantLab 11/8 STRATA_QL_DYN_LATE
+        const auto d0 = std::chrono::steady_clock::now();
+        dyn_insert((size_t) late_key, late_src, blob_len(layer, late_key % n_expert_));
+        if (tl_decode) {
+            ql_path().dyn_ns.fetch_add(ql_ns(d0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+            ql_path().dyn_n.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 }
 
 void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
@@ -2733,6 +2795,10 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
     const bool dec = tl_decode;
     auto work = [this, direct, dec] {
         tl_decode = dec;
+        if (dec) {   // QuantLab 11/8 STRATA_QL_PATH_STATS: from the call to this worker running
+            ql_path().spawn_ns.fetch_add(ql_ns(async_t0_, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+            ql_path().spawn_n.fetch_add(1, std::memory_order_relaxed);
+        }
         const std::vector<Fill>& todo = async_todo_;
         if (direct) {
             for (size_t at; (at = async_next_.fetch_add(16)) < todo.size();) {
@@ -2759,8 +2825,60 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
     };
     const size_t nt = direct ? std::min<size_t>(4, (async_todo_.size() + 15) / 16)
                              : std::min<size_t>(async_todo_.size(), (size_t) std::max(1, fetch_threads_));
+    // QuantLab 11/8 STRATA_QL_PERSIST_READERS=1: the same work on 4 kept reader threads (no thread made and joined per layer)
+    static const bool persist = [] { const char* v = std::getenv("STRATA_QL_PERSIST_READERS"); return v != nullptr && std::atoi(v) != 0; }();
+    if (persist && direct) {
+        pr_run(work, nt);
+        pr_used_ = true;
+        return np;
+    }
     for (size_t t = 0; t < nt; ++t) async_th_.emplace_back(work);
     return np;
+}
+
+void FileExpertSource::pr_run(const std::function<void()>& f, size_t n) {
+    {
+        std::lock_guard<std::mutex> lk(pr_mu_);
+        if (pr_th_.empty())
+            for (int t = 0; t < 4; ++t)
+                pr_th_.emplace_back([this] {
+                    for (;;) {
+                        std::function<void()> job;
+                        {
+                            std::unique_lock<std::mutex> lk2(pr_mu_);
+                            pr_cv_.wait(lk2, [&] { return pr_quit_ || !pr_q_.empty(); });
+                            if (pr_q_.empty()) return;   // quitting
+                            job = std::move(pr_q_.front());
+                            pr_q_.pop_front();
+                        }
+                        job();
+                        std::lock_guard<std::mutex> lk2(pr_mu_);
+                        if (--pr_pending_ == 0) pr_done_cv_.notify_all();
+                    }
+                });
+        for (size_t i = 0; i < n; ++i) pr_q_.push_back(f);
+        pr_pending_ += (int) n;
+    }
+    pr_cv_.notify_all();
+}
+
+void FileExpertSource::pr_wait() {
+    std::unique_lock<std::mutex> lk(pr_mu_);
+    pr_done_cv_.wait(lk, [&] { return pr_pending_ == 0; });
+}
+
+void FileExpertSource::pr_stop() {
+    {
+        std::lock_guard<std::mutex> lk(pr_mu_);
+        pr_quit_ = true;
+    }
+    pr_cv_.notify_all();
+    for (std::thread& t : pr_th_) t.join();
+    pr_th_.clear();
+    std::lock_guard<std::mutex> lk(pr_mu_);
+    pr_q_.clear();
+    pr_pending_ = 0;
+    pr_quit_ = false;   // open() calls close() first: the readers start again at the next layer
 }
 
 int64_t FileExpertSource::wait_landed(int64_t layer, const int64_t* experts, int64_t n, uint8_t* state) {
@@ -2796,9 +2914,14 @@ bool FileExpertSource::zc_roles(int64_t layer, int64_t expert, const uint8_t** p
 }
 
 void FileExpertSource::prefetch_end() {
-    if (async_th_.empty()) return;
-    for (std::thread& t : async_th_) t.join();
-    async_th_.clear();
+    if (pr_used_) {   // QuantLab 11/8 STRATA_QL_PERSIST_READERS: this layer's reads ran on the kept readers
+        pr_wait();
+        pr_used_ = false;
+    } else {
+        if (async_th_.empty()) return;
+        for (std::thread& t : async_th_) t.join();
+        async_th_.clear();
+    }
     async_fill_us_ = (double) async_end_ns_.load(std::memory_order_relaxed) / 1e3;
     if (io_pf_ && !async_todo_.empty()) {   // the reads' wall time, as the synchronous fill counts it
         io_crit_us_.fetch_add((uint64_t) async_fill_us_, std::memory_order_relaxed);
@@ -3218,6 +3341,7 @@ bool FileExpertSource::map_view(std::string& why) {
 
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #if defined(_WIN32)
+    const auto qp0 = std::chrono::steady_clock::now();   // QuantLab 11/8 STRATA_QL_PATH_STATS
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
     // queue depth 48 make 10.4 GB/s on a file nobody maps and 3.4 GB/s on a mapped one, 8 MiB reads 8.6 GB/s.  So
@@ -3307,6 +3431,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         sc.ev.push_back(e);
     }
     sc.ov.assign(sc.req.size(), OVERLAPPED{});
+    const auto qp1 = std::chrono::steady_clock::now();
     // every request in flight before the first wait: the drive sees the whole batch as one queue
     size_t issued = 0;
     bool ok = true;
@@ -3322,15 +3447,30 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         }
         ++issued;
     }
+    const auto qp2 = std::chrono::steady_clock::now();
     std::vector<DWORD>& got = sc.got;
     got.assign(sc.req.size(), 0);
     for (size_t q = 0; q < issued; ++q)
         if (!GetOverlappedResult(sc.req[q].h, &sc.ov[q], &got[q], TRUE)) ok = false;
     if (!ok || issued < sc.req.size()) return false;
+    const auto qp3 = std::chrono::steady_clock::now();
+    uint64_t qbytes = 0;
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if ((uint64_t) got[x.req] < x.in_req + x.skip + x.n) return false;
         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+        qbytes += x.n;
+    }
+    if (tl_decode) {
+        const auto qp4 = std::chrono::steady_clock::now();
+        QlPathStats& ps = ql_path();
+        ps.n.fetch_add(1, std::memory_order_relaxed);
+        ps.blobs.fetch_add(n, std::memory_order_relaxed);
+        ps.bytes.fetch_add(qbytes, std::memory_order_relaxed);
+        ps.prep_ns.fetch_add(ql_ns(qp0, qp1), std::memory_order_relaxed);
+        ps.issue_ns.fetch_add(ql_ns(qp1, qp2), std::memory_order_relaxed);
+        ps.wait_ns.fetch_add(ql_ns(qp2, qp3), std::memory_order_relaxed);
+        ps.copy_ns.fetch_add(ql_ns(qp3, qp4), std::memory_order_relaxed);
     }
     return true;
 #elif defined(__linux__)

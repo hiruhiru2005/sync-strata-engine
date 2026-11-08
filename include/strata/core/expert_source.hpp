@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -954,6 +955,8 @@ public:
     std::string ql_direct_ahead_line(int64_t predicted, int64_t skipped);
     /// QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: this request's ring of experts read from the file (empty when off)
     std::string ql_dyn_line();
+    /// QuantLab 11/8 STRATA_QL_PATH_STATS=1: this request's decode reads, phase by phase (empty when off)
+    std::string ql_path_line();
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
@@ -1245,6 +1248,16 @@ private:
     void* split_h_ = nullptr;
     bool split_tried_ = false;
     static constexpr int kSplitFile = 1000;
+    /// QuantLab 11/8 STRATA_QL_PERSIST_READERS=1: the COLD_OVERLAP reads on 4 kept threads (prefetch_begin / prefetch_end)
+    void pr_run(const std::function<void()>& f, size_t n);
+    void pr_wait();
+    void pr_stop();
+    std::mutex pr_mu_;
+    std::condition_variable pr_cv_, pr_done_cv_;
+    std::deque<std::function<void()>> pr_q_;
+    std::vector<std::thread> pr_th_;
+    int pr_pending_ = 0;
+    bool pr_quit_ = false, pr_used_ = false;
     struct QlIoJob { std::vector<Fill> b; std::chrono::steady_clock::time_point t; };
     std::deque<QlIoJob> ql_io_q_;
     std::vector<std::thread> ql_io_th_;
