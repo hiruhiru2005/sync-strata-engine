@@ -74,6 +74,10 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// QuantLab (11/9): *flag = value (a mapped host flag's device alias) from a one-thread kernel on `stream`, after the
+/// stream's earlier work - STRATA_QL_DMA_GPUFLAG raises flag B this way after the PCIe share's DMA copies.  Raises
+/// only if every raise of the flag goes through the same stream in order.
+void set_flag_on_stream(uint32_t* flag, uint32_t value, void* stream);
 /// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
 /// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
 /// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).
@@ -148,6 +152,10 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 /// 16-aligned, then sc_bytes of scales (cpu::ql_r1q2_scale_bytes), 256-aligned.
 void fetch_blobs_mixed(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
                        int64_t d_unit, int cap, void* stream, int64_t sc_bytes = 0);
+/// QuantLab (11/9): fetch_blobs_mixed with the kernel picked by `impl`: 0 the 10/31 kernel, 1 the per-blob kernel with four
+/// loads in flight (fetch_blobs_mixed itself takes 1 when STRATA_QL_FETCH2=1)
+void fetch_blobs_mixed_impl(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
+                            int64_t d_unit, int cap, void* stream, int64_t sc_bytes, int impl);
 /// table[pairs[2k]] = pairs[2k + 1] for k < n, `pairs` in mapped host memory: a residency table's changed entries,
 /// stream-ordered before the window that reads it, without the copy engine (where the tier's swaps may queue).
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream);

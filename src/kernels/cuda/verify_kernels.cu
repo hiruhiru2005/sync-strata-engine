@@ -642,6 +642,35 @@ __global__ void fetch_blobs_mixed_kernel(const unsigned long long* __restrict__ 
     }
 }
 
+// QuantLab (11/9): fetch_blobs_mixed_kernel's copy with blockIdx.y = the blob (no 64-bit divide per 16 bytes) and four
+// 16-byte loads in flight per thread before their stores (the source is mapped host memory: each load is a PCIe read,
+// and the 10/31 kernel had one outstanding per thread - an RTX 3080's decode moved its PCIe share at ~11 GB/s of the
+// link's 26.8).  The same uint4 of every blob to the same place, so the staging bytes are the same.
+__global__ void fetch_blobs_mixed2_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                          uint4* __restrict__ dst, long long slot_per, long long gu_unit, long long d_unit,
+                                          long long sc_bytes) {
+    const int k = (int) blockIdx.y;
+    if (k >= *n) return;
+    const unsigned long long p = src[k];
+    const unsigned tag = (unsigned) (p >> 56);
+    const long long own = sc_bytes > 0
+        ? (((gu_unit * 4 * (long long) (tag & 15u) + d_unit * 4 * (long long) (tag >> 4)) + 15) / 16 * 16 + sc_bytes + 255) / 256 * 256
+        : gu_unit * (2 + 4 * (long long) (tag & 15u)) + d_unit * (2 + 4 * (long long) (tag >> 4));
+    const long long cnt = min((own + 15) / 16, slot_per);   // the uint4 whose start is inside the blob (off * 16 < own)
+    const uint4* __restrict__ s = (const uint4*) (p & ((1ull << 56) - 1));
+    uint4* __restrict__ d = dst + (long long) k * slot_per;
+    const long long step = (long long) gridDim.x * blockDim.x;
+    long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    for (; i + 3 * step < cnt; i += 4 * step) {
+        const uint4 a = s[i], b = s[i + step], c = s[i + 2 * step], e = s[i + 3 * step];
+        d[i] = a;
+        d[i + step] = b;
+        d[i + 2 * step] = c;
+        d[i + 3 * step] = e;
+    }
+    for (; i < cnt; i += step) d[i] = s[i];
+}
+
 __global__ void res_patch_kernel(int32_t* __restrict__ table, const volatile int32_t* pairs, int n) {
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) table[pairs[2 * k]] = pairs[2 * k + 1];
 }
@@ -744,14 +773,26 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 
 void fetch_blobs_mixed(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
                        int64_t d_unit, int cap, void* stream, int64_t sc_bytes) {
+    fetch_blobs_mixed_impl(src, n, dst, slot_bytes, gu_unit, d_unit, cap, stream, sc_bytes, -1);
+}
+
+void fetch_blobs_mixed_impl(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t slot_bytes, int64_t gu_unit,
+                            int64_t d_unit, int cap, void* stream, int64_t sc_bytes, int impl) {
     if (cap <= 0) return;
     if (slot_bytes % 16 != 0 || gu_unit % 8 != 0 || d_unit % 8 != 0) {   // (2 + 4K) is even: unit * 2 is a multiple of 16
         std::fprintf(stderr, "fetch_blobs_mixed: sizes must be multiples of 16\n");
         std::exit(1);
     }
-    fetch_blobs_mixed_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (slot_bytes / 16),
-                                                                       (long long) gu_unit, (long long) d_unit,
-                                                                       (long long) sc_bytes);
+    // QuantLab (11/9): impl < 0 - STRATA_QL_FETCH2=1 picks the per-blob kernel (fetch_blobs_mixed2_kernel); 0 / 1 force one
+    static const bool env2 = [] { const char* v = std::getenv("STRATA_QL_FETCH2"); return v && v[0] == '1'; }();
+    if (impl > 0 || (impl < 0 && env2)) {
+        fetch_blobs_mixed2_kernel<<<dim3(96, (unsigned) cap), 256, 0, (cudaStream_t) stream>>>(
+            src, n, (uint4*) dst, (long long) (slot_bytes / 16), (long long) gu_unit, (long long) d_unit, (long long) sc_bytes);
+    } else {
+        fetch_blobs_mixed_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (slot_bytes / 16),
+                                                                           (long long) gu_unit, (long long) d_unit,
+                                                                           (long long) sc_bytes);
+    }
     check("fetch_blobs_mixed");
 }
 
@@ -1308,6 +1349,15 @@ __global__ void handoff_publish_kernel(float* dst, const float* __restrict__ a, 
     }
 }
 
+// QuantLab (11/9): *flag = value from the GPU, after the stream's earlier work (STRATA_QL_DMA_GPUFLAG: the PCIe
+// share's DMA copies on the copy stream).  A host function in its place wakes a driver thread on the copies'
+// interrupt (WDDM: tens to hundreds of us).  The fences put the stream's earlier writes before the flag.
+__global__ void set_flag_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+
 // wait_flag_ge, with the GPU's clock as it arrives (t_in) and as it leaves (t_out), either may be null
 __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint32_t value, volatile unsigned long long* t_in,
                                             volatile unsigned long long* t_out) {
@@ -1317,6 +1367,11 @@ __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint3
     if (t_out != nullptr) *t_out = strata_now_ns();
 }
 }  // namespace
+
+void set_flag_on_stream(uint32_t* flag, uint32_t value, void* stream) {
+    set_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("set_flag_on_stream");
+}
 
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
     wait_handoff_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);

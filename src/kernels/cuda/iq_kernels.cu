@@ -2469,31 +2469,34 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
 
 // ---------------------------------------------------------------- QuantLab (10/31): R1Q2 blocks (4K code bytes, no fp16 d)
 // tq_load without the block's d: the same states and codebook ints from a code-only block (its K's sizeof - 2 bytes)
-template<int TY>
-__device__ __forceinline__ TqLane tq_load_codes(const uint8_t* __restrict__ qs, int iqs) {
+// QuantLab (11/9): STAGED reads the int8 codebook from shared memory (s_lut: tq_lut_i8's 2048 u16, staged by the
+// kernel) - the same entries, so the same ints
+template<int TY, bool STAGED = false>
+__device__ __forceinline__ TqLane tq_load_codes(const uint8_t* __restrict__ qs, int iqs, const uint16_t* __restrict__ s_lut = nullptr) {
     uint32_t s[4];
     tq_states4<TY>(qs, iqs / 4, s);
     TqLane r;
+    const uint16_t* lut = STAGED ? s_lut : tq_lut_i8;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
-        r.q[i] = (int) ((uint32_t) tq_lut_i8[x >> 21] | ((uint32_t) tq_lut_i8[(x >> 10) & 2047u] << 16));
+        r.q[i] = (int) ((uint32_t) lut[x >> 21] | ((uint32_t) lut[(x >> 10) & 2047u] << 16));
     }
     r.d = 0.0f;
     return r;
 }
 // row_dot_multi for one R1Q2 row: block kbx's scale colscale[kbx] * p2[q]; the caller multiplies by the row's rowbase
-template<int TY, int NC>
+template<int TY, int NC, bool STAGED = false>
 __device__ __forceinline__ void row_dot_multi_r1(const uint8_t* row, const uint16_t* __restrict__ colscale,
                                                  const uint8_t* __restrict__ qrow, const float* __restrict__ p2,
                                                  const block_q8_1* x, const int (&off)[NC], int n, int nb, int lane,
-                                                 float (&s)[NC]) {
+                                                 float (&s)[NC], const uint16_t* __restrict__ s_lut = nullptr) {
     constexpr int CB = (int) sizeof(typename TqInfo<TY>::block_t) - 2;
 #pragma unroll
     for (int c = 0; c < NC; ++c) s[c] = 0.0f;
     for (int k = lane; k < nb * 8; k += 32) {
         const int kbx = k >> 3, iqs = 4 * (k & 7);
-        TqLane w = tq_load_codes<TY>(row + (size_t) kbx * CB, iqs);
+        TqLane w = tq_load_codes<TY, STAGED>(row + (size_t) kbx * CB, iqs, s_lut);
         w.d = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3];
 #pragma unroll
         for (int c = 0; c < NC; ++c)
@@ -2541,35 +2544,37 @@ __device__ __forceinline__ void tqmix_down_rows(const uint8_t* wr, const block_q
     }
 }
 
-template<int TY>
+template<int TY, bool STAGED = false>
 __device__ __forceinline__ void tqmix_gu_rows_r1(const uint8_t* wr, const uint16_t* colscale, const uint8_t* qrow,
                                                  const float* p2, float rbase, const block_q8_1* __restrict__ xq,
                                                  const int32_t* __restrict__ ent_tok, int e0, int e1, int xb, int nb,
-                                                 int lane, float* __restrict__ dst, int64_t n_ff, int r) {
+                                                 int lane, float* __restrict__ dst, int64_t n_ff, int r,
+                                                 const uint16_t* __restrict__ s_lut = nullptr) {
     for (int e = e0; e < e1; e += GRP_NC) {
         const int n = min(GRP_NC, e1 - e);
         int off[GRP_NC];
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
         float s[GRP_NC];
-        row_dot_multi_r1<TY, GRP_NC>(wr, colscale, qrow, p2, xq, off, n, nb, lane, s);
+        row_dot_multi_r1<TY, GRP_NC, STAGED>(wr, colscale, qrow, p2, xq, off, n, nb, lane, s, s_lut);
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c)
             if (c < n && lane == c) dst[(size_t) (e + c) * n_ff + r] = s[c] * rbase;
     }
 }
-template<int TY>
+template<int TY, bool STAGED = false>
 __device__ __forceinline__ void tqmix_down_rows_r1(const uint8_t* wr, const uint16_t* colscale, const uint8_t* qrow,
                                                    const float* p2, float rbase, const block_q8_1* __restrict__ hq,
                                                    const int32_t* __restrict__ ent_dst, int e0, int e1, int hb, int nb,
-                                                   int lane, float* __restrict__ out, int64_t n_embd, int r) {
+                                                   int lane, float* __restrict__ out, int64_t n_embd, int r,
+                                                   const uint16_t* __restrict__ s_lut = nullptr) {
     for (int e = e0; e < e1; e += GRP_NC) {
         const int n = min(GRP_NC, e1 - e);
         int off[GRP_NC];
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
         float s[GRP_NC];
-        row_dot_multi_r1<TY, GRP_NC>(wr, colscale, qrow, p2, hq, off, n, nb, lane, s);
+        row_dot_multi_r1<TY, GRP_NC, STAGED>(wr, colscale, qrow, p2, hq, off, n, nb, lane, s, s_lut);
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c)
             if (c < n && lane == c) out[(size_t) ent_dst[e + c] * n_embd + r] = s[c] * rbase;
@@ -2582,6 +2587,10 @@ __device__ __forceinline__ const uint8_t* r1q2_scales_at(const uint8_t* blob, in
     return blob + (codes + 15) / 16 * 16;
 }
 
+// QuantLab (11/9): STAGED (STRATA_QL_TQMIX_SMEM=1) - the R1Q2 rows read the int8 codebook from shared memory, staged
+// once per block before any warp leaves (a warp's 32 lookups land in ~27 different 32-byte sectors of the 4 KB global
+// table; in shared memory they cost the bank conflicts only).  The same entries, so bitwise the same sums.
+template<bool STAGED>
 __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
@@ -2590,6 +2599,11 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
                                                               float* __restrict__ gate, float* __restrict__ up) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
+    __shared__ __align__(16) uint16_t s_lut[STAGED ? 2048 : 8];
+    if constexpr (STAGED) {
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) ((uint32_t*) s_lut)[i] = ((const uint32_t*) tq_lut_i8)[i];
+        __syncthreads();
+    }
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
     if (row >= 2 * L.n_ff) return;
@@ -2614,7 +2628,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
             const float* p2 = L.p2[is_up ? 1 : 0];
             const float rbase = tq_h2f(rb[r]);
             switch (kg) {
-#define STRATA_TQ_MIX_GU_R1(K, T) case K: tqmix_gu_rows_r1<T>(wr, cs, qrow, p2, rbase, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r); break;
+#define STRATA_TQ_MIX_GU_R1(K, T) case K: tqmix_gu_rows_r1<T, STAGED>(wr, cs, qrow, p2, rbase, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r, s_lut); break;
                 STRATA_TQ_MIX_KS(STRATA_TQ_MIX_GU_R1)
 #undef STRATA_TQ_MIX_GU_R1
                 default: break;
@@ -2632,6 +2646,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
     }
 }
 
+template<bool STAGED>
 __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
@@ -2640,6 +2655,11 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
                                                                 float* __restrict__ out) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
+    __shared__ __align__(16) uint16_t s_lut[STAGED ? 2048 : 8];
+    if constexpr (STAGED) {
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) ((uint32_t*) s_lut)[i] = ((const uint32_t*) tq_lut_i8)[i];
+        __syncthreads();
+    }
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = blockIdx.x * 8 + warp;
     if (r >= L.n_embd) return;
@@ -2660,7 +2680,7 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
             const uint8_t* qrow = sc + (size_t) L.n_embd * 2 + (size_t) nb * 2 + (size_t) r * qdf;
             const float rbase = tq_h2f(rb[r]);
             switch (kd) {
-#define STRATA_TQ_MIX_DOWN_R1(K, T) case K: tqmix_down_rows_r1<T>(wr, cs, qrow, L.p2[2], rbase, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r); break;
+#define STRATA_TQ_MIX_DOWN_R1(K, T) case K: tqmix_down_rows_r1<T, STAGED>(wr, cs, qrow, L.p2[2], rbase, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r, s_lut); break;
                 STRATA_TQ_MIX_KS(STRATA_TQ_MIX_DOWN_R1)
 #undef STRATA_TQ_MIX_DOWN_R1
                 default: break;
@@ -6608,7 +6628,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (L.gu_type == kTqMixedType) {   // QuantLab: a layer of per-expert trellis K (tq_mix.hpp), its own three passes
         const int64_t gyq = (grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
         const dim3 gq((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gyq);
-        native_gu_tqmix_kernel<<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        // QuantLab (11/9): STRATA_QL_TQMIX_SMEM=1 - the codebook staged in shared memory (bitwise the same sums)
+        static const bool tq_smem = [] { const char* v = std::getenv("STRATA_QL_TQMIX_SMEM"); return v && v[0] == '1'; }();
+        if (tq_smem) native_gu_tqmix_kernel<true><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else native_gu_tqmix_kernel<false><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
         check("native_expert_grouped/gu (per-expert K)");
         const long long nhq = (long long) cap_entries * L.n_ff;
         swiglu_entries_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(gate, up, h, nhq);
@@ -6616,7 +6639,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
         check("native_expert_grouped/swiglu (per-expert K)");
         const dim3 gdq((unsigned) ((L.n_embd + 7) / 8), (unsigned) gyq);
-        native_down_tqmix_kernel<<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        if (tq_smem) native_down_tqmix_kernel<true><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_tqmix_kernel<false><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         check("native_expert_grouped/down (per-expert K)");
         return;
     }

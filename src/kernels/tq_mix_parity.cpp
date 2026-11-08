@@ -137,11 +137,12 @@ float r1q2_d(const cpu::NativeFmt& f, const uint8_t* blob, int m, int64_t r, int
 
 int main(int argc, char** argv) {
     bool had = false, r1q2 = false;
-    std::string lut;
+    std::string lut, dump;   // QuantLab (11/9) --dump PREFIX: the grouped GPU output to PREFIX.<grid>.bin
     for (int i = 1; i < argc; ++i) {
         had = had || std::string(argv[i]) == "--hadamard";
         r1q2 = r1q2 || std::string(argv[i]) == "--r1q2";
         if (std::string(argv[i]) == "--lut" && i + 1 < argc) lut = argv[++i];
+        if (std::string(argv[i]) == "--dump" && i + 1 < argc) dump = argv[++i];
     }
     if (!lut.empty()) {   // QuantLab (11/4): the codebook on both sides, as the engine sets it from a pack
         std::string err;
@@ -290,6 +291,10 @@ int main(int argc, char** argv) {
         if (!ck(cudaStreamSynchronize(s), "grouped")) return 1;
         std::vector<float> got((size_t) cap_e * H);
         if (!ck(cudaMemcpy(got.data(), d_out, sizeof(float) * cap_e * H, cudaMemcpyDeviceToHost), "out down")) return 1;
+        if (!dump.empty()) {
+            const std::string p = dump + (gy ? ".strided.bin" : ".pergroup.bin");
+            if (std::FILE* f = std::fopen(p.c_str(), "wb")) { std::fwrite(got.data(), sizeof(float), got.size(), f); std::fclose(f); }
+        }
         for (int e = 0; e < NE; ++e) {
             const size_t o = (size_t) e * NT * H;
             const double r = rel_l1(got.data() + o, want.data() + o, (size_t) NT * H);

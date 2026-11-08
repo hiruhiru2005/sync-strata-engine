@@ -2418,6 +2418,11 @@ if(STRATA_NATIVE_EXPERTS)
     # strata_engine: the --load-check mode runs the engine's start-up checks (NativeDense, check_experts_gguf)
     target_link_libraries(native_expert_parity PRIVATE strata_engine strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
     # QuantLab: a layer of per-expert trellis K (native_experts.txt v6, tq_mix.hpp) on the GPU against the CPU
+    # QuantLab (11/9): the decode's PCIe share copy (fetch_blobs_mixed) from mapped host memory, old and per-blob kernels:
+    # GB/s and the staging bytes compared
+    add_executable(fetch_mixed_bench tests/cuda/fetch_mixed_bench.cpp)
+    target_include_directories(fetch_mixed_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(fetch_mixed_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_executable(tq_mix_parity src/kernels/tq_mix_parity.cpp)
     target_include_directories(tq_mix_parity PRIVATE ${_strata_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
     target_link_libraries(tq_mix_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})

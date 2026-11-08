@@ -439,6 +439,29 @@ bool device_is_sm75() {
 #endif
 }
 
+// QuantLab (11/9): STRATA_QL_DMA_GPUFLAG=1 - with --pcie-mode dma, flag B (the PCIe share has landed in staging) is
+// raised by a kernel on the copy stream right after the copies, not by a host function: an RTX 3080 under WDDM starts
+// a host-issued copy ~60 us after the call, and the host function then waits for the copies' interrupt and a driver
+// thread.  The kernel path (--pcie-mode kernel) reads the registered 4 KB pages at ~10 GB/s after the VRAM groups;
+// the copy engine reads them at ~25 GB/s beside them.
+bool ql_dma_gpuflag() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_DMA_GPUFLAG"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+// QuantLab (11/9): STRATA_QL_PCIE_GROUP_ROWS=N - the PCIe groups' launch with N block rows (1..16) in place of
+// kPcieGroupRows (4).  The rows stride over the groups, so a layer with more than 4 PCIe experts ran them 4 at a time:
+// on the RTX 3080 (pcie-frac 0.85, ~4 PCIe experts a layer on average) the PCIe gate/up took 61.5 us a layer against
+// the VRAM groups' 35 us for ~22 experts, and grew with the layer's PCIe count.  Rows past the layer's count exit at once.
+int64_t ql_pcie_group_rows(int64_t dflt) {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_QL_PCIE_GROUP_ROWS");
+        const int n = e != nullptr ? std::atoi(e) : 0;
+        return (int64_t) (n < 1 ? 0 : (n > 16 ? 16 : n));
+    }();
+    return v > 0 ? v : dflt;
+}
+
 bool fuse_wait_on() {
 #if defined(STRATA_USE_HIP)
     static const int env = [] {
@@ -2368,7 +2391,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
+            grouped(p_ptr2, p_start2, p_counts + 2, ql_pcie_group_rows(kPcieGroupRows), hit_out, false);
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
@@ -3388,7 +3411,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flagB(want);
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
@@ -3621,13 +3644,22 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 #endif
 }
 
+void Verifier::raise_flagB(uint32_t want) {
+    if (ql_dma_gpuflag() && sink_.pcie_mode == 0) {
+        strata::kernels::set_flag_on_stream(m_flagB_, want, (void*) copy_);
+        copy_used_ = true;   // the window's end syncs the copy stream: no raise of this window lands in the next
+        return;
+    }
+    raise_flag(h_flagB_, want);
+}
+
 // Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
 // GPU its VRAM experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe
 // groups).  Staging is split between the two token groups of a split window.
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) { v->raise_flagB(want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
@@ -3635,7 +3667,21 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     // cannot be submitted stops the engine: flag B must not release the consumers to expert weights that were never
     // copied.
     const int batch_mode = strata::core::dma_batch_mode();
-    if (v->sink_.fetch_sizes != nullptr) {   // QuantLab: a mixed layer - each blob at its own size, the slots striding `bytes`
+    if (v->sink_.fetch_sizes != nullptr && batch_mode != 0 && n <= 64) {
+        // QuantLab (11/9): a mixed layer's copies as one batch as well (STRATA_DMA_BATCH=1|2): one submission, one interrupt
+        const size_t* sz = v->sink_.fetch_sizes;
+        void* d[64] = {};
+        const void* s[64] = {};
+        size_t b[64] = {};
+        for (int i = 0; i < n; ++i) { d[i] = stage + (size_t) i * bytes; s[i] = src[i]; b[i] = sz[i]; }
+        const cudaError_t copied = strata::core::copy_blobs(d, s, b, (size_t) n, v->copy_, batch_mode);
+        if (copied != cudaSuccess) {
+            std::fprintf(stderr, "strata DMA: expert upload failed: %s\n", cudaGetErrorString(copied));
+            std::fflush(stderr);
+            v->release_gpu_waits(5000);
+            std::abort();
+        }
+    } else if (v->sink_.fetch_sizes != nullptr) {   // QuantLab: a mixed layer - each blob at its own size, the slots striding `bytes`
         const size_t* sz = v->sink_.fetch_sizes;
         for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], sz[i], cudaMemcpyHostToDevice, v->copy_);
     } else if (batch_mode == 0) {
@@ -3648,6 +3694,10 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
             v->release_gpu_waits(5000);
             std::abort();
         }
+    }
+    if (ql_dma_gpuflag()) {   // QuantLab (11/9): the GPU raises it as the copies land
+        strata::kernels::set_flag_on_stream(v->m_flagB_, want, (void*) v->copy_);
+        return;
     }
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
     fs.flag = v->h_flagB_;
@@ -4606,7 +4656,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flagB(want);
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
@@ -4751,7 +4801,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flagB(want);
         }
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
@@ -5106,7 +5156,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flagB(want);
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;
