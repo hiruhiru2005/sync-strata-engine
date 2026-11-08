@@ -2151,7 +2151,10 @@ void FileExpertSource::ql_io_enqueue(std::vector<Fill>&& batch) {
     if (batch.empty()) return;
     {
         std::lock_guard<std::mutex> lk(ql_io_mu_);
-        if (ql_io_quit_) return;
+        if (ql_io_quit_) {   // stopping: the claimed stage buffers are released unread (the layer reads them itself)
+            for (const Fill& f : batch) publish_stage(f.v, f.layer, false, 0.0);
+            return;
+        }
         if (ql_io_th_.empty()) {
             static const int nt = [] { const char* v = std::getenv("STRATA_QL_AHEAD_IO_THREADS"); return v ? std::clamp(std::atoi(v), 1, 8) : 2; }();
             for (int t = 0; t < nt; ++t) ql_io_th_.emplace_back([this] { ql_io_worker(); });
@@ -2211,6 +2214,8 @@ void FileExpertSource::ql_io_stop() {
     ql_io_cv_.notify_all();
     for (std::thread& t : ql_io_th_) t.join();
     ql_io_th_.clear();
+    std::lock_guard<std::mutex> lk(ql_io_mu_);
+    ql_io_quit_ = false;   // open() calls close() first: the readers start again at the next batch
 }
 
 // QuantLab 11/8 STRATA_QL_SPLIT / STRATA_QL_DUMP_BLOBS (see the header): once, from open_direct (Windows, experts.v2.bin)
@@ -2505,7 +2510,10 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
         const uint8_t* src = nullptr;
         {
             std::lock_guard<std::mutex> lk(stage_mu_);
-            if (v < stage_key_.size()) { key = stage_key_[v]; src = stage_buf_[v].get(); }
+            // a read-ahead's guess goes in only once a layer asked for it (11/8: 6-7 in 10 guesses were never used
+            // and pushed the used experts out of the ring) - STRATA_QL_DYN_AHEAD=1: every guess as well
+            static const bool dyn_ahead = [] { const char* e = std::getenv("STRATA_QL_DYN_AHEAD"); return e != nullptr && std::atoi(e) != 0; }();
+            if (v < stage_key_.size() && (dyn_ahead || !stage_pf_[v])) { key = stage_key_[v]; src = stage_buf_[v].get(); }
         }
         if (key >= 0 && src != nullptr && key / n_expert_ == layer)
             dyn_insert((size_t) key, src, blob_len(layer, key % n_expert_));
