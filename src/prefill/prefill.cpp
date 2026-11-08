@@ -1364,6 +1364,13 @@ bool ql_prefill_gather() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_PREFILL_GATHER"); return v && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (11/9): in such a batch, the R1Q2 experts of every class are gathered by one mmq::gather_r1q2_batch (one launch
+// per 32 experts) instead of one gather_r1q2 launch an expert (~26 us each on an RTX 3080 under WDDM: 21% of a 4K
+// prompt).  The same words into the same slots.  STRATA_QL_R1Q2_BATCH=0 keeps one launch an expert.
+bool ql_r1q2_batch() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_R1Q2_BATCH"); return !(v && v[0] == '0'); }();
+    return on;
+}
 // Volta (sm_70): MMQ runs on dp4a there (no int8 tensor cores).  pf_wmma(): the layers MMQ would take, and the IQ1_M
 // ones the FP16 path would, run as one launch per expert group on FP16 tensor-core tiles instead
 // (strata::kernels::gemm_iq_f16_grouped: each weight superblock dequantized once into shared memory by the FP16 path's
@@ -5404,6 +5411,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         size_t mxp_ents[MMQ_GROUP];   // their entries (wait_copied)
                         int mxp_nslots = 0;   // ring slots the next mx_flush releases
                         int mxp_n = 0;        // experts in the batch
+                        std::vector<mmq::R1q2Item> mxr1;   // QuantLab (11/9): the batch's R1Q2 experts (ql_r1q2_batch)
+                        if (mx_batch) mxr1.reserve(64);
                         auto mx_flush = [&]() {
                             if (mxp_n == 0) return;
                             if (mxp_nslots > 0) {   // the copies land in order: the last one covers the others
@@ -5411,6 +5420,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 wait_copied(mxp_ents[mxp_nslots - 1], (size_t) mxp_slots[mxp_nslots - 1]);
                             }
                             pt.mark(kPfDequant, cs);
+                            mxr1.clear();
                             for (size_t c = 0; c < mxp.size(); ++c) {
                                 MxPend& pc = mxp[c];
                                 if (pc.g.n <= pc.g.first) continue;
@@ -5422,6 +5432,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const size_t zero = pc.g.n == mx.gsize[(size_t) pc.gi] ? MMQ_TAIL : 0;
                                 if (fe.r1q2) {   // QuantLab (10/31): R1Q2 blobs, expanded to the old blocks
                                     for (int q = pc.g.first; q < pc.g.n; ++q) {
+                                        if (ql_r1q2_batch()) {   // QuantLab (11/9): gathered with the batch's others below
+                                            mmq::R1q2Item it;
+                                            it.blob = pc.g.blob[q];
+                                            it.kg = ql_tq_kbits(fe.gu_type);
+                                            it.kd = ql_tq_kbits(fe.d_type);
+                                            it.up_off = fe.up_off;
+                                            it.down_off = fe.down_off;
+                                            it.sc_off = fe.sc_off;
+                                            it.p2 = fe.p2;
+                                            it.gu_dst = bgu + (size_t) q * gub;
+                                            it.d_dst = bd + (size_t) q * db;
+                                            it.zero_bytes = q + 1 == pc.g.n ? zero : 0;
+                                            mxr1.push_back(it);
+                                            continue;
+                                        }
                                         mmq::gather_r1q2(pc.g.blob[q], ql_tq_kbits(fe.gu_type), ql_tq_kbits(fe.d_type), N, 640,
                                                          fe.up_off, fe.down_off, fe.sc_off, fe.p2, bgu + (size_t) q * gub,
                                                          bd + (size_t) q * db, m.cs, q + 1 == pc.g.n ? zero : 0);
@@ -5440,6 +5465,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 pc.g.first = pc.g.n;
                                 if (zero != 0) pc.gi = -1;
+                            }
+                            if (!mxr1.empty()) {   // QuantLab (11/9): every class's R1Q2 experts of the batch, one launch per 32
+                                mmq::gather_r1q2_batch(mxr1.data(), (int) mxr1.size(), N, 640, m.cs);
+                                ql_batch_launches += ((int64_t) mxr1.size() + 31) / 32;
                             }
                             if (mxp_nslots > 0) {   // one event releases the batch's ring slots
                                 const int rel = mxp_slots[mxp_nslots - 1];

@@ -685,44 +685,81 @@ void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail
 // QuantLab (10/31): gather_r1q2's kernel - one thread per output uint16 word; a block's word 0 is its fp16 d, words
 // 1 .. 2K its codes.  Gate and up codes are contiguous in an R1Q2 blob (up_off = gate's codes), so a gate/up block
 // index runs over both matrices.
+// QuantLab (11/9): one output word of gather_r1q2 (word i of the expert's [gate | up] blocks then its down blocks).  Both
+// kernels below run this, so a batch launch writes the same words as one launch an expert.  The indices are 32-bit: an
+// expert's words (< 1M) and blob bytes (< 4 MB) fit, and the 64-bit divides of the 10/31 kernel (one per word, emulated on
+// the GPU's integer units) were most of its time; the values written are the same.
+__device__ __forceinline__ void r1q2_word(unsigned i, const uint8_t* __restrict__ blob, unsigned kg, unsigned kd, unsigned nbe,
+                                          unsigned nbf, unsigned n_ff, unsigned n_embd, unsigned down_off, unsigned sc_off,
+                                          const float4& pg, const float4& pu, const float4& pd, uint16_t* __restrict__ gu_dst,
+                                          uint16_t* __restrict__ d_dst) {
+    const unsigned wg = 1u + 2u * kg, wd = 1u + 2u * kd;               // uint16 words per block
+    const unsigned ngu = 2u * n_ff * nbe;                               // gate/up blocks
+    const unsigned qge = (nbe + 3u) / 4u, qdf = (nbf + 3u) / 4u;
+    const unsigned g_sc = n_ff * 2u + nbe * 2u + n_ff * qge;            // gate's (and up's) scale bytes
+    const bool down = i >= ngu * wg;
+    const unsigned k = down ? i - ngu * wg : i;
+    const unsigned w = down ? wd : wg;
+    const unsigned blk = k / w, j = k - blk * w;
+    const unsigned K = down ? kd : kg;
+    uint16_t* dst = down ? d_dst : gu_dst;
+    if (j > 0) {
+        const uint16_t* src = (const uint16_t*) (down ? blob + down_off : blob);
+        dst[k] = src[blk * 2u * K + (j - 1u)];
+        return;
+    }
+    unsigned m, nb, qb, r, rows, base, b;
+    if (down) {
+        m = 2u; nb = nbf; qb = qdf; rows = n_embd; r = blk / nbf; b = blk - r * nbf; base = sc_off + 2u * g_sc;
+    } else {
+        m = blk >= n_ff * nbe ? 1u : 0u;
+        const unsigned bb = blk - m * n_ff * nbe;
+        nb = nbe; qb = qge; rows = n_ff; r = bb / nbe; b = bb - r * nbe; base = sc_off + m * g_sc;
+    }
+    const uint8_t* sc = blob + base;
+    const float rb = __half2float(__ushort_as_half(((const uint16_t*) sc)[r]));
+    const float cs = __half2float(__ushort_as_half(((const uint16_t*) (sc + rows * 2u))[b]));
+    const int q = (sc[rows * 2u + nb * 2u + r * qb + (b >> 2)] >> (2u * (b & 3u))) & 3;
+    const float4 p = m == 0u ? pg : m == 1u ? pu : pd;
+    const float pq = q == 0 ? p.x : q == 1 ? p.y : q == 2 ? p.z : p.w;
+    dst[k] = __half_as_ushort(__float2half(cs * pq * rb));
+}
+
+__device__ __forceinline__ unsigned r1q2_words(unsigned kg, unsigned kd, unsigned nbe, unsigned nbf, unsigned n_ff,
+                                               unsigned n_embd) {
+    return 2u * n_ff * nbe * (1u + 2u * kg) + n_embd * nbf * (1u + 2u * kd);
+}
+
 __global__ void gather_r1q2_kernel(const uint8_t* __restrict__ blob, int kg, int kd, int nbe, int nbf, long long n_ff,
                                    long long n_embd, long long down_off, long long sc_off, float4 pg, float4 pu, float4 pd,
                                    uint16_t* __restrict__ gu_dst, uint16_t* __restrict__ d_dst) {
-    const long long wg = 1 + 2LL * kg, wd = 1 + 2LL * kd;              // uint16 words per block
-    const long long ngu = 2 * n_ff * nbe, nd = n_embd * nbf;            // blocks
-    const long long total = ngu * wg + nd * wd;
-    const int qge = (nbe + 3) / 4, qdf = (nbf + 3) / 4;
-    const long long g_sc = n_ff * 2 + (long long) nbe * 2 + n_ff * qge;  // gate's (and up's) scale bytes
-    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
-        const bool down = i >= ngu * wg;
-        const long long k = down ? i - ngu * wg : i;
-        const long long w = down ? wd : wg;
-        const long long blk = k / w, j = k - blk * w;
-        const int K = down ? kd : kg;
-        uint16_t* dst = down ? d_dst : gu_dst;
-        if (j > 0) {
-            const uint16_t* src = (const uint16_t*) (down ? blob + down_off : blob);
-            dst[k] = src[blk * 2LL * K + (j - 1)];
-            continue;
-        }
-        int m, nb, qb;
-        long long r, rows, base;
-        int b;
-        if (down) {
-            m = 2; nb = nbf; qb = qdf; rows = n_embd; r = blk / nbf; b = (int) (blk % nbf); base = sc_off + 2 * g_sc;
-        } else {
-            m = blk >= n_ff * nbe ? 1 : 0;
-            const long long bb = blk - m * n_ff * nbe;
-            nb = nbe; qb = qge; rows = n_ff; r = bb / nbe; b = (int) (bb % nbe); base = sc_off + m * g_sc;
-        }
-        const uint8_t* sc = blob + base;
-        const float rb = __half2float(__ushort_as_half(((const uint16_t*) sc)[r]));
-        const float cs = __half2float(__ushort_as_half(((const uint16_t*) (sc + rows * 2))[b]));
-        const int q = (sc[rows * 2 + (long long) nb * 2 + r * qb + (b >> 2)] >> (2 * (b & 3))) & 3;
-        const float4 p = m == 0 ? pg : m == 1 ? pu : pd;
-        const float pq = q == 0 ? p.x : q == 1 ? p.y : q == 2 ? p.z : p.w;
-        dst[k] = __half_as_ushort(__float2half(cs * pq * rb));
-    }
+    const unsigned total = r1q2_words((unsigned) kg, (unsigned) kd, (unsigned) nbe, (unsigned) nbf, (unsigned) n_ff,
+                                      (unsigned) n_embd);
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x)
+        r1q2_word(i, blob, (unsigned) kg, (unsigned) kd, (unsigned) nbe, (unsigned) nbf, (unsigned) n_ff, (unsigned) n_embd,
+                  (unsigned) down_off, (unsigned) sc_off, pg, pu, pd, gu_dst, d_dst);
+}
+
+// QuantLab (11/9): gather_r1q2_batch's kernel - blockIdx.y is the expert (its own K, offsets, p2 and slots)
+constexpr int kR1q2BatchMax = 32;
+struct R1q2Dev {
+    const uint8_t* blob;
+    uint16_t* gu;
+    uint16_t* d;
+    long long down_off, sc_off;
+    int kg, kd;
+    float4 pg, pu, pd;
+};
+struct R1q2BatchArgs {
+    R1q2Dev it[kR1q2BatchMax];
+};
+__global__ void gather_r1q2_batch_kernel(R1q2BatchArgs a, int nbe, int nbf, long long n_ff, long long n_embd) {
+    const R1q2Dev& e = a.it[blockIdx.y];
+    const unsigned total = r1q2_words((unsigned) e.kg, (unsigned) e.kd, (unsigned) nbe, (unsigned) nbf, (unsigned) n_ff,
+                                      (unsigned) n_embd);
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x)
+        r1q2_word(i, e.blob, (unsigned) e.kg, (unsigned) e.kd, (unsigned) nbe, (unsigned) nbf, (unsigned) n_ff,
+                  (unsigned) n_embd, (unsigned) e.down_off, (unsigned) e.sc_off, e.pg, e.pu, e.pd, e.gu, e.d);
 }
 
 void gather_r1q2(const uint8_t* blob, int kg, int kd, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
@@ -745,6 +782,47 @@ void gather_r1q2(const uint8_t* blob, int kg, int kd, int64_t n_embd, int64_t n_
         cudaMemsetAsync((uint8_t*) d_dst + (size_t) n_embd * nbf * (2 + 4 * kd), 0, zero_bytes, s);
     }
     ck(cudaGetLastError(), "gather_r1q2");
+}
+
+void gather_r1q2_batch(const R1q2Item* items, int n, int64_t n_embd, int64_t n_ff, void* stream) {
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int nbe = (int) (n_embd / 128), nbf = (int) (n_ff / 128);
+    for (int at = 0; at < n; at += kR1q2BatchMax) {
+        const int cnt = std::min(kR1q2BatchMax, n - at);
+        R1q2BatchArgs a{};
+        long long most = 0;
+        for (int i = 0; i < cnt; ++i) {
+            const R1q2Item& it = items[at + i];
+            if (it.up_off != (size_t) n_ff * nbe * 4 * it.kg || it.down_off != 2 * it.up_off || it.kg < 2 || it.kg > 14 ||
+                it.kd < 2 || it.kd > 14 || it.p2 == nullptr) {
+                std::fprintf(stderr, "gather_r1q2_batch: not an R1Q2 blob (K %d / %d, up_off %zu, down_off %zu)\n", it.kg, it.kd,
+                             it.up_off, it.down_off);
+                std::exit(1);
+            }
+            R1q2Dev& e = a.it[i];
+            e.blob = it.blob;
+            e.gu = (uint16_t*) it.gu_dst;
+            e.d = (uint16_t*) it.d_dst;
+            e.down_off = (long long) it.down_off;
+            e.sc_off = (long long) it.sc_off;
+            e.kg = it.kg;
+            e.kd = it.kd;
+            e.pg = make_float4(it.p2[0][0], it.p2[0][1], it.p2[0][2], it.p2[0][3]);
+            e.pu = make_float4(it.p2[1][0], it.p2[1][1], it.p2[1][2], it.p2[1][3]);
+            e.pd = make_float4(it.p2[2][0], it.p2[2][1], it.p2[2][2], it.p2[2][3]);
+            const long long w = 2LL * n_ff * nbe * (1 + 2LL * it.kg) + (long long) n_embd * nbf * (1 + 2LL * it.kd);
+            most = std::max(most, w);
+        }
+        gather_r1q2_batch_kernel<<<dim3(blocks(most), (unsigned) cnt), 256, 0, s>>>(a, nbe, nbf, (long long) n_ff,
+                                                                                  (long long) n_embd);
+        for (int i = 0; i < cnt; ++i) {   // the tails after the slots, once their words are queued (as gather_r1q2 does)
+            const R1q2Item& it = items[at + i];
+            if (!it.zero_bytes) continue;
+            cudaMemsetAsync((uint8_t*) it.gu_dst + (size_t) 2 * n_ff * nbe * (2 + 4 * it.kg), 0, it.zero_bytes, s);
+            cudaMemsetAsync((uint8_t*) it.d_dst + (size_t) n_embd * nbf * (2 + 4 * it.kd), 0, it.zero_bytes, s);
+        }
+    }
+    ck(cudaGetLastError(), "gather_r1q2_batch");
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,

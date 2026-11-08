@@ -118,6 +118,20 @@ struct GatherGroup {
 /// zero_bytes are zeroed after both (the MMQ tail of a group's last expert).
 void gather_r1q2(const uint8_t* blob, int kg, int kd, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
                  size_t sc_off, const float (&p2)[3][4], void* gu_dst, void* d_dst, void* stream, size_t zero_bytes = 0);
+/// QuantLab (11/9): one R1Q2 expert of a gather batch - gather_r1q2's arguments (p2: its class's [3][4])
+struct R1q2Item {
+    const uint8_t* blob = nullptr;
+    int kg = 0, kd = 0;
+    size_t up_off = 0, down_off = 0, sc_off = 0;
+    const float (*p2)[4] = nullptr;
+    void* gu_dst = nullptr;
+    void* d_dst = nullptr;
+    size_t zero_bytes = 0;
+};
+/// QuantLab (11/9): gather_r1q2 for n experts of any classes (any K) in ceil(n / 32) launches, blockIdx.y = the expert:
+/// the same words as one gather_r1q2 each (both kernels run the same per-word code), and each item's zero_bytes after
+/// its slots.  A mixed layer's prompt batch was one launch an expert (~26 us each on an RTX 3080 under WDDM).
+void gather_r1q2_batch(const R1q2Item* items, int n, int64_t n_embd, int64_t n_ff, void* stream);
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream,
                          size_t tail_off = 0, void* tail_dst = nullptr, size_t zero_bytes = 0);

@@ -2262,6 +2262,12 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_mmq_scatter_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_mmq_scatter_test COMMAND prefill_mmq_scatter_test)
       set_tests_properties(prefill_mmq_scatter_test PROPERTIES TIMEOUT 120)
+      # QuantLab (11/9): mmq::gather_r1q2_batch (R1Q2 experts of any K in one launch per 32) against one gather_r1q2 an
+      # expert and a CPU reference of the formula, word for word (the slots and the zeroed tails)
+      add_executable(prefill_r1q2_batch_test tests/cuda/prefill_r1q2_batch_test.cpp)
+      target_link_libraries(prefill_r1q2_batch_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_r1q2_batch_test COMMAND prefill_r1q2_batch_test)
+      set_tests_properties(prefill_r1q2_batch_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
       if(STRATA_EXPERIMENTAL_SM60)
         # mmq::swiglu_quant: swiglu + the down product's q8_1 rows in one kernel against the two, byte for byte
         add_executable(prefill_swiglu_quant_test tests/cuda/prefill_swiglu_quant_test.cpp)
