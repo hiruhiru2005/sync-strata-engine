@@ -1018,7 +1018,7 @@ private:
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
-    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
+    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; uint8_t* wbase = nullptr; };   ///< wbase: QuantLab 11/8 read straight there (4 KiB-aligned window)
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
     /// 149-cold: the claim half of `prefetch` (the blobs this call must fill; pending[i] = 1 for those, if given)
@@ -1231,7 +1231,16 @@ private:
     bool dyn_tried_ = false;
     const uint8_t* dyn_get(size_t index) const;
     void dyn_insert(size_t index, const uint8_t* src, uint64_t bytes);
-    struct DynEntry { size_t index; uint64_t off, bytes; };
+    struct DynEntry { size_t index; uint64_t off, bytes, boff; };   ///< off/bytes: the slot, boff: the blob's offset
+    /// QuantLab 11/8 STRATA_QL_DYN_DIRECT=1: a demand read lands straight in a 4 KiB-aligned ring slot (no copy into a
+    /// stage buffer, none into the ring); published (dyn_off_) once read.  Called with stage_mu_ held (dyn_reserve).
+    uint8_t* dyn_reserve(size_t index, uint64_t bytes, uint64_t skip, int64_t& boff);
+    void dyn_publish(size_t index, int64_t boff);
+    bool dyn_place(uint64_t size, uint64_t align, uint64_t now, uint64_t& at);   ///< dyn_mu_ held
+    std::unique_ptr<std::atomic<uint8_t>[]> dyn_resv_;   ///< per layer*n_expert: a slot reserved, its read in flight
+    struct StageDirect { uint8_t* ptr; int64_t boff; size_t index; };
+    std::unordered_map<size_t, StageDirect> stage_direct_;   ///< stage v -> its ring slot (stage_mu_)
+    uint64_t ql_file_off(int64_t layer, int64_t expert) const;   ///< where read_direct reads the blob (11/8 split)
     mutable std::mutex dyn_mu_;
     uint8_t* dyn_base_ = nullptr;
     uint64_t dyn_cap_ = 0, dyn_head_ = 0;

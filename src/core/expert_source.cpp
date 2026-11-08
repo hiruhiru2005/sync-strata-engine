@@ -2055,6 +2055,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     stage_used_[v] = seq;
     stage_busy_[v] = 1;
     stage_of_[key] = v;
+    stage_direct_.erase(v);   // QuantLab 11/8 STRATA_QL_DYN_DIRECT: set again by claim_todo when it reads into the ring
     fill = true;
     return false;
 }
@@ -2331,6 +2332,8 @@ void FileExpertSource::dyn_init() {
     const size_t n = (size_t) n_layers_ * (size_t) n_expert_;
     dyn_off_.reset(new std::atomic<int64_t>[n]);
     dyn_last_.reset(new std::atomic<uint64_t>[n]);
+    dyn_resv_.reset(new std::atomic<uint8_t>[n]);
+    for (size_t i = 0; i < n; ++i) dyn_resv_[i].store(0, std::memory_order_relaxed);
     for (size_t i = 0; i < n; ++i) {
         dyn_off_[i].store(-1, std::memory_order_relaxed);
         dyn_last_[i].store(0, std::memory_order_relaxed);
@@ -2353,43 +2356,82 @@ const uint8_t* FileExpertSource::dyn_get(size_t index) const {
     return dyn_base_ + off;
 }
 
-void FileExpertSource::dyn_insert(size_t index, const uint8_t* src, uint64_t bytes) {
-    std::lock_guard<std::mutex> lk(dyn_mu_);
-    if (!dyn_tried_) dyn_init();
-    if (!dyn_on() || src == nullptr || bytes == 0) return;
-    if (dyn_off_[index].load(std::memory_order_relaxed) >= 0) return;   // held already
-    const uint64_t size = (bytes + 63) / 64 * 64;
-    if (size > dyn_cap_ / 4) return;
-    const uint64_t now = io_epoch_.load(std::memory_order_relaxed);
-    // the entries in [from, from + size) go, oldest first; one used in this layer or the one before stops the insert
+// QuantLab 11/8: room for `size` bytes at an `align`-aligned head; the entries there go, oldest first; one used in this
+// layer or the one before (or whose read is still in flight) stops it.  dyn_mu_ held.
+bool FileExpertSource::dyn_place(uint64_t size, uint64_t align, uint64_t now, uint64_t& at) {
     auto evict_front_while = [&](auto in_range) {
         while (!dyn_fifo_.empty() && in_range(dyn_fifo_.front())) {
             const DynEntry& d = dyn_fifo_.front();
-            dyn_off_[d.index].store(-1, std::memory_order_seq_cst);
-            if (dyn_last_[d.index].load(std::memory_order_seq_cst) + 2 > now) {   // in use: keep it, skip this insert
-                dyn_off_[d.index].store((int64_t) d.off, std::memory_order_seq_cst);
+            const int64_t was = dyn_off_[d.index].exchange(-1, std::memory_order_seq_cst);
+            if (dyn_last_[d.index].load(std::memory_order_seq_cst) + 2 > now) {   // in use: keep it, stop here
+                if (was >= 0) dyn_off_[d.index].store(was, std::memory_order_seq_cst);
                 return false;
             }
+            dyn_resv_[d.index].store(0, std::memory_order_relaxed);
             dyn_fifo_.pop_front();
             dyn_evict_.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
     };
-    uint64_t at = dyn_head_;
+    const uint64_t head = dyn_head_;
+    at = (head + align - 1) / align * align;
     if (at + size > dyn_cap_) {   // wrap: the tail end's entries go first
-        if (!evict_front_while([&](const DynEntry& d) { return d.off >= at; })) { dyn_skip_.fetch_add(1); return; }
+        if (!evict_front_while([&](const DynEntry& d) { return d.off >= head; })) return false;
         at = 0;
+        return evict_front_while([&](const DynEntry& d) { return d.off < size; });
     }
-    if (!evict_front_while([&](const DynEntry& d) { return d.off >= at && d.off < at + size; })) {
-        dyn_skip_.fetch_add(1);
-        return;
-    }
+    return evict_front_while([&](const DynEntry& d) { return d.off >= head && d.off < at + size; });
+}
+
+void FileExpertSource::dyn_insert(size_t index, const uint8_t* src, uint64_t bytes) {
+    std::lock_guard<std::mutex> lk(dyn_mu_);
+    if (!dyn_tried_) dyn_init();
+    if (!dyn_on() || src == nullptr || bytes == 0) return;
+    if (dyn_off_[index].load(std::memory_order_relaxed) >= 0 || dyn_resv_[index].load(std::memory_order_relaxed)) return;
+    const uint64_t size = (bytes + 63) / 64 * 64;
+    if (size > dyn_cap_ / 4) return;
+    const uint64_t now = io_epoch_.load(std::memory_order_relaxed);
+    uint64_t at = 0;
+    if (!dyn_place(size, 64, now, at)) { dyn_skip_.fetch_add(1); return; }
     std::memcpy(dyn_base_ + at, src, (size_t) bytes);
     dyn_last_[index].store(now, std::memory_order_relaxed);
     dyn_off_[index].store((int64_t) at, std::memory_order_release);
-    dyn_fifo_.push_back({index, at, size});
+    dyn_fifo_.push_back({index, at, size, at});
     dyn_head_ = at + size;
     dyn_ins_.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint8_t* FileExpertSource::dyn_reserve(size_t index, uint64_t bytes, uint64_t skip, int64_t& boff) {
+    std::lock_guard<std::mutex> lk(dyn_mu_);
+    if (!dyn_tried_) dyn_init();
+    if (!dyn_on() || bytes == 0) return nullptr;
+    if (dyn_off_[index].load(std::memory_order_relaxed) >= 0 || dyn_resv_[index].load(std::memory_order_relaxed)) return nullptr;
+    const uint64_t size = (skip + bytes + 4095) / 4096 * 4096;
+    if (size > dyn_cap_ / 4) return nullptr;
+    const uint64_t now = io_epoch_.load(std::memory_order_relaxed);
+    uint64_t at = 0;
+    if (!dyn_place(size, 4096, now, at)) { dyn_skip_.fetch_add(1); return nullptr; }
+    dyn_last_[index].store(now, std::memory_order_relaxed);   // the reservation is in use: not overwritten for 2 layers
+    dyn_resv_[index].store(1, std::memory_order_relaxed);
+    boff = (int64_t) (at + skip);
+    dyn_fifo_.push_back({index, at, size, (uint64_t) boff});
+    dyn_head_ = at + size;
+    return dyn_base_ + at;
+}
+
+void FileExpertSource::dyn_publish(size_t index, int64_t boff) {
+    std::lock_guard<std::mutex> lk(dyn_mu_);
+    if (!dyn_on() || !dyn_resv_[index].load(std::memory_order_relaxed)) return;   // evicted meanwhile: not published
+    dyn_resv_[index].store(0, std::memory_order_relaxed);
+    dyn_last_[index].store(io_epoch_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    dyn_off_[index].store(boff, std::memory_order_release);
+    dyn_ins_.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t FileExpertSource::ql_file_off(int64_t layer, int64_t expert) const {
+    const size_t si = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0) return (uint64_t) split_off_[si];
+    return blob_off(layer, expert);
 }
 
 std::string FileExpertSource::ql_path_line() {
@@ -2554,6 +2596,18 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
     if (dyn_env && ok && complement_ready_ && !direct_.empty()) {
         int64_t key = -1;
         const uint8_t* src = nullptr;
+        {   // QuantLab 11/8 STRATA_QL_DYN_DIRECT: read straight into its ring slot - publish it, nothing to copy
+            int64_t dboff = -1;
+            size_t didx = 0;
+            {
+                std::lock_guard<std::mutex> lk(stage_mu_);
+                if (const auto it = stage_direct_.find(v); it != stage_direct_.end()) { dboff = it->second.boff; didx = it->second.index; }
+            }
+            if (dboff >= 0) {
+                dyn_publish(didx, dboff);
+                goto ql_published;
+            }
+        }
         {
             std::lock_guard<std::mutex> lk(stage_mu_);
             // a read-ahead's guess goes in only once a layer asked for it (11/8: 6-7 in 10 guesses were never used
@@ -2573,6 +2627,7 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
             }
         }
     }
+ql_published:
     if (ok) {
         file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
         file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
@@ -2645,6 +2700,8 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
         const bool have = claim_stage(key, v, fill);
         if (!have && !fill) return nullptr;
         dst = stage_buf_[v].get();
+        if (have)   // QuantLab 11/8 STRATA_QL_DYN_DIRECT: claim_todo read it into a ring slot
+            if (const auto it = stage_direct_.find(v); it != stage_direct_.end()) dst = it->second.ptr;
         if (have) {
             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
             stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
@@ -2741,7 +2798,20 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
             size_t v = 0;
             bool fill = false;
             if (!claim_stage(layer * n_expert_ + e, v, fill) && fill) {
-                todo.push_back({v, layer, e, stage_buf_[v].get()});
+                // QuantLab 11/8 STRATA_QL_DYN_DIRECT=1: read straight into a ring slot (the unbuffered experts.bin tier)
+                static const bool dyn_direct = [] { const char* q = std::getenv("STRATA_QL_DYN_DIRECT"); return q != nullptr && std::atoi(q) != 0; }();
+                uint8_t* qdst = stage_buf_[v].get();
+                uint8_t* qwb = nullptr;
+                if (dyn_direct && complement_ready_ && !direct_.empty() && role_ptr_.empty()) {
+                    int64_t boff = -1;
+                    const uint64_t skip = ql_file_off(layer, e) & 4095;
+                    if (uint8_t* base = dyn_reserve(index, blob_len(layer, e), skip, boff)) {
+                        stage_direct_[v] = {base + skip, boff, index};
+                        qdst = base + skip;
+                        qwb = base;
+                    }
+                }
+                todo.push_back({v, layer, e, qdst, qwb});
                 if (pending != nullptr) pending[i] = 1;
                 if (warm_stamp_) {
                     const uint32_t s = warm_stamp_[index].load(std::memory_order_relaxed);
@@ -3348,8 +3418,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     // queue depth 48 make 10.4 GB/s on a file nobody maps and 3.4 GB/s on a mapped one, 8 MiB reads 8.6 GB/s.  So
     // windows less than kGap apart (the same role of nearby experts) are merged into requests of up to kMerge bytes.
     constexpr uint64_t kSector = 4096, kGap = 1ull << 20, kMerge = 32ull << 20;
-    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
-    struct Req { HANDLE h; uint64_t a0, size, pos; };
+    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; uint8_t* wbase; };
+    struct Req { HANDLE h; uint64_t a0, size, pos; uint8_t* direct; };   // direct: QuantLab 11/8 read straight there
     // this thread's aligned buffer and events, kept for its next batch
     struct Scratch {
         uint8_t* buf = nullptr;
@@ -3377,7 +3447,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             const bool sp = split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0;
             const uint64_t off = sp ? (uint64_t) split_off_[si] : blob_off(f.layer, f.e);
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({sp ? kSplitFile : 0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
+            sc.win.push_back({sp ? kSplitFile : 0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0, f.wbase});
             continue;
         }
         uint64_t at = 0;
@@ -3387,7 +3457,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             const Map& m = maps_[(size_t) role_file_[i]];
             const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
+            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0, nullptr});
             at += per;
         }
     }
@@ -3401,7 +3471,14 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     int last_file = -1;
     for (size_t w : sc.order) {
         Window& x = sc.win[w];
-        if (!sc.req.empty() && x.file == last_file) {
+        if (x.wbase != nullptr) {   // QuantLab 11/8 STRATA_QL_DYN_DIRECT: its own request, read straight into its slot
+            sc.req.push_back({x.file == kSplitFile ? (HANDLE) split_h_ : (HANDLE) direct_[(size_t) x.file], x.a0, x.size, 0, x.wbase});
+            x.req = sc.req.size() - 1;
+            x.in_req = 0;
+            last_file = -1;
+            continue;
+        }
+        if (!sc.req.empty() && x.file == last_file && sc.req.back().direct == nullptr) {
             Req& q = sc.req.back();
             const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
             if (x.a0 <= end + kGap && std::max(end, xend) - q.a0 <= kMerge) {
@@ -3414,7 +3491,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({x.file == kSplitFile ? (HANDLE) split_h_ : (HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({x.file == kSplitFile ? (HANDLE) split_h_ : (HANDLE) direct_[(size_t) x.file], x.a0, x.size, total, nullptr});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -3442,7 +3519,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         o.Offset = (DWORD) r.a0;
         o.OffsetHigh = (DWORD) (r.a0 >> 32);
         o.hEvent = sc.ev[q];
-        if (!ReadFile(r.h, sc.buf + r.pos, (DWORD) r.size, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
+        if (!ReadFile(r.h, r.direct != nullptr ? r.direct : sc.buf + r.pos, (DWORD) r.size, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
             ok = false;
             break;
         }
@@ -3459,6 +3536,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if ((uint64_t) got[x.req] < x.in_req + x.skip + x.n) return false;
+        if (x.wbase != nullptr) continue;   // QuantLab 11/8: read straight into place, nothing to copy
         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
         qbytes += x.n;
     }
