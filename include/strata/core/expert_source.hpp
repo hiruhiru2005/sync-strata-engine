@@ -952,6 +952,8 @@ public:
     static int ql_direct_ahead_max();
     /// One line of this request's read-ahead counts (and the look-ahead's predictions / skipped submits), "" when off.
     std::string ql_direct_ahead_line(int64_t predicted, int64_t skipped);
+    /// QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: this request's ring of experts read from the file (empty when off)
+    std::string ql_dyn_line();
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
@@ -1203,8 +1205,50 @@ private:
     /// QuantLab (11/3) STRATA_QL_DIRECT_AHEAD: the look-ahead's calls, its candidates (not in RAM or VRAM), the blobs it read,
     /// those already staged or in flight, the reads' wall time, the reads that failed
     void ql_direct_ahead(int64_t layer, const int64_t* experts, const float* conf, int64_t n);
-    std::atomic<uint64_t> ql_ah_calls_{0}, ql_ah_cand_{0}, ql_ah_read_{0}, ql_ah_have_{0}, ql_ah_us_{0}, ql_ah_fail_{0}, ql_ah_batch_{0};
+    std::atomic<uint64_t> ql_ah_calls_{0}, ql_ah_cand_{0}, ql_ah_read_{0}, ql_ah_have_{0}, ql_ah_us_{0}, ql_ah_fail_{0}, ql_ah_batch_{0}, ql_ah_stale_{0};
     uint64_t ql_ah_prev_[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};   ///< the counts at the last line (ql_direct_ahead_line)
+    /// QuantLab 11/8: the read-ahead's own reader threads - ql_direct_ahead only claims the stage buffers and queues the
+    /// batch, so the look-ahead thread never waits on the drive (STRATA_QL_AHEAD_ASYNC=0: the 11/3 inline reads)
+    void ql_io_enqueue(std::vector<Fill>&& batch);
+    void ql_io_worker();
+    void ql_io_stop();
+    std::mutex ql_io_mu_;
+    std::condition_variable ql_io_cv_;
+    /// QuantLab 11/8 STRATA_QL_DYN_TIER_GIB=X: a RAM ring of X GiB that keeps the experts read from the file in this
+    /// conversation (the decode re-read the same ~7.5k cold experts 27 times each; a 3 GiB ring would have served
+    /// ~90% of those bytes).  Filled from the stage buffers as they are published (unbuffered tier only:
+    /// STRATA_QL_KEEP_UNBUFFERED=1), looked up by blob / claim_todo / the read-ahead after the RAM copy.  FIFO: written
+    /// at the head, the oldest entries overwritten - never one used in this layer or the one before (the CPU pool may
+    /// still read it): such an insert is skipped instead.
+    bool dyn_on() const { return dyn_ready_.load(std::memory_order_acquire); }
+    std::atomic<bool> dyn_ready_{false};
+    bool dyn_tried_ = false;
+    const uint8_t* dyn_get(size_t index) const;
+    void dyn_insert(size_t index, const uint8_t* src, uint64_t bytes);
+    struct DynEntry { size_t index; uint64_t off, bytes; };
+    mutable std::mutex dyn_mu_;
+    uint8_t* dyn_base_ = nullptr;
+    uint64_t dyn_cap_ = 0, dyn_head_ = 0;
+    std::deque<DynEntry> dyn_fifo_;
+    std::unique_ptr<std::atomic<int64_t>[]> dyn_off_;     ///< per layer*n_expert: the ring offset, -1 when not held
+    std::unique_ptr<std::atomic<uint64_t>[]> dyn_last_;   ///< per layer*n_expert: the layer clock of its last use
+    mutable std::atomic<uint64_t> dyn_hits_{0}, dyn_hit_bytes_{0};
+    std::atomic<uint64_t> dyn_ins_{0}, dyn_skip_{0}, dyn_evict_{0};
+    uint64_t dyn_prev_[5] = {0, 0, 0, 0, 0};
+    void dyn_init();
+    /// QuantLab 11/8 STRATA_QL_SPLIT=<index>: a copy of some experts on a second drive (index: "file <path>", then
+    /// "layer expert offset" lines); read_direct reads those from it, the rest from experts.v2.bin, both in one batch.
+    /// Checked at open: the first listed expert must read the same from both drives.  STRATA_QL_DUMP_BLOBS=<file>
+    /// writes every expert's place in experts.v2.bin (layer expert offset bytes) for the tool that makes the copy.
+    void ql_split_load();
+    std::vector<int64_t> split_off_;   ///< per layer*n_expert: the offset in the second drive's copy, -1 = experts.v2.bin
+    void* split_h_ = nullptr;
+    bool split_tried_ = false;
+    static constexpr int kSplitFile = 1000;
+    struct QlIoJob { std::vector<Fill> b; std::chrono::steady_clock::time_point t; };
+    std::deque<QlIoJob> ql_io_q_;
+    std::vector<std::thread> ql_io_th_;
+    bool ql_io_quit_ = false;
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
     int spans(int64_t layer, int64_t expert, Span* out) const;

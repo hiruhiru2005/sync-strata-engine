@@ -369,6 +369,12 @@ private:
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    // QuantLab 11/8 STRATA_QL_FUSED_QUANT=1: the intermediate's Hadamard + Q8 (native_quant_h) is done by the gate/up
+    // task that finishes an expert's last rows, inside phase 5, instead of on the host between the phases (the same
+    // function on the same inputs: bit-identical).  fq_rows_[e]: the rows of expert e done in this phase.
+    bool fq_on_ = false;
+    std::unique_ptr<std::atomic<int32_t>[]> fq_rows_{new std::atomic<int32_t>[kMaxSplitMulti]};
+    void fq_tail(int e, int rows);
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own

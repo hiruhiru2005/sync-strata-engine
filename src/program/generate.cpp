@@ -18173,6 +18173,10 @@ int main(int argc, char** argv) {
                 const std::string qa = src.ql_direct_ahead_line(drive.d.lookahead->predicted(), drive.d.lookahead->skipped());
                 if (!qa.empty()) std::fputs(qa.c_str(), stderr);
             }
+            if (srcp == &src) {   // QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: this request's ring of experts read from the file
+                const std::string qd = src.ql_dyn_line();
+                if (!qd.empty()) std::fputs(qd.c_str(), stderr);
+            }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
             if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)

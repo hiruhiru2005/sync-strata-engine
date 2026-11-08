@@ -1228,6 +1228,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+                    if (fq_on_) fq_tail(e, r1 - r0);
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
@@ -1235,6 +1236,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                         native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                     else
                         native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    if (fq_on_) fq_tail(e, r1 - r0);
                 } else if (q2_native_kernels(nfmt->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
@@ -1281,6 +1283,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             done_.fetch_add(1, std::memory_order_release);
         }
     }
+}
+
+// QuantLab 11/8 STRATA_QL_FUSED_QUANT: the task that completes expert e's gate/up rows quantizes its intermediate, with
+// the same call the host makes between the phases (nfmt_, the batch's format, as there)
+void ExpertPool::fq_tail(int e, int rows) {
+    const int n_ff = (int) nfmt_->n_ff;
+    if (fq_rows_[(size_t) e].fetch_add(rows, std::memory_order_acq_rel) + rows != n_ff) return;
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    for (int t = 0; t < mjobs_[e].nt; ++t)
+        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+        else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
@@ -1373,13 +1386,19 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         narithmetic_ = arithmetic;
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
+        static const bool fused_env = [] { const char* v = std::getenv("STRATA_QL_FUSED_QUANT"); return v != nullptr && std::atoi(v) != 0; }();
+        fq_on_ = fused_env && numa_n_ == 0;
+        if (fq_on_)
+            for (int e = 0; e < nb; ++e) fq_rows_[(size_t) e].store(0, std::memory_order_relaxed);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        if (!fq_on_)
+            for (int e = 0; e < nb; ++e)
+                for (int t = 0; t < mjobs_[e].nt; ++t)
+                    if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                    else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        fq_on_ = false;
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);

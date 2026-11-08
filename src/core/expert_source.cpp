@@ -1185,6 +1185,7 @@ void FileExpertSource::ql_direct_ahead(int64_t layer, const int64_t* experts, co
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
         if (resident_blob(index) != nullptr) continue;                     // in the RAM copy
         if (!override_.empty() && override_[index] != nullptr) continue;   // an exchange buffer holds it
+        if (dyn_on() && dyn_off_[index].load(std::memory_order_relaxed) >= 0) continue;   // in the ring (11/8)
         const float c = conf != nullptr ? conf[j] : 1.0f;
         if (c < minconf) continue;
         cand.emplace_back(c, e);
@@ -1206,6 +1207,15 @@ void FileExpertSource::ql_direct_ahead(int64_t layer, const int64_t* experts, co
             stage_pf_[v] = 1;
             todo.push_back({v, layer, ce.second, stage_buf_[v].get()});
         }
+    }
+    // QuantLab 11/8: the reads go to the read-ahead's own reader threads (STRATA_QL_AHEAD_ASYNC=0: on this thread, as on
+    // 11/3, when the look-ahead skipped ~26% of its submits while it read)
+    static const bool async = [] { const char* v = std::getenv("STRATA_QL_AHEAD_ASYNC"); return v == nullptr || std::atoi(v) != 0; }();
+    if (async) {
+        for (size_t at = 0; at < todo.size(); at += 16)
+            ql_io_enqueue(std::vector<Fill>(todo.begin() + (std::ptrdiff_t) at,
+                                            todo.begin() + (std::ptrdiff_t) std::min(todo.size(), at + 16)));
+        return;
     }
     for (size_t at = 0; at < todo.size(); at += 16) {   // the batches fill_many reads (16 blobs in flight)
         const size_t k = std::min<size_t>(16, todo.size() - at);
@@ -1233,16 +1243,17 @@ std::string FileExpertSource::ql_direct_ahead_line(int64_t predicted, int64_t sk
     uint64_t d[9];
     for (int i = 0; i < 9; ++i) { d[i] = now[i] - ql_ah_prev_[i]; ql_ah_prev_[i] = now[i]; }
     const double calls = (double) std::max<uint64_t>(1, d[0]);
-    char buf[640];
+    char buf[768];
     std::snprintf(buf, sizeof buf,
                   "strata serve: direct read-ahead (STRATA_QL_DIRECT_AHEAD=%d) this request: %llu layers predicted, "
                   "%.2f candidates/layer (outside RAM and VRAM), %.2f read/layer, %.2f already staged or in flight/layer; "
                   "read-ahead used %llu, evicted unused %llu; reads %.3f ms a batch (%llu batches); look-ahead skipped %llu submits "
-                  "(%lld predictions in all); %llu reads failed (read again one by one)\n",
+                  "(%lld predictions in all); %llu reads failed (read again one by one); %llu dropped stale (all requests)\n",
                   ql_direct_ahead_max(), (unsigned long long) d[0], (double) d[1] / calls, (double) d[2] / calls,
                   (double) d[3] / calls, (unsigned long long) d[5], (unsigned long long) d[6],
                   d[8] > 0 ? (double) d[4] / 1000.0 / (double) d[8] : 0.0, (unsigned long long) d[8],
-                  (unsigned long long) d[7], (long long) predicted, (unsigned long long) ql_ah_fail_.load());
+                  (unsigned long long) d[7], (long long) predicted, (unsigned long long) ql_ah_fail_.load(),
+                  (unsigned long long) ql_ah_stale_.load());
     return std::string(buf);
 }
 
@@ -1668,7 +1679,11 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    ql_io_stop();
     prefetch_end();
+#if defined(_WIN32)
+    if (split_h_ != nullptr) { CloseHandle((HANDLE) split_h_); split_h_ = nullptr; }   // QuantLab 11/8 STRATA_QL_SPLIT
+#endif
     ram_stop();
     io_stop();
     inputs_.clear();
@@ -2125,8 +2140,245 @@ void FileExpertSource::ql_trace_end(const Fill* f, size_t k, std::chrono::steady
         x.decode = dec ? 1 : 0;
         x.ok = ok ? 1 : 0;
         x.kind = (uint8_t) kind;
+        const size_t si = (size_t) f[i].layer * (size_t) n_expert_ + (size_t) f[i].e;   // 11/8: 1 = the second drive
+        x.pad[0] = (uint8_t) (split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0 ? 1 : 0);
     }
     t.add(r, m);
+}
+
+// QuantLab 11/8: the read-ahead's reader threads (STRATA_QL_AHEAD_IO_THREADS, default 2), started at the first batch
+void FileExpertSource::ql_io_enqueue(std::vector<Fill>&& batch) {
+    if (batch.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(ql_io_mu_);
+        if (ql_io_quit_) return;
+        if (ql_io_th_.empty()) {
+            static const int nt = [] { const char* v = std::getenv("STRATA_QL_AHEAD_IO_THREADS"); return v ? std::clamp(std::atoi(v), 1, 8) : 2; }();
+            for (int t = 0; t < nt; ++t) ql_io_th_.emplace_back([this] { ql_io_worker(); });
+        }
+        ql_io_q_.push_back(QlIoJob{std::move(batch), std::chrono::steady_clock::now()});
+    }
+    ql_io_cv_.notify_one();
+}
+
+void FileExpertSource::ql_io_worker() {
+    tl_decode = true;
+    for (;;) {
+        std::vector<Fill> b;
+        {
+            std::unique_lock<std::mutex> lk(ql_io_mu_);
+            ql_io_cv_.wait(lk, [&] { return ql_io_quit_ || !ql_io_q_.empty(); });
+            if (ql_io_quit_) return;
+            QlIoJob j = std::move(ql_io_q_.front());
+            ql_io_q_.pop_front();
+            b = std::move(j.b);
+            // a guess that waited too long behind other reads: its layer has likely passed - released unread, so the
+            // layer that does route it reads it itself instead of waiting for this queue (STRATA_QL_AHEAD_MAX_WAIT_US)
+            static const double max_wait = [] { const char* v = std::getenv("STRATA_QL_AHEAD_MAX_WAIT_US"); return v ? std::atof(v) : 3000.0; }();
+            if (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - j.t).count() > max_wait) {
+                lk.unlock();
+                for (const Fill& f : b) publish_stage(f.v, f.layer, false, 0.0);
+                ql_ah_stale_.fetch_add(b.size(), std::memory_order_relaxed);
+                continue;
+            }
+        }
+        const size_t k = b.size();
+        const int infl = ql_trace_begin(k);
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = read_direct(b.data(), k);
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        ql_trace_end(b.data(), k, t0, us, ok, true, infl, 1);
+        ql_ah_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
+        ql_ah_batch_.fetch_add(1, std::memory_order_relaxed);
+        for (const Fill& f : b) {
+            if (ok) publish_stage(f.v, f.layer, true, us / (double) k);
+            else {
+                ql_ah_fail_.fetch_add(1, std::memory_order_relaxed);
+                (void) fill_stage(f.v, f.layer, f.e, f.dst);
+            }
+        }
+        ql_ah_read_.fetch_add(k, std::memory_order_relaxed);
+    }
+}
+
+void FileExpertSource::ql_io_stop() {
+    {
+        std::lock_guard<std::mutex> lk(ql_io_mu_);
+        ql_io_quit_ = true;
+        // the batches not started: their stage buffers stay claimed, which only matters while the source runs
+        ql_io_q_.clear();
+    }
+    ql_io_cv_.notify_all();
+    for (std::thread& t : ql_io_th_) t.join();
+    ql_io_th_.clear();
+}
+
+// QuantLab 11/8 STRATA_QL_SPLIT / STRATA_QL_DUMP_BLOBS (see the header): once, from open_direct (Windows, experts.v2.bin)
+void FileExpertSource::ql_split_load() {
+    if (split_tried_) return;
+    split_tried_ = true;
+    if (!role_ptr_.empty() || paths_.size() != 1 || direct_.empty()) return;
+    if (const char* dp = std::getenv("STRATA_QL_DUMP_BLOBS"); dp != nullptr && dp[0] != '\0') {
+        if (std::FILE* f = std::fopen(dp, "w")) {
+            std::fprintf(f, "# layer expert offset bytes (%s)\n", paths_.front().c_str());
+            for (int64_t l = 0; l < n_layers_; ++l)
+                for (int64_t e = 0; e < n_expert_; ++e)
+                    std::fprintf(f, "%lld %lld %llu %llu\n", (long long) l, (long long) e, (unsigned long long) blob_off(l, e),
+                                 (unsigned long long) blob_len(l, e));
+            std::fclose(f);
+            std::fprintf(stderr, "strata: ql dump of every expert's place -> %s\n", dp);
+        }
+    }
+#if defined(_WIN32)
+    const char* p = std::getenv("STRATA_QL_SPLIT");
+    if (p == nullptr || p[0] == '\0') return;
+    std::ifstream in(p);
+    std::string line, data;
+    std::vector<int64_t> off((size_t) n_layers_ * (size_t) n_expert_, -1);
+    size_t n = 0, first = off.size();
+    uint64_t bytes = 0;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("file ", 0) == 0) { data = line.substr(5); continue; }
+        std::istringstream ss(line);
+        long long l = -1, e = -1;
+        unsigned long long o = 0;
+        if (!(ss >> l >> e >> o) || l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
+        const size_t i = (size_t) l * (size_t) n_expert_ + (size_t) e;
+        off[i] = (int64_t) o;
+        first = std::min(first, i);
+        bytes += blob_len(l, e);
+        ++n;
+    }
+    if (data.empty() || n == 0) {
+        std::fprintf(stderr, "strata: ql split: %s names no file or no experts - off\n", p);
+        return;
+    }
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, data.c_str(), -1, nullptr, 0);
+    std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
+    if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, data.c_str(), -1, w.data(), wide);
+    HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        std::fprintf(stderr, "strata: ql split: cannot open %s unbuffered (error %lu) - off\n", data.c_str(), GetLastError());
+        return;
+    }
+    // the check: the first listed expert, from experts.v2.bin (split off yet) and then from the copy
+    const int64_t fl = (int64_t) (first / (size_t) n_expert_), fe = (int64_t) (first % (size_t) n_expert_);
+    std::vector<uint8_t> a((size_t) blob_len(fl, fe)), b(a.size());
+    const Fill fa{0, fl, fe, a.data()};
+    const bool ra = read_direct(&fa, 1);
+    split_off_ = std::move(off);
+    split_h_ = h;
+    const Fill fb{0, fl, fe, b.data()};
+    const bool rb = read_direct(&fb, 1);
+    if (!ra || !rb || a != b) {
+        std::fprintf(stderr, "strata: ql split: layer %lld expert %lld differs between %s and the copy %s - off\n",
+                     (long long) fl, (long long) fe, paths_.front().c_str(), data.c_str());
+        split_h_ = nullptr;
+        split_off_.clear();
+        CloseHandle(h);
+        return;
+    }
+    std::fprintf(stderr, "strata: ql split: %zu experts (%.2f GiB) are read from %s (the second drive), the rest from %s\n", n,
+                 (double) bytes / 1073741824.0, data.c_str(), paths_.front().c_str());
+#endif
+}
+
+// QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: the ring of experts read from the file (see the header).  Called with dyn_mu_ held.
+void FileExpertSource::dyn_init() {
+    dyn_tried_ = true;
+    const char* v = std::getenv("STRATA_QL_DYN_TIER_GIB");
+    const double gib = v != nullptr ? std::atof(v) : 0.0;
+    if (gib <= 0.0 || n_layers_ <= 0 || n_expert_ <= 0) return;
+    const uint64_t cap = (uint64_t) (gib * 1073741824.0) / 65536 * 65536;
+#if defined(_WIN32)
+    void* p = VirtualAlloc(nullptr, (SIZE_T) cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    void* p = std::aligned_alloc(65536, (size_t) cap);
+#endif
+    if (p == nullptr) {
+        std::fprintf(stderr, "strata: ql dyn tier: could not allocate %.2f GiB - off\n", gib);
+        return;
+    }
+    for (uint64_t at = 0; at < cap; at += 4096) ((volatile uint8_t*) p)[at] = 0;   // committed now, not on the decode
+    const size_t n = (size_t) n_layers_ * (size_t) n_expert_;
+    dyn_off_.reset(new std::atomic<int64_t>[n]);
+    dyn_last_.reset(new std::atomic<uint64_t>[n]);
+    for (size_t i = 0; i < n; ++i) {
+        dyn_off_[i].store(-1, std::memory_order_relaxed);
+        dyn_last_[i].store(0, std::memory_order_relaxed);
+    }
+    dyn_base_ = (uint8_t*) p;
+    dyn_cap_ = cap;
+    dyn_head_ = 0;
+    dyn_ready_.store(true, std::memory_order_release);
+    std::fprintf(stderr, "strata: ql dyn tier: %.2f GiB ring for the experts read from the file\n", (double) cap / 1073741824.0);
+}
+
+const uint8_t* FileExpertSource::dyn_get(size_t index) const {
+    if (!dyn_on()) return nullptr;
+    const int64_t off = dyn_off_[index].load(std::memory_order_seq_cst);
+    if (off < 0) return nullptr;
+    // stamp the use, then confirm the entry is still there (the evictor clears the offset, then reads the stamp)
+    dyn_last_[index].store(io_epoch_.load(std::memory_order_relaxed), std::memory_order_seq_cst);
+    if (dyn_off_[index].load(std::memory_order_seq_cst) != off) return nullptr;
+    dyn_hits_.fetch_add(1, std::memory_order_relaxed);
+    return dyn_base_ + off;
+}
+
+void FileExpertSource::dyn_insert(size_t index, const uint8_t* src, uint64_t bytes) {
+    std::lock_guard<std::mutex> lk(dyn_mu_);
+    if (!dyn_tried_) dyn_init();
+    if (!dyn_on() || src == nullptr || bytes == 0) return;
+    if (dyn_off_[index].load(std::memory_order_relaxed) >= 0) return;   // held already
+    const uint64_t size = (bytes + 63) / 64 * 64;
+    if (size > dyn_cap_ / 4) return;
+    const uint64_t now = io_epoch_.load(std::memory_order_relaxed);
+    // the entries in [from, from + size) go, oldest first; one used in this layer or the one before stops the insert
+    auto evict_front_while = [&](auto in_range) {
+        while (!dyn_fifo_.empty() && in_range(dyn_fifo_.front())) {
+            const DynEntry& d = dyn_fifo_.front();
+            dyn_off_[d.index].store(-1, std::memory_order_seq_cst);
+            if (dyn_last_[d.index].load(std::memory_order_seq_cst) + 2 > now) {   // in use: keep it, skip this insert
+                dyn_off_[d.index].store((int64_t) d.off, std::memory_order_seq_cst);
+                return false;
+            }
+            dyn_fifo_.pop_front();
+            dyn_evict_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    };
+    uint64_t at = dyn_head_;
+    if (at + size > dyn_cap_) {   // wrap: the tail end's entries go first
+        if (!evict_front_while([&](const DynEntry& d) { return d.off >= at; })) { dyn_skip_.fetch_add(1); return; }
+        at = 0;
+    }
+    if (!evict_front_while([&](const DynEntry& d) { return d.off >= at && d.off < at + size; })) {
+        dyn_skip_.fetch_add(1);
+        return;
+    }
+    std::memcpy(dyn_base_ + at, src, (size_t) bytes);
+    dyn_last_[index].store(now, std::memory_order_relaxed);
+    dyn_off_[index].store((int64_t) at, std::memory_order_release);
+    dyn_fifo_.push_back({index, at, size});
+    dyn_head_ = at + size;
+    dyn_ins_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string FileExpertSource::ql_dyn_line() {
+    if (!dyn_on()) return std::string();
+    const uint64_t now[5] = {dyn_hits_.load(), dyn_ins_.load(), dyn_skip_.load(), dyn_evict_.load(), (uint64_t) dyn_fifo_.size()};
+    uint64_t d[4];
+    for (int i = 0; i < 4; ++i) { d[i] = now[i] - dyn_prev_[i]; dyn_prev_[i] = now[i]; }
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: ql dyn tier (%.2f GiB) this request: %llu hits, %llu inserted, %llu skipped (in use), %llu evicted; "
+                  "%llu experts held\n",
+                  (double) dyn_cap_ / 1073741824.0, (unsigned long long) d[0], (unsigned long long) d[1],
+                  (unsigned long long) d[2], (unsigned long long) d[3], (unsigned long long) now[4]);
+    return std::string(buf);
 }
 
 FileExpertSource::DecodeScope::DecodeScope() : prev(tl_decode) { tl_decode = true; }
@@ -2246,6 +2498,18 @@ bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8
 
 void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us) {
     file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
+    // QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: a blob read from the file (after the RAM copy is built) is kept in the ring
+    static const bool dyn_env = [] { const char* e = std::getenv("STRATA_QL_DYN_TIER_GIB"); return e != nullptr && std::atof(e) > 0; }();
+    if (dyn_env && ok && complement_ready_ && !direct_.empty()) {
+        int64_t key = -1;
+        const uint8_t* src = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(stage_mu_);
+            if (v < stage_key_.size()) { key = stage_key_[v]; src = stage_buf_[v].get(); }
+        }
+        if (key >= 0 && src != nullptr && key / n_expert_ == layer)
+            dyn_insert((size_t) key, src, blob_len(layer, key % n_expert_));
+    }
     if (ok) {
         file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
         file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
@@ -2397,6 +2661,7 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
             if (complement_ready_ && resident_blob(index) != nullptr)
                 continue;                                     // in the RAM copy
             if (!override_.empty() && override_[index] != nullptr) continue;
+            if (dyn_get(index) != nullptr) continue;          // QuantLab 11/8: in the ring of experts read before
             if (only_uncached && !cold[(size_t) i] && stage_of_.find(layer * n_expert_ + e) == stage_of_.end()) continue;
             if (!zc_ok.empty() && zc_ok[(size_t) i] && stage_of_.find(layer * n_expert_ + e) == stage_of_.end()) {
                 zc_keys_.push_back(layer * n_expert_ + e);   // read from the mapping by the kernels themselves
@@ -2665,6 +2930,7 @@ bool FileExpertSource::open_direct(std::string& why) {
         std::lock_guard<std::mutex> lk(stage_mu_);
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
     }
+    ql_split_load();   // QuantLab 11/8: STRATA_QL_SPLIT / STRATA_QL_DUMP_BLOBS
     return true;
 #elif defined(__linux__)
     // O_DIRECT: the reads bypass the page cache, as FILE_FLAG_NO_BUFFERING does (4 KiB-aligned windows, read_direct)
@@ -2876,6 +3142,17 @@ bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
 bool FileExpertSource::end_startup_unbuffered(std::string& why) {
     if (!startup_ub_) return true;
     startup_ub_ = false;
+    // QuantLab 11/8 STRATA_QL_KEEP_UNBUFFERED=1: experts.v2.bin is not mapped again - the decode's cold experts are
+    // read unbuffered (staged, COLD_OVERLAP / read-ahead) instead of page-faulted from the mapping; with the file
+    // mapped NTFS ran a second program's 1 MiB unbuffered reads one at a time (E:, queue depth 32: 4.8 -> 2.75 GB/s)
+    if (const char* v = std::getenv("STRATA_QL_KEEP_UNBUFFERED"); v != nullptr && std::atoi(v) != 0) {
+        why = "STRATA_QL_KEEP_UNBUFFERED=1: experts.v2.bin stays unmapped; every expert outside RAM and VRAM is read unbuffered";
+        {   // the ring of STRATA_QL_DYN_TIER_GIB now, beside the RAM copy, not at the decode's first cold read
+            std::lock_guard<std::mutex> lk(dyn_mu_);
+            if (!dyn_tried_) dyn_init();
+        }
+        return false;
+    }
     // the view first: closing the unbuffered handles beside a buffered one purges nothing
     if (!map_view(why)) {
         why += ": the file tier reads it unbuffered";
@@ -2962,9 +3239,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         if (f.dst == nullptr || f.layer < 0 || f.e < 0 || f.layer >= n_layers_ || f.e >= n_expert_) return false;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
             const uint64_t per = blob_len(f.layer, f.e);   // (QuantLab v6: the expert's own place and size)
-            const uint64_t off = blob_off(f.layer, f.e);
+            // QuantLab 11/8 STRATA_QL_SPLIT: the experts copied to the second drive are read from there
+            const size_t si = (size_t) f.layer * (size_t) n_expert_ + (size_t) f.e;
+            const bool sp = split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0;
+            const uint64_t off = sp ? (uint64_t) split_off_[si] : blob_off(f.layer, f.e);
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
+            sc.win.push_back({sp ? kSplitFile : 0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
             continue;
         }
         uint64_t at = 0;
@@ -3001,7 +3281,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({x.file == kSplitFile ? (HANDLE) split_h_ : (HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -4971,6 +5251,14 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
         } else if (!override_.empty() && override_[index] != nullptr) {
             result = override_[index];
             from_files = false;
+        }
+    }
+    if (from_files && complement_ready_) {   // QuantLab 11/8: the ring of experts read from the file before
+        if (const uint8_t* d = dyn_get(index); d != nullptr) {
+            result = d;
+            from_files = false;
+            ram_reads_.fetch_add(1, std::memory_order_relaxed);
+            dyn_hit_bytes_.fetch_add(blob_len(layer, expert), std::memory_order_relaxed);
         }
     }
     if (from_files) {
