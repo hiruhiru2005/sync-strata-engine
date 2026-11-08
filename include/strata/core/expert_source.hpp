@@ -491,6 +491,10 @@ struct PcieModel {
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;
 
+/// QuantLab 11/8 STRATA_QL_GPU_AHEAD: the verify window's device-computed guess of `layer`'s routed ids (n entries,
+/// tokens x top-10 in rank order), set on the thread that then dispatches the layer before it (expert_pool_dispatch_multi)
+void ql_set_gpu_pred(const int32_t* ids, int n, int64_t layer);
+
 struct ExpertDispatch {
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
     strata::kernels::cpu::ExpertPool* pool = nullptr;

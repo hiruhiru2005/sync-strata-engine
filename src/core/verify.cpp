@@ -96,6 +96,15 @@ bool window_copy_logits(void* w, int t, float* host);
 #endif
 
 namespace strata::core {
+
+// QuantLab 11/8 STRATA_QL_GPU_AHEAD=1 (with STRATA_QL_DIRECT_AHEAD=N): the read-ahead's guess of layer l+1's experts
+// computed on the device right after layer l's own router (the same GEMV and top-10 with l+1's router weights, on l's MoE
+// input: what RouterLookahead computes on a CPU thread), handed to the host with the layer (ql_set_gpu_pred)
+static bool ql_gpu_ahead_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_GPU_AHEAD"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -756,7 +765,7 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     if (hcount_d_) cudaFree(hcount_d_);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_pids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
@@ -881,6 +890,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                      (void**) &m_nf_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
+              mapped(T * K * 4, (void**) &h_pids_, (void**) &m_pids_) &&   // QuantLab 11/8 STRATA_QL_GPU_AHEAD
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
@@ -991,6 +1001,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
+        plogits_ = b.take<float>(T * (uint64_t) g.n_expert); pw_ = b.take<float>(T * K); pids_ = b.take<int32_t>(T * K);   // QuantLab 11/8
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
@@ -2125,6 +2136,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+        }
+        // QuantLab 11/8 STRATA_QL_GPU_AHEAD: layer l+1's guess, its ids in mapped memory before this layer's doorbell
+        if (ql_gpu_ahead_on() && dec_batch && n > 1 && native_router_enabled() && NE == 512 && K == 10 && l + 1 < g.n_layers) {
+            const LayerView vn(wt, l + 1);
+            if (const WeightRef* wr1 = vn.get("ffn_gate_inp.weight"); wr1 != nullptr) {
+                try {
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wr1->data, plogits_ + tb * NE, NE, N, NE, n, cs);
+                    native_router_top10_multi(plogits_ + tb * NE, pids_ + tb * K, pw_ + tb * K, n, cs);
+                    if (cudaMemcpyAsync(h_pids_ + (size_t) tb * K, pids_ + tb * K, (size_t) n * K * sizeof(int32_t),
+                                        cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                        err = "verify ql gpu ahead: the ids' copy failed";
+                        return false;
+                    }
+                } catch (const std::exception& e) { err = "verify ql gpu ahead: " + std::string(e.what()); return false; }
+            }
         }
         // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
         // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 1.5 on a
@@ -3312,6 +3338,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        if (ql_gpu_ahead_on() && n > 1 && l + 1 < g.n_layers)   // QuantLab 11/8: layer l+1's guess, for the read-ahead
+            ql_set_gpu_pred(h_pids_ + (size_t) tb * ss.k, n * (int) ss.k, l + 1);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -5014,6 +5042,8 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
+        if (ql_gpu_ahead_on() && n > 1 && l + 1 < g.n_layers)   // QuantLab 11/8: layer l+1's guess, for the read-ahead
+            ql_set_gpu_pred(h_pids_ + (size_t) tb * ss.k, n * (int) ss.k, l + 1);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

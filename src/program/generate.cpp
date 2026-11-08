@@ -7955,7 +7955,8 @@ int main(int argc, char** argv) {
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
     // QuantLab (11/3): STRATA_QL_DIRECT_AHEAD=N - the look-ahead also runs on the unbuffered file tier, which reads its
     // predictions into stage buffers (FileExpertSource::ql_direct_ahead); whether the reads are unbuffered is asked per call
-    const bool ql_ahead = srcp == &src && strata::core::FileExpertSource::ql_direct_ahead_max() > 0;
+    const bool ql_ahead = srcp == &src && strata::core::FileExpertSource::ql_direct_ahead_max() > 0 &&
+                          [] { const char* v = std::getenv("STRATA_QL_GPU_AHEAD"); return v == nullptr || std::atoi(v) == 0; }();   // QuantLab 11/8: the device guesses instead
     if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats || ql_ahead) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
@@ -18245,6 +18246,9 @@ int main(int argc, char** argv) {
             }
             if (srcp == &src && drive.d.lookahead != nullptr) {   // QuantLab (11/3) STRATA_QL_DIRECT_AHEAD: this request's read-ahead
                 const std::string qa = src.ql_direct_ahead_line(drive.d.lookahead->predicted(), drive.d.lookahead->skipped());
+                if (!qa.empty()) std::fputs(qa.c_str(), stderr);
+            } else if (srcp == &src && std::getenv("STRATA_QL_GPU_AHEAD") != nullptr) {   // QuantLab 11/8: the device's guesses
+                const std::string qa = src.ql_direct_ahead_line(0, 0);
                 if (!qa.empty()) std::fputs(qa.c_str(), stderr);
             }
             if (srcp == &src) {   // QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: this request's ring of experts read from the file

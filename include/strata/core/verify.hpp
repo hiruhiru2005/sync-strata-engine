@@ -642,6 +642,9 @@ private:
     void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
+    // QuantLab 11/8 STRATA_QL_GPU_AHEAD: layer l+1's predicted top-10 (device: logits, ids, weights; mapped: ids)
+    float* plogits_ = nullptr; int32_t* pids_ = nullptr; float* pw_ = nullptr;
+    int32_t* h_pids_ = nullptr;  int32_t* m_pids_ = nullptr;    // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;

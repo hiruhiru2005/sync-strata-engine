@@ -5743,6 +5743,39 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+thread_local const int32_t* tl_gpu_pred = nullptr;
+thread_local int tl_gpu_pred_n = 0;
+thread_local int64_t tl_gpu_pred_layer = -1;
+
+// one candidate per expert, its best rank over the window's tokens as the confidence (as RouterLookahead's), to the
+// source's scored warm (FileExpertSource: ql_direct_ahead when STRATA_QL_DIRECT_AHEAD is on)
+void ql_gpu_ahead(ExpertSource* src, int64_t layer, const int32_t* ids, int n, int k) {
+    if (src == nullptr || ids == nullptr || n <= 0 || k <= 0 || layer < 0) return;
+    int64_t ex[160];
+    float cf[160];
+    int m = 0;
+    for (int i = 0; i < n && m < 160; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0) continue;
+        const float c = (float) (k - i % k) / (float) k;
+        int j = 0;
+        while (j < m && ex[j] != e) ++j;
+        if (j < m) { if (c > cf[j]) cf[j] = c; continue; }
+        ex[m] = e;
+        cf[m] = c;
+        ++m;
+    }
+    if (m > 0) src->warm_scored(layer, ex, cf, m, 1);
+}
+}  // namespace
+
+void ql_set_gpu_pred(const int32_t* ids, int n, int64_t layer) {
+    tl_gpu_pred = ids;
+    tl_gpu_pred_n = n;
+    tl_gpu_pred_layer = layer;
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -5759,6 +5792,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
         }
         d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
+    }
+    if (tl_gpu_pred != nullptr) {   // QuantLab 11/8 STRATA_QL_GPU_AHEAD: the device's guess of layer + 1
+        if (tl_gpu_pred_layer == d.layers + 1) ql_gpu_ahead(d.src, d.layers + 1, tl_gpu_pred, tl_gpu_pred_n, (int) k);
+        tl_gpu_pred = nullptr;
     }
     if (k < 1 || n_tok * k > kMaxWindowEntries) {
         d.failed = true;
