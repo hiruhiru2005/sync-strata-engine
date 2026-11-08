@@ -944,7 +944,14 @@ public:
     /// against the queue's pressure, a speculative byte budget per decode window, a deadline per read.
     void warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) override;
     bool io_sched() const { return io_sched_; }
-    bool wants_scores() const override { return io_sched_ && io_pf_; }
+    bool wants_scores() const override { return (io_sched_ && io_pf_) || ql_direct_ahead_on(); }
+    /// QuantLab (11/3): STRATA_QL_DIRECT_AHEAD=N (opt-in, N = at most N blobs a layer) - with the reads unbuffered (the
+    /// Windows file tier), the look-ahead's predicted experts of the next layer are read into stage buffers on its thread,
+    /// the surest first; the layer that then routes one finds it staged, or waits for that read instead of starting its own.
+    bool ql_direct_ahead_on() const { return !direct_.empty() && ql_direct_ahead_max() > 0; }
+    static int ql_direct_ahead_max();
+    /// One line of this request's read-ahead counts (and the look-ahead's predictions / skipped submits), "" when off.
+    std::string ql_direct_ahead_line(int64_t predicted, int64_t skipped);
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
@@ -1193,6 +1200,11 @@ private:
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
         io_crit_us_{0}, io_crit_n_{0};
+    /// QuantLab (11/3) STRATA_QL_DIRECT_AHEAD: the look-ahead's calls, its candidates (not in RAM or VRAM), the blobs it read,
+    /// those already staged or in flight, the reads' wall time, the reads that failed
+    void ql_direct_ahead(int64_t layer, const int64_t* experts, const float* conf, int64_t n);
+    std::atomic<uint64_t> ql_ah_calls_{0}, ql_ah_cand_{0}, ql_ah_read_{0}, ql_ah_have_{0}, ql_ah_us_{0}, ql_ah_fail_{0}, ql_ah_batch_{0};
+    uint64_t ql_ah_prev_[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};   ///< the counts at the last line (ql_direct_ahead_line)
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
     int spans(int64_t layer, int64_t expert, Span* out) const;

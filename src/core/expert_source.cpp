@@ -1123,6 +1123,7 @@ void FileExpertSource::io_window_tick() {
 // the queue's fill against the window budget (a busy drive takes only the surer guesses); the window's speculative bytes
 // stay within the budget; each job carries the layer clock by which it must have started (else the worker drops it).
 void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) {
+    if (ql_direct_ahead_on()) { ql_direct_ahead(layer, experts, conf, n); return; }   // QuantLab (11/3)
     if (!io_sched_ || !io_pf_ || !direct_.empty() || !io_ahead_ || !gate_open()) { warm(layer, experts, n); return; }
     if (n <= 0 || layer < 0 || layer >= n_layers_) return;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
@@ -1153,6 +1154,96 @@ void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const 
         }
     }
     if (any) io_cv_.notify_all();
+}
+
+// QuantLab (11/3): STRATA_QL_DIRECT_AHEAD=N - the unbuffered file tier's read-ahead (see the header).  Runs on the look-ahead
+// thread: the predicted experts that neither the RAM copy nor the GPU holds, the surest first (the confidence of their
+// best rank over the window's tokens), at most N; each claims its stage buffer as a read ahead (stage_pf_: counted used or
+// unused, as the Linux read-ahead's are), and the batch is read with the same overlapped unbuffered reads as a layer's own.
+// While it reads, the look-ahead skips the next layer's submit (no backlog).  The layer that routes one finds it staged,
+// or in flight (claim_todo marks it pending, `blob` / wait_landed wait for its publish) - the tokens do not change.
+int FileExpertSource::ql_direct_ahead_max() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_QL_DIRECT_AHEAD");
+        return v == nullptr ? 0 : std::clamp(std::atoi(v), 0, 64);
+    }();
+    return n;
+}
+
+void FileExpertSource::ql_direct_ahead(int64_t layer, const int64_t* experts, const float* conf, int64_t n) {
+    const int cap = ql_direct_ahead_max();
+    if (cap <= 0 || n <= 0 || layer < 0 || layer >= n_layers_ || !complement_ready_ || direct_.empty()) return;
+    static const float minconf = [] {
+        const char* v = std::getenv("STRATA_QL_DIRECT_AHEAD_MINCONF");
+        return v == nullptr ? 0.0f : (float) std::clamp(std::atof(v), 0.0, 1.0);
+    }();
+    ql_ah_calls_.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::pair<float, int64_t>> cand;
+    for (int64_t j = 0; j < n; ++j) {
+        const int64_t e = experts[j];
+        if (e < 0 || e >= n_expert_) continue;
+        const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+        if (resident_blob(index) != nullptr) continue;                     // in the RAM copy
+        if (!override_.empty() && override_[index] != nullptr) continue;   // an exchange buffer holds it
+        const float c = conf != nullptr ? conf[j] : 1.0f;
+        if (c < minconf) continue;
+        cand.emplace_back(c, e);
+    }
+    ql_ah_cand_.fetch_add(cand.size(), std::memory_order_relaxed);
+    if (cand.empty()) return;
+    std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    if ((int) cand.size() > cap) cand.resize((size_t) cap);
+    std::vector<Fill> todo;
+    {
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        if (stage_blob_ == 0) return;
+        for (const auto& ce : cand) {
+            size_t v = 0;
+            bool fill = false;
+            const bool have = claim_stage(layer * n_expert_ + ce.second, v, fill, /*ahead=*/true);
+            if (have) { ql_ah_have_.fetch_add(1, std::memory_order_relaxed); continue; }   // staged or in flight
+            if (!fill) continue;                                                            // no buffer
+            stage_pf_[v] = 1;
+            todo.push_back({v, layer, ce.second, stage_buf_[v].get()});
+        }
+    }
+    for (size_t at = 0; at < todo.size(); at += 16) {   // the batches fill_many reads (16 blobs in flight)
+        const size_t k = std::min<size_t>(16, todo.size() - at);
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = read_direct(todo.data() + at, k);
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        ql_ah_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
+        ql_ah_batch_.fetch_add(1, std::memory_order_relaxed);
+        for (size_t i = at; i < at + k; ++i) {
+            const Fill& f = todo[i];
+            if (ok) publish_stage(f.v, f.layer, true, us / (double) k);
+            else {
+                ql_ah_fail_.fetch_add(1, std::memory_order_relaxed);
+                (void) fill_stage(f.v, f.layer, f.e, f.dst);   // each again on its own, as fill_many does
+            }
+        }
+        ql_ah_read_.fetch_add(k, std::memory_order_relaxed);
+    }
+}
+
+std::string FileExpertSource::ql_direct_ahead_line(int64_t predicted, int64_t skipped) {
+    if (!ql_direct_ahead_on()) return std::string();
+    const uint64_t now[9] = {ql_ah_calls_.load(), ql_ah_cand_.load(), ql_ah_read_.load(), ql_ah_have_.load(), ql_ah_us_.load(),
+                             io_pf_used_.load(), io_pf_unused_.load(), (uint64_t) std::max<int64_t>(0, skipped), ql_ah_batch_.load()};
+    uint64_t d[9];
+    for (int i = 0; i < 9; ++i) { d[i] = now[i] - ql_ah_prev_[i]; ql_ah_prev_[i] = now[i]; }
+    const double calls = (double) std::max<uint64_t>(1, d[0]);
+    char buf[640];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: direct read-ahead (STRATA_QL_DIRECT_AHEAD=%d) this request: %llu layers predicted, "
+                  "%.2f candidates/layer (outside RAM and VRAM), %.2f read/layer, %.2f already staged or in flight/layer; "
+                  "read-ahead used %llu, evicted unused %llu; reads %.3f ms a batch (%llu batches); look-ahead skipped %llu submits "
+                  "(%lld predictions in all); %llu reads failed (read again one by one)\n",
+                  ql_direct_ahead_max(), (unsigned long long) d[0], (double) d[1] / calls, (double) d[2] / calls,
+                  (double) d[3] / calls, (unsigned long long) d[5], (unsigned long long) d[6],
+                  d[8] > 0 ? (double) d[4] / 1000.0 / (double) d[8] : 0.0, (unsigned long long) d[8],
+                  (unsigned long long) d[7], (long long) predicted, (unsigned long long) ql_ah_fail_.load());
+    return std::string(buf);
 }
 
 void FileExpertSource::set_io_prefetch(bool on, int threads) {

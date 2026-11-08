@@ -7913,7 +7913,10 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+    // QuantLab (11/3): STRATA_QL_DIRECT_AHEAD=N - the look-ahead also runs on the unbuffered file tier, which reads its
+    // predictions into stage buffers (FileExpertSource::ql_direct_ahead); whether the reads are unbuffered is asked per call
+    const bool ql_ahead = srcp == &src && strata::core::FileExpertSource::ql_direct_ahead_max() > 0;
+    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats || ql_ahead) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
@@ -7926,7 +7929,8 @@ int main(int argc, char** argv) {
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
+        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err,
+                                  fs_ahead || la_stats || ql_ahead)) {
             drive.d.lookahead = &lookahead;
             if (la_stats) lookahead.enable_stats(g.n_layers);
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
@@ -7934,7 +7938,8 @@ int main(int argc, char** argv) {
             else if (srcp == &src && src.io_prefetch())
                 lookahead.set_depth(2);
             std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
-                         fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
+                         fs_ahead ? ", feeding the Foresight swap space"
+                                  : ql_ahead ? ", file tier; unbuffered: read into stage buffers (STRATA_QL_DIRECT_AHEAD)" : ", file tier");
         } else {
             (void) cudaGetLastError();
             std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
@@ -18163,6 +18168,10 @@ int main(int argc, char** argv) {
                 cp.cold_layers = c.cold_layers; cp.cold_pending = c.cold_pending; cp.cold_ready = c.cold_ready; cp.cold_zc = c.cold_zc;
                 cp.cold_batches = c.cold_batches; cp.ms_cold_r = c.ms_cold_r; cp.ms_cold_cr = c.ms_cold_cr;
                 cp.ms_cold_cc = c.ms_cold_cc; cp.ms_cold_wait = c.ms_cold_wait; cp.ms_cold_hide = c.ms_cold_hide;
+            }
+            if (srcp == &src && drive.d.lookahead != nullptr) {   // QuantLab (11/3) STRATA_QL_DIRECT_AHEAD: this request's read-ahead
+                const std::string qa = src.ql_direct_ahead_line(drive.d.lookahead->predicted(), drive.d.lookahead->skipped());
+                if (!qa.empty()) std::fputs(qa.c_str(), stderr);
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
