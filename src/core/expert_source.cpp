@@ -1952,6 +1952,92 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
 
 // 149 STRATA_IO_PF_GATE: whether this thread reads for the decode (the dispatch's thread, and the fetch threads it starts)
 namespace { thread_local bool tl_decode = false; }
+
+// QuantLab 11/8 STRATA_QL_READ_TRACE=<file>: every blob read from the experts file (unbuffered batches of
+// fill_many and the STRATA_COLD_OVERLAP workers) as a 32-byte record: start (ns since the engine started), the
+// batch's wall time (us), the blob's bytes, layer, expert, the batch size, the reads in flight with this batch
+// (all threads), decode or not, ok, kind (0 demand, 1 read ahead).  Written in chunks of 512 records and at exit.
+namespace {
+struct QlReadRec {
+    uint64_t t0_ns;
+    uint32_t dur_us, bytes;
+    uint16_t layer, expert, batch, inflight;
+    uint8_t decode, ok, kind, pad[5];
+};
+static_assert(sizeof(QlReadRec) == 32, "QlReadRec is 32 bytes");
+struct QlReadTrace {
+    std::mutex mu;
+    std::vector<QlReadRec> buf;
+    std::FILE* f = nullptr;
+    bool on = false;
+    std::atomic<int> inflight{0};
+    const std::chrono::steady_clock::time_point base = std::chrono::steady_clock::now();
+    QlReadTrace() {
+        const char* p = std::getenv("STRATA_QL_READ_TRACE");
+        if (p == nullptr || p[0] == '\0') return;
+        f = std::fopen(p, "wb");
+        on = f != nullptr;
+        std::fprintf(stderr, "strata: ql read trace %s %s\n", on ? "->" : "could not open", p);
+    }
+    ~QlReadTrace() {
+        flush();
+        if (f != nullptr) std::fclose(f);
+    }
+    void flush() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (f != nullptr && !buf.empty()) {
+            std::fwrite(buf.data(), sizeof(QlReadRec), buf.size(), f);
+            std::fflush(f);
+            buf.clear();
+        }
+    }
+    void add(const QlReadRec* r, size_t n) {
+        std::lock_guard<std::mutex> lk(mu);
+        buf.insert(buf.end(), r, r + n);
+        if (buf.size() >= 512 && f != nullptr) {
+            std::fwrite(buf.data(), sizeof(QlReadRec), buf.size(), f);
+            std::fflush(f);
+            buf.clear();
+        }
+    }
+};
+QlReadTrace& ql_read_trace() {
+    static QlReadTrace t;
+    return t;
+}
+}  // namespace
+
+// one batch of `k` fills read by read_direct: the in-flight count before the batch starts, and the records after
+int FileExpertSource::ql_trace_begin(size_t k) {
+    QlReadTrace& t = ql_read_trace();
+    if (!t.on) return 0;
+    return t.inflight.fetch_add((int) k, std::memory_order_relaxed) + (int) k;
+}
+void FileExpertSource::ql_trace_end(const Fill* f, size_t k, std::chrono::steady_clock::time_point t0, double us, bool ok,
+                                    bool dec, int inflight, int kind) const {
+    QlReadTrace& t = ql_read_trace();
+    if (!t.on) return;
+    t.inflight.fetch_sub((int) k, std::memory_order_relaxed);
+    QlReadRec r[16];
+    size_t m = 0;
+    for (size_t i = 0; i < k; ++i) {
+        if (m == 16) { t.add(r, m); m = 0; }
+        QlReadRec& x = r[m++];
+        std::memset(&x, 0, sizeof x);
+        x.t0_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - t.base).count();
+        x.dur_us = (uint32_t) us;
+        x.bytes = (uint32_t) blob_len(f[i].layer, f[i].e);
+        x.layer = (uint16_t) f[i].layer;
+        x.expert = (uint16_t) f[i].e;
+        x.batch = (uint16_t) k;
+        x.inflight = (uint16_t) std::max(0, inflight);
+        x.decode = dec ? 1 : 0;
+        x.ok = ok ? 1 : 0;
+        x.kind = (uint8_t) kind;
+    }
+    t.add(r, m);
+}
+
 FileExpertSource::DecodeScope::DecodeScope() : prev(tl_decode) { tl_decode = true; }
 FileExpertSource::DecodeScope::~DecodeScope() { tl_decode = prev; }
 bool FileExpertSource::in_decode() { return tl_decode; }
@@ -2287,9 +2373,11 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
         if (direct) {
             for (size_t at; (at = async_next_.fetch_add(16)) < todo.size();) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
+                const int infl = ql_trace_begin(k);
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool ok = read_direct(todo.data() + at, k);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                ql_trace_end(todo.data() + at, k, t0, us, ok, dec, infl, 0);
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
                     if (ok) publish_stage(f.v, f.layer, true, us / (double) k);
@@ -2394,12 +2482,15 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
         // #286: overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile
         // fill) on up to 4 threads, a decode layer's few misses on this one
         std::atomic<size_t> next{0};
+        const bool dec = tl_decode;
         auto work = [&] {
             for (size_t at; (at = next.fetch_add(16)) < todo.size();) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
+                const int infl = ql_trace_begin(k);
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool ok = read_direct(todo.data() + at, k);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                ql_trace_end(todo.data() + at, k, t0, us, ok, dec, infl, 0);
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
                     // a failed batch: each blob again on its own (copy_from_files falls back to the mapping)
@@ -4811,6 +4902,19 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
             }
         }
         if (complement_ready_ && result != nullptr) file_reads_.fetch_add(1, std::memory_order_relaxed);
+        if (result != nullptr && ql_read_trace().on) {   // QuantLab 11/8: the blob handed out from the file tier (kind 2)
+            QlReadRec x;
+            std::memset(&x, 0, sizeof x);
+            x.t0_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                                      ql_read_trace().base).count();
+            x.bytes = (uint32_t) blob_len(layer, expert);
+            x.layer = (uint16_t) layer;
+            x.expert = (uint16_t) expert;
+            x.decode = tl_decode ? 1 : 0;
+            x.ok = 1;
+            x.kind = (uint8_t) (staged() ? 3 : 2);   // 3 staged (read unbuffered above), 2 the mapping
+            ql_read_trace().add(&x, 1);
+        }
     }
     if (result != nullptr) reads_.fetch_add(1, std::memory_order_relaxed);
     return result;

@@ -1072,6 +1072,10 @@ private:
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
+    /// QuantLab 11/8 STRATA_QL_READ_TRACE: one record per blob of a read_direct batch (expert_source.cpp)
+    static int ql_trace_begin(size_t k);
+    void ql_trace_end(const Fill* f, size_t k, std::chrono::steady_clock::time_point t0, double us, bool ok, bool dec,
+                      int inflight, int kind) const;
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
