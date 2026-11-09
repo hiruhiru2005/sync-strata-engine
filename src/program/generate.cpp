@@ -14757,6 +14757,7 @@ int main(int argc, char** argv) {
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             double req_pipe = -1.0;   // --prefill-pipe for this request (setup's calibration of a layer split)
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
+            int req_tail_skip = -1;   // QuantLab 11/10 tail_skip=R (0..9): STRATA_ROUTE_TAIL_SKIP for this request (-1 = the start-up value)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
@@ -14804,6 +14805,7 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "tail_skip") req_tail_skip = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 9);
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -16560,6 +16562,20 @@ int main(int argc, char** argv) {
                 if (want != was_on)
                     std::fprintf(stderr, "strata serve: aux cpus %s for this request%s\n", strata::aux_cpus::enabled() ? "ON" : "off",
                                  want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
+            }
+            {   // QuantLab 11/10 tail_skip=R: the rank for this request only (the skip reads it every verify window); a request
+                // without it gets the start-up value back.  Not when the start-up left it off (NVFP4 experts, --batch, a peer or
+                // helper GPU, every expert resident, STRATA_ROUTE_TAIL_SKIP=0): those stay off.
+                static const int tail_start = strata::core::tail_skip_rank();   // the first request: the start-up value
+                const int want = req_tail_skip >= 0 && tail_start > 0 ? req_tail_skip : tail_start;
+                if (req_tail_skip >= 0 && tail_start == 0)
+                    std::fprintf(stderr, "strata serve: tail_skip=%d for this request ignored: the route tail skip is off since the start\n",
+                                 req_tail_skip);
+                if (want != strata::core::tail_skip_rank()) {
+                    strata::core::set_tail_skip_rank(want);
+                    std::fprintf(stderr, "strata serve: route tail skip rank %d for this request (start-up %d)\n",
+                                 strata::core::tail_skip_rank(), tail_start);
+                }
             }
             ver.pause_pcie_balance(req_pcie_set);   // the measured costs keep across requests
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
