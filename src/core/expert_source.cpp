@@ -1205,7 +1205,7 @@ void FileExpertSource::ql_direct_ahead(int64_t layer, const int64_t* experts, co
             if (have) { ql_ah_have_.fetch_add(1, std::memory_order_relaxed); continue; }   // staged or in flight
             if (!fill) continue;                                                            // no buffer
             stage_pf_[v] = 1;
-            todo.push_back({v, layer, ce.second, stage_buf_[v].get()});
+            todo.push_back({v, layer, ce.second, stage_buf_[v].get(), nullptr, (int8_t) ql_drive_for(true)});   // the decode's
         }
     }
     // QuantLab 11/8: the reads go to the read-ahead's own reader threads (STRATA_QL_AHEAD_ASYNC=0: on this thread, as on
@@ -2162,7 +2162,8 @@ void FileExpertSource::ql_trace_end(const Fill* f, size_t k, std::chrono::steady
         x.ok = ok ? 1 : 0;
         x.kind = (uint8_t) kind;
         const size_t si = (size_t) f[i].layer * (size_t) n_expert_ + (size_t) f[i].e;   // 11/8: 1 = the second drive
-        x.pad[0] = (uint8_t) (split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0 ? 1 : 0);
+        x.pad[0] = (uint8_t) (split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0 &&
+                              (f[i].drive >= 0 ? f[i].drive : ql_drive_for(dec)) == 1 ? 1 : 0);
     }
     t.add(r, m);
 }
@@ -2293,11 +2294,11 @@ void FileExpertSource::ql_split_load() {
     // the check: the first listed expert, from experts.v2.bin (split off yet) and then from the copy
     const int64_t fl = (int64_t) (first / (size_t) n_expert_), fe = (int64_t) (first % (size_t) n_expert_);
     std::vector<uint8_t> a((size_t) blob_len(fl, fe)), b(a.size());
-    const Fill fa{0, fl, fe, a.data()};
+    const Fill fa{0, fl, fe, a.data(), nullptr, 0};
     const bool ra = read_direct(&fa, 1);
     split_off_ = std::move(off);
     split_h_ = h;
-    const Fill fb{0, fl, fe, b.data()};
+    const Fill fb{0, fl, fe, b.data(), nullptr, 1};
     const bool rb = read_direct(&fb, 1);
     if (!ra || !rb || a != b) {
         std::fprintf(stderr, "strata: ql split: layer %lld expert %lld differs between %s and the copy %s - off\n",
@@ -2307,8 +2308,14 @@ void FileExpertSource::ql_split_load() {
         CloseHandle(h);
         return;
     }
-    std::fprintf(stderr, "strata: ql split: %zu experts (%.2f GiB) are read from %s (the second drive), the rest from %s\n", n,
-                 (double) bytes / 1073741824.0, data.c_str(), paths_.front().c_str());
+    {
+        const char* sd = std::getenv("STRATA_QL_SPLIT_DECODE");
+        split_decode_ = sd != nullptr && std::atoi(sd) != 0;
+    }
+    std::fprintf(stderr, "strata: ql split: %zu experts (%.2f GiB) are read from %s (the second drive), the rest from %s; %s\n", n,
+                 (double) bytes / 1073741824.0, data.c_str(), paths_.front().c_str(),
+                 split_decode_ ? "the decode reads the copy too (STRATA_QL_SPLIT_DECODE=1)"
+                               : "the decode reads experts.v2.bin only, the prefill both drives (STRATA_QL_SPLIT_DECODE=1: the decode too)");
 #endif
 }
 
@@ -2428,9 +2435,9 @@ void FileExpertSource::dyn_publish(size_t index, int64_t boff) {
     dyn_ins_.fetch_add(1, std::memory_order_relaxed);
 }
 
-uint64_t FileExpertSource::ql_file_off(int64_t layer, int64_t expert) const {
+uint64_t FileExpertSource::ql_file_off(int64_t layer, int64_t expert, int drive) const {
     const size_t si = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    if (split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0) return (uint64_t) split_off_[si];
+    if (drive == 1 && split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0) return (uint64_t) split_off_[si];
     return blob_off(layer, expert);
 }
 
@@ -2452,6 +2459,21 @@ std::string FileExpertSource::ql_path_line() {
                   (double) d[4] / nb / 1e3, (double) d[5] / nb / 1e3, (double) d[6] / nb / 1e3,
                   d[8] ? (double) d[7] / (double) d[8] / 1e3 : 0.0, (unsigned long long) d[8],
                   d[10] ? (double) d[9] / (double) d[10] / 1e3 : 0.0, (unsigned long long) d[10]);
+    return std::string(buf);
+}
+
+std::string FileExpertSource::ql_split_line() {
+    if (split_h_ == nullptr) return std::string();
+    const uint64_t c = split_rd_copy_.load(std::memory_order_relaxed), m = split_rd_main_.load(std::memory_order_relaxed);
+    const uint64_t dc = c - split_prev_[0], dm = m - split_prev_[1];
+    split_prev_[0] = c;
+    split_prev_[1] = m;
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: ql split this request: %llu blobs read from the second drive's copy, %llu that have a copy "
+                  "read from experts.v2.bin (%s)\n",
+                  (unsigned long long) dc, (unsigned long long) dm,
+                  split_decode_ ? "the decode reads the copy too" : "the copy is the prefill's, experts.v2.bin the decode's");
     return std::string(buf);
 }
 
@@ -2802,16 +2824,17 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
                 static const bool dyn_direct = [] { const char* q = std::getenv("STRATA_QL_DYN_DIRECT"); return q != nullptr && std::atoi(q) != 0; }();
                 uint8_t* qdst = stage_buf_[v].get();
                 uint8_t* qwb = nullptr;
+                const int8_t dv = (int8_t) ql_drive_for(tl_decode);   // 11/10: this claim's reader (decode or prefill)
                 if (dyn_direct && complement_ready_ && !direct_.empty() && role_ptr_.empty()) {
                     int64_t boff = -1;
-                    const uint64_t skip = ql_file_off(layer, e) & 4095;
+                    const uint64_t skip = ql_file_off(layer, e, dv) & 4095;
                     if (uint8_t* base = dyn_reserve(index, blob_len(layer, e), skip, boff)) {
                         stage_direct_[v] = {base + skip, boff, index};
                         qdst = base + skip;
                         qwb = base;
                     }
                 }
-                todo.push_back({v, layer, e, qdst, qwb});
+                todo.push_back({v, layer, e, qdst, qwb, dv});
                 if (pending != nullptr) pending[i] = 1;
                 if (warm_stamp_) {
                     const uint32_t s = warm_stamp_[index].load(std::memory_order_relaxed);
@@ -2876,7 +2899,7 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
                 const size_t k = std::min<size_t>(16, todo.size() - at);
                 const int infl = ql_trace_begin(k);
                 const auto t0 = std::chrono::steady_clock::now();
-                const bool ok = read_direct(todo.data() + at, k);
+                const bool ok = read_direct(todo.data() + at, k, ql_drive_for(dec));
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 ql_trace_end(todo.data() + at, k, t0, us, ok, dec, infl, 0);
                 for (size_t i = at; i < at + k; ++i) {
@@ -3046,7 +3069,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
                 const int infl = ql_trace_begin(k);
                 const auto t0 = std::chrono::steady_clock::now();
-                const bool ok = read_direct(todo.data() + at, k);
+                const bool ok = read_direct(todo.data() + at, k, ql_drive_for(dec));   // 11/10: the caller's drive
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 ql_trace_end(todo.data() + at, k, t0, us, ok, dec, infl, 0);
                 for (size_t i = at; i < at + k; ++i) {
@@ -3410,7 +3433,7 @@ bool FileExpertSource::map_view(std::string& why) {
 #endif
 }
 
-bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+bool FileExpertSource::read_direct(const Fill* fills, size_t n, int drive) const {
 #if defined(_WIN32)
     const auto qp0 = std::chrono::steady_clock::now();   // QuantLab 11/8 STRATA_QL_PATH_STATS
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
@@ -3442,9 +3465,13 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         if (f.dst == nullptr || f.layer < 0 || f.e < 0 || f.layer >= n_layers_ || f.e >= n_expert_) return false;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
             const uint64_t per = blob_len(f.layer, f.e);   // (QuantLab v6: the expert's own place and size)
-            // QuantLab 11/8 STRATA_QL_SPLIT: the experts copied to the second drive are read from there
+            // QuantLab 11/8 STRATA_QL_SPLIT: the experts copied to the second drive are read from there - 11/10: by the
+            // prefill only (the fill's own drive, else the batch's, else this thread's decode mark; ql_drive_for)
             const size_t si = (size_t) f.layer * (size_t) n_expert_ + (size_t) f.e;
-            const bool sp = split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0;
+            const bool has = split_h_ != nullptr && si < split_off_.size() && split_off_[si] >= 0;
+            const int dv = f.drive >= 0 ? f.drive : drive >= 0 ? drive : ql_drive_for(tl_decode);
+            const bool sp = has && dv == 1;
+            if (has) (sp ? split_rd_copy_ : split_rd_main_).fetch_add(1, std::memory_order_relaxed);
             const uint64_t off = sp ? (uint64_t) split_off_[si] : blob_off(f.layer, f.e);
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             sc.win.push_back({sp ? kSplitFile : 0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0, f.wbase});

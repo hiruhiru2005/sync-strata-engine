@@ -974,6 +974,8 @@ public:
     std::string ql_direct_ahead_line(int64_t predicted, int64_t skipped);
     /// QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: this request's ring of experts read from the file (empty when off)
     std::string ql_dyn_line();
+    /// QuantLab 11/10 STRATA_QL_SPLIT: this request's blobs that have a copy, read from it / from experts.v2.bin ("" when off)
+    std::string ql_split_line();
     /// QuantLab 11/8 STRATA_QL_PATH_STATS=1: this request's decode reads, phase by phase (empty when off)
     std::string ql_path_line();
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
@@ -1034,7 +1036,9 @@ private:
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
-    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; uint8_t* wbase = nullptr; };   ///< wbase: QuantLab 11/8 read straight there (4 KiB-aligned window)
+    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; uint8_t* wbase = nullptr; int8_t drive = -1; };   ///< wbase: QuantLab 11/8 read straight there (4 KiB-aligned window)
+    ///< drive: QuantLab 11/10 STRATA_QL_SPLIT, where the blob is read: 0 experts.v2.bin, 1 the second drive's copy (when it
+    ///< has the expert), -1 decided by read_direct (ql_drive_for).  Set where a read straight into place sized its window.
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
     /// 149-cold: the claim half of `prefetch` (the blobs this call must fill; pending[i] = 1 for those, if given)
@@ -1102,7 +1106,9 @@ private:
     double async_fill_us_ = 0;
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
-    bool read_direct(const Fill* fills, size_t n) const;
+    /// QuantLab 11/10: `drive` (0 / 1, -1 = from this thread's tl_decode) for the fills whose own `drive` is -1 - the
+    /// batch's caller passes it when the reads run on threads that do not carry the caller's decode mark.
+    bool read_direct(const Fill* fills, size_t n, int drive = -1) const;
     /// QuantLab 11/8 STRATA_QL_READ_TRACE: one record per blob of a read_direct batch (expert_source.cpp)
     static int ql_trace_begin(size_t k);
     void ql_trace_end(const Fill* f, size_t k, std::chrono::steady_clock::time_point t0, double us, bool ok, bool dec,
@@ -1259,7 +1265,7 @@ private:
     std::unique_ptr<std::atomic<uint8_t>[]> dyn_resv_;   ///< per layer*n_expert: a slot reserved, its read in flight
     struct StageDirect { uint8_t* ptr; int64_t boff; size_t index; };
     std::unordered_map<size_t, StageDirect> stage_direct_;   ///< stage v -> its ring slot (stage_mu_)
-    uint64_t ql_file_off(int64_t layer, int64_t expert) const;   ///< where read_direct reads the blob (11/8 split)
+    uint64_t ql_file_off(int64_t layer, int64_t expert, int drive) const;   ///< where read_direct reads the blob (11/8 split)
     mutable std::mutex dyn_mu_;
     uint8_t* dyn_base_ = nullptr;
     uint64_t dyn_cap_ = 0, dyn_head_ = 0;
@@ -1279,6 +1285,13 @@ private:
     void* split_h_ = nullptr;
     bool split_tried_ = false;
     static constexpr int kSplitFile = 1000;
+    /// QuantLab 11/10: the decode reads experts.v2.bin only (its few blobs a layer wait on each read, and the second
+    /// drive answered them slower: 11/9 decode -1%); the prefill's streams read both drives (11/9 prefill +17.5%).
+    /// STRATA_QL_SPLIT_DECODE=1: the decode reads the copy too, as on 11/8.
+    bool split_decode_ = false;
+    int ql_drive_for(bool dec) const { return split_h_ != nullptr && (!dec || split_decode_) ? 1 : 0; }
+    mutable std::atomic<uint64_t> split_rd_copy_{0}, split_rd_main_{0};   ///< blobs with a copy, read from it / from experts.v2.bin
+    uint64_t split_prev_[2] = {0, 0};
     /// QuantLab 11/8 STRATA_QL_PERSIST_READERS=1: the COLD_OVERLAP reads on 4 kept threads (prefetch_begin / prefetch_end)
     void pr_run(const std::function<void()>& f, size_t n);
     void pr_wait();

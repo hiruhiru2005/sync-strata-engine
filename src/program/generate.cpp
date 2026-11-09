@@ -18424,6 +18424,8 @@ int main(int argc, char** argv) {
             if (srcp == &src) {   // QuantLab 11/8 STRATA_QL_DYN_TIER_GIB: this request's ring of experts read from the file
                 const std::string qd = src.ql_dyn_line();
                 if (!qd.empty()) std::fputs(qd.c_str(), stderr);
+                const std::string qs = src.ql_split_line();   // QuantLab 11/10 STRATA_QL_SPLIT
+                if (!qs.empty()) std::fputs(qs.c_str(), stderr);
                 const std::string qp = src.ql_path_line();
                 if (!qp.empty()) std::fputs(qp.c_str(), stderr);
                 const std::string qa = ql_adapt_line();
