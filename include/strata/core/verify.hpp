@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -676,6 +677,30 @@ private:
     /// QuantLab (11/9): flag B's raise - with STRATA_QL_DMA_GPUFLAG=1 and --pcie-mode dma a kernel on the copy stream
     /// (after the layer's copies, or alone for a layer with none: every raise in order there), else raise_flag
     void raise_flagB(uint32_t want);
+    // QuantLab (11/9) STRATA_QL_DMA_THREAD=1 (with STRATA_QL_DMA_GPUFLAG): the PCIe share's DMA submissions and flag B's
+    // kernels go to a thread of their own, in order, so the pool's thread does not spend the API calls (~22 us a layer on
+    // the RTX 3080 under WDDM) before its own experts.  The window's end waits for the queue (ql_dma_drain) before it syncs
+    // the copy stream.
+    struct QlDmaJob {
+        uint8_t* stage = nullptr;
+        const uint8_t* src[16] = {};
+        size_t sizes[16] = {};
+        int n = 0;
+        size_t bytes = 0;
+        uint32_t want = 0;
+    };
+    static constexpr uint32_t kQlDmaRing = 256;
+    QlDmaJob ql_dma_jobs_[kQlDmaRing];
+    std::atomic<uint32_t> ql_dma_head_{0};   ///< jobs pushed (the pool's thread)
+    std::atomic<uint32_t> ql_dma_done_{0};   ///< jobs submitted (the DMA thread)
+    std::atomic<bool> ql_dma_quit_{false};
+    std::thread ql_dma_thr_;
+    void ql_dma_push(const QlDmaJob& j);
+    void ql_dma_drain();
+    bool ql_dma_pending() const { return ql_dma_done_.load(std::memory_order_acquire) != ql_dma_head_.load(std::memory_order_acquire); }
+    void ql_dma_loop();
+    void ql_dma_stop();
+    void ql_dma_submit(const QlDmaJob& j);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;

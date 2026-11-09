@@ -845,6 +845,18 @@ public:
     /// either expert meanwhile and no exchange may be staged (the caller's device and tiers are quiet).  False, and nothing
     /// changed, when that does not hold.
     bool ql_take_into_ram(int64_t layer, int64_t in, int64_t out, const uint8_t* src, uint64_t src_bytes);
+    /// QuantLab (11/9), STRATA_QL_PIN_SWAP: two experts of `layer` the compact copy holds, one inside the registered
+    /// (GPU-readable) part and one past it, trade places - their bytes and their offsets - so an expert the windows keep
+    /// sending to the CPU because it is not registered becomes one the PCIe share can read.  One size (a copy packed by
+    /// size: both own sizes equal).  Every check is made before a byte moves; the caller's thread, between windows, with
+    /// nothing reading either expert and no exchange staged.  False, nothing changed, when that does not hold.
+    bool ql_swap_pin(int64_t layer, int64_t a, int64_t b);
+    /// The copy is registered only in part (CS-T: complement_pin_limit_ < its bytes): STRATA_QL_PIN_SWAP has work to do.
+    bool ql_partial_pin() const { return complement_ready_ && complement_partial_ && complement_pin_limit_ < complement_bytes_; }
+    /// The bytes an expert's place in the copy holds (its own size when packed by size, else the layer's largest).
+    uint64_t ql_place_bytes(int64_t layer, int64_t expert) const { return blob_len(layer, expert); }
+    int64_t ql_pin_swaps() const { return ql_pin_swaps_; }
+    double ql_pin_swap_ms() const { return ql_pin_swap_ms_; }
     int64_t ram_adapts() const { return ram_adapts_; }
     int64_t ram_staged() const { return ram_staged_; }   ///< of ram_adapts(): copied out of a stage buffer
     // ---- 149-prefetch (STRATA_RAM_ADAPT2): the same promotion, staged.  `ram_stage` queues the read of `in` on an I/O thread
@@ -1151,6 +1163,9 @@ private:
     int64_t ram_adapts_ = 0;                  ///< replace_resident(_staged): experts moved into the compact copy
     int64_t ram_staged_ = 0;                  ///< replace_resident_staged: of those, copied out of a stage buffer
     std::vector<uint8_t> ram_adapt_buf_;      ///< ...one blob, read here before it replaces another
+    std::vector<uint8_t> ql_swap_buf_;        ///< QuantLab STRATA_QL_PIN_SWAP: one blob held while two trade places
+    int64_t ql_pin_swaps_ = 0;                ///< ...pairs swapped (cumulative)
+    double ql_pin_swap_ms_ = 0.0;             ///< ...and the time the copies took (decode thread, between windows)
     // 149-prefetch: the staged promotions (ram_stage / ram_install)
     struct RamJob { int64_t layer, in, out; std::vector<uint8_t> buf; int state; };   ///< state 0 queued, 1 reading, 2 landed, 3 failed
     mutable std::mutex ram_mu_;

@@ -462,6 +462,12 @@ int64_t ql_pcie_group_rows(int64_t dflt) {
     return v > 0 ? v : dflt;
 }
 
+// QuantLab (11/9): STRATA_QL_DMA_THREAD=1 - see Verifier::QlDmaJob (with STRATA_QL_DMA_GPUFLAG=1 and --pcie-mode dma)
+bool ql_dma_thread_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_DMA_THREAD"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
 bool fuse_wait_on() {
 #if defined(STRATA_USE_HIP)
     static const int env = [] {
@@ -741,6 +747,7 @@ Verifier::~Verifier() {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
+    ql_dma_stop();   // QuantLab STRATA_QL_DMA_THREAD: nothing more is submitted on the copy stream
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     for (auto& row : exec_)
@@ -3440,6 +3447,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const OnDevice back(device_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (copy_used_) {
+            ql_dma_drain();
             cudaStreamSynchronize(copy_);
             copy_used_ = false;
         }
@@ -3481,6 +3489,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
+        ql_dma_drain();
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
         copy_used_ = false;
     }
@@ -3645,6 +3654,12 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 }
 
 void Verifier::raise_flagB(uint32_t want) {
+    if (ql_dma_gpuflag() && sink_.pcie_mode == 0 && ql_dma_thread_on()) {
+        QlDmaJob j;
+        j.want = want;
+        ql_dma_push(j);
+        return;
+    }
     if (ql_dma_gpuflag() && sink_.pcie_mode == 0) {
         strata::kernels::set_flag_on_stream(m_flagB_, want, (void*) copy_);
         copy_used_ = true;   // the window's end syncs the copy stream: no raise of this window lands in the next
@@ -3662,6 +3677,19 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     if (n <= 0) { v->raise_flagB(want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
+    if (ql_dma_gpuflag() && ql_dma_thread_on() && n <= 16) {       // QuantLab (11/9): the DMA thread submits them
+        QlDmaJob j;
+        j.stage = stage;
+        j.n = n;
+        j.bytes = bytes;
+        j.want = want;
+        for (int i = 0; i < n; ++i) {
+            j.src[i] = src[i];
+            j.sizes[i] = v->sink_.fetch_sizes != nullptr ? v->sink_.fetch_sizes[i] : bytes;
+        }
+        v->ql_dma_push(j);
+        return;
+    }
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
     // the loop the engine always ran, errors unchecked (it never stops the engine).  A batch mode whose uploads
     // cannot be submitted stops the engine: flag B must not release the consumers to expert weights that were never
@@ -3703,6 +3731,70 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     fs.flag = v->h_flagB_;
     fs.value = want;
     cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+}
+
+void Verifier::ql_dma_push(const QlDmaJob& j) {
+    if (!ql_dma_thr_.joinable()) {
+        ql_dma_quit_.store(false, std::memory_order_relaxed);
+        ql_dma_thr_ = std::thread([this] { ql_dma_loop(); });
+    }
+    const uint32_t h = ql_dma_head_.load(std::memory_order_relaxed);
+    for (uint32_t d = ql_dma_done_.load(std::memory_order_acquire); h - d >= kQlDmaRing; d = ql_dma_done_.load(std::memory_order_acquire))
+        ql_dma_done_.wait(d, std::memory_order_acquire);   // the ring is full: the thread is behind (not expected)
+    ql_dma_jobs_[h % kQlDmaRing] = j;
+    ql_dma_head_.store(h + 1, std::memory_order_release);
+    ql_dma_head_.notify_one();
+    copy_used_ = true;
+}
+
+void Verifier::ql_dma_drain() {
+    const uint32_t h = ql_dma_head_.load(std::memory_order_acquire);
+    for (uint32_t d = ql_dma_done_.load(std::memory_order_acquire); d != h; d = ql_dma_done_.load(std::memory_order_acquire))
+        ql_dma_done_.wait(d, std::memory_order_acquire);
+}
+
+void Verifier::ql_dma_submit(const QlDmaJob& j) {
+    if (j.n > 0) {
+        void* d[16] = {};
+        const void* s[16] = {};
+        size_t b[16] = {};
+        for (int i = 0; i < j.n; ++i) { d[i] = j.stage + (size_t) i * j.bytes; s[i] = j.src[i]; b[i] = j.sizes[i]; }
+        const cudaError_t copied = strata::core::copy_blobs(d, s, b, (size_t) j.n, copy_, strata::core::dma_batch_mode());
+        if (copied != cudaSuccess) {
+            std::fprintf(stderr, "strata DMA (QuantLab thread): expert upload failed: %s\n", cudaGetErrorString(copied));
+            std::fflush(stderr);
+            release_gpu_waits(5000);
+            std::abort();
+        }
+    }
+    strata::kernels::set_flag_on_stream(m_flagB_, j.want, (void*) copy_);
+}
+
+void Verifier::ql_dma_loop() {
+    if (device_ >= 0) cudaSetDevice(device_);
+    uint32_t next = ql_dma_done_.load(std::memory_order_acquire);
+    for (;;) {
+        uint32_t h = ql_dma_head_.load(std::memory_order_acquire);
+        while (h == next) {
+            if (ql_dma_quit_.load(std::memory_order_acquire)) return;
+            ql_dma_head_.wait(h, std::memory_order_acquire);
+            h = ql_dma_head_.load(std::memory_order_acquire);
+        }
+        if (ql_dma_quit_.load(std::memory_order_acquire)) return;   // ql_dma_stop's bump: no job behind it
+        ql_dma_submit(ql_dma_jobs_[next % kQlDmaRing]);
+        ++next;
+        ql_dma_done_.store(next, std::memory_order_release);
+        ql_dma_done_.notify_all();
+    }
+}
+
+void Verifier::ql_dma_stop() {
+    if (!ql_dma_thr_.joinable()) return;
+    ql_dma_drain();
+    ql_dma_quit_.store(true, std::memory_order_release);
+    ql_dma_head_.fetch_add(1, std::memory_order_release);   // a changed head wakes the wait; the loop then sees quit
+    ql_dma_head_.notify_all();
+    ql_dma_thr_.join();
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -4599,6 +4691,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         }
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
+        ql_dma_drain();
         cudaStreamSynchronize(copy_);
         if (prof_on_) collect_profile();
         ++windows;
@@ -4664,6 +4757,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
+    ql_dma_drain();
     cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
     ++windows;
@@ -5181,7 +5275,7 @@ bool Verifier::done(std::string& err) {
     }
     if (q != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(q); return false; }
     if (copy_used_) {   // no host function of this window may raise flag B in the next one
-        if (cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
+        if (ql_dma_pending() || cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
         copy_used_ = false;
     }
     return true;

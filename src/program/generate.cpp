@@ -17581,6 +17581,59 @@ int main(int argc, char** argv) {
                     const char* e = std::getenv("STRATA_RAM_ADAPT");
                     return e != nullptr ? std::max(0, std::atoi(e)) : 0;
                 }();
+                // QuantLab (11/9) STRATA_QL_PIN_SWAP=<n>: the copy is registered for the GPU only in part (Windows: about
+                // half the RAM), so an expert outside VRAM and outside the registered part always runs on the CPU - on the
+                // RTX 3080 a third of the misses (2.45 of 7.4 a layer at --pcie-frac 1.0).  Before a window, while no
+                // adaptive round is in flight, up to n pairs of one layer and one size trade places: the most routed
+                // unregistered expert (decayed count >= STRATA_QL_PIN_SWAP_IN, default 2) against the least routed
+                // registered one (< STRATA_QL_PIN_SWAP_OUT, default 0.5), the largest difference first.  The bytes move
+                // on this thread (three blob copies a pair).
+                static const int ql_pin_swap_n = [] {
+                    const char* e = std::getenv("STRATA_QL_PIN_SWAP");
+                    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+                }();
+                if (ql_pin_swap_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
+                    (!ajob || astate == AState::Idle) && src.ql_partial_pin() && !multi_gpu && !peer.valid() &&
+                    !remote_opt && o.batch == 0) {
+                    static const float kIn = [] { const char* e = std::getenv("STRATA_QL_PIN_SWAP_IN"); return e ? (float) std::atof(e) : 2.0f; }();
+                    static const float kOut = [] { const char* e = std::getenv("STRATA_QL_PIN_SWAP_OUT"); return e ? (float) std::atof(e) : 0.5f; }();
+                    struct PinSwap { float gain; int32_t layer, in, out; };
+                    std::vector<PinSwap> swaps;
+                    std::vector<int32_t> ins, outs;
+                    for (int64_t l = 0; l < g.n_layers; ++l) {
+                        const float* u = drive.d.usage.data() + l * g.n_expert;
+                        const int32_t* r = host_res.data() + l * g.n_expert;
+                        ins.clear();
+                        outs.clear();
+                        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                            if (r[e] >= 0 || !src.has_resident(l, e)) continue;   // in VRAM, or not in the RAM copy
+                            if (src.pinned(l, e)) { if (u[e] < kOut) outs.push_back(e); }
+                            else if (u[e] >= kIn) ins.push_back(e);
+                        }
+                        if (ins.empty() || outs.empty()) continue;
+                        std::sort(ins.begin(), ins.end(), [&](int32_t x, int32_t y) { return u[x] > u[y]; });
+                        std::sort(outs.begin(), outs.end(), [&](int32_t x, int32_t y) { return u[x] < u[y]; });
+                        std::vector<char> used(outs.size(), 0);
+                        int per_layer = 0;
+                        for (int32_t in : ins) {
+                            if (per_layer >= ql_pin_swap_n) break;
+                            const uint64_t sz = src.ql_place_bytes(l, in);
+                            for (size_t j = 0; j < outs.size(); ++j) {
+                                if (used[j] || src.ql_place_bytes(l, outs[j]) != sz) continue;
+                                used[j] = 1;
+                                swaps.push_back({u[in] - u[outs[j]], (int32_t) l, in, outs[j]});
+                                ++per_layer;
+                                break;
+                            }
+                        }
+                    }
+                    std::sort(swaps.begin(), swaps.end(), [](const PinSwap& a, const PinSwap& b) { return a.gain > b.gain; });
+                    int done_n = 0;
+                    for (const PinSwap& x : swaps) {
+                        if (done_n >= ql_pin_swap_n) break;
+                        if (src.ql_swap_pin(x.layer, x.in, x.out)) ++done_n;
+                    }
+                }
                 if (ram_adapt_n > 0 && ram_adapt2.on && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
                     !remote_opt && o.batch == 0) {
@@ -18245,6 +18298,10 @@ int main(int argc, char** argv) {
                                      "%lld installed, %lld skipped at the install (%lld of them: the GPU tier took one of the pair)\n",
                              (long long) src.ram_staged_reads(),
                              (long long) ram_adapt2.installed, (long long) (src.ram_install_skips() + src.ram_install_gpu()), (long long) src.ram_install_gpu());
+            if (src.ql_pin_swaps() > 0)   // QuantLab STRATA_QL_PIN_SWAP, cumulative
+                std::fprintf(stderr, "strata serve: QuantLab pin swaps (STRATA_QL_PIN_SWAP): %lld pairs traded places across the "
+                                     "registered part, %.2f ms each\n", (long long) src.ql_pin_swaps(),
+                             src.ql_pin_swap_ms() / (double) src.ql_pin_swaps());
             if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
                 std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in in place of unused ones, %lld of "
                                      "them out of a stage buffer (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts(),

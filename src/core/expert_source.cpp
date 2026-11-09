@@ -5310,6 +5310,44 @@ bool FileExpertSource::ql_take_into_ram(int64_t layer, int64_t in, int64_t out, 
     return moved;
 }
 
+// QuantLab (11/9), STRATA_QL_PIN_SWAP: see the header.  The registered part is the copy's prefix (CS-T), so the place
+// decides: after the swap `a` reads from `b`'s old place and the reverse; pinned() and device_alias() follow the offsets.
+bool FileExpertSource::ql_swap_pin(int64_t layer, int64_t a, int64_t b) {
+    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
+        layer < 0 || layer >= n_layers_ || a < 0 || b < 0 || a >= n_expert_ || b >= n_expert_ || a == b)
+        return false;
+    const size_t ia = (size_t) layer * (size_t) n_expert_ + (size_t) a;
+    const size_t ib = (size_t) layer * (size_t) n_expert_ + (size_t) b;
+    if (ia >= complement_offsets_.size() || ib >= complement_offsets_.size()) return false;
+    if (!override_.empty() && (override_[ia] != nullptr || override_[ib] != nullptr)) return false;
+    if (!soft_in_.empty() && (soft_in_[ia] != SIZE_MAX || soft_in_[ib] != SIZE_MAX)) return false;
+    const uint64_t oa = complement_offsets_[ia], ob = complement_offsets_[ib];
+    if (oa == kNoComplement || ob == kNoComplement) return false;
+    if (pinned(layer, a) == pinned(layer, b)) return false;   // only across the registered part's end
+    const bool packed = fes_pack(n_layers_);
+    const uint64_t la = blob_len(layer, a), lb = blob_len(layer, b);
+    const uint64_t room = packed ? la : layer_blob_bytes_[(size_t) layer];
+    if ((packed && la != lb) || la > room || lb > room) return false;
+    if (oa > complement_bytes_ || room > complement_bytes_ - oa || ob > complement_bytes_ || room > complement_bytes_ - ob)
+        return false;
+    if (ram_queued(layer, a) || ram_queued(layer, b)) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    // #2134: a Foresight slot may be copying out of either place; it is dropped (never served) before the place is rewritten
+    ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
+    if (fs != nullptr) { fs->hold(layer, (int32_t) a); fs->hold(layer, (int32_t) b); }
+    if (ql_swap_buf_.size() < (size_t) room) ql_swap_buf_.resize((size_t) room);
+    uint8_t* pa = (uint8_t*) complement_host_ + (size_t) oa;
+    uint8_t* pb = (uint8_t*) complement_host_ + (size_t) ob;
+    std::memcpy(ql_swap_buf_.data(), pa, (size_t) la);
+    std::memcpy(pa, pb, (size_t) lb);
+    std::memcpy(pb, ql_swap_buf_.data(), (size_t) la);
+    std::swap(complement_offsets_[ia], complement_offsets_[ib]);
+    if (fs != nullptr) { fs->unhold(layer, (int32_t) b); fs->unhold(layer, (int32_t) a); }
+    ++ql_pin_swaps_;
+    ql_pin_swap_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
 // ---- 149-prefetch: staged promotions.  The read of `in` runs on this source's own thread (one at a time: the drive's
 // queue stays the decode's first); the install is the decode thread's (ram_install, at a window boundary).
 bool FileExpertSource::ram_stage(int64_t layer, int64_t in, int64_t out) {
