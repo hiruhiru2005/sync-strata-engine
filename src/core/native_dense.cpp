@@ -139,6 +139,32 @@ bool hc_q8_name(const std::string& name) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+// QuantLab (11/9) STRATA_QL_HC_I8=1: the down / up Q8_0 copies repacked for the int8 read (fused_gr_q8_split); not with
+// the Q8_0 inject rows (that read takes the bf16 ones)
+bool ql_hc_i8_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QL_HC_I8");
+        if (v == nullptr || v[0] != '1') return false;
+        const char* qi = std::getenv("STRATA_HC_Q8_INJECT");
+        if (qi != nullptr && qi[0] == '1') {
+            std::fprintf(stderr, "strata: STRATA_QL_HC_I8 is off: it does not take STRATA_HC_Q8_INJECT=1\n");
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+// repacks one down / up copy for the int8 read (the inject rows keep the Q8_0 layout)
+bool ql_hc_i8_split(const std::string& name, void* p, uint64_t bytes, uint64_t& count, std::string& err) {
+    if (!ql_hc_i8_env() || name.ends_with("_inject.weight")) return true;
+    if (!strata::kernels::fused_gr_q8_split((uint8_t*) p, (int64_t) (bytes / 34), nullptr)) {
+        err = "native dense (STRATA_QL_HC_I8): repacking " + name + " failed";
+        return false;
+    }
+    strata::kernels::fused_gr_set_q8_i8(1);
+    ++count;
+    return true;
+}
 // S25: the GGUF keeps the inject rows as F32 - quantized here to Q8_0 (ggml's reference rounding) so the Q8_0 read
 // covers every hc projection
 uint16_t half_bits(float f) {
@@ -497,6 +523,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::set<std::string> seen;
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
+        uint64_t ql_i8_count = 0;   // QuantLab STRATA_QL_HC_I8: down / up copies repacked
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -687,6 +714,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     ref.hc_q8 = p;
                     weights_.push_back(p);
                     hc_q8_bytes += bytes;
+                    if (!ql_hc_i8_split(tensor.name, p, bytes, ql_i8_count, err)) return false;
                 }
         }
         if (hc_q8_env()) {
@@ -717,6 +745,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 } else {
                     strata::kernels::fused_gr_quantize_q8_0((const uint16_t*) ref.data, (uint8_t*) p, (int64_t) nb, nullptr);
                 }
+                if (!ql_hc_i8_split(name, p, bytes, ql_i8_count, err)) return false;   // (after the quantization, same stream)
                 ref.hc_q8 = p;
                 hc_q8_bytes += bytes;
                 allocated += alloc_bytes(bytes);
@@ -786,6 +815,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (hc_q8_env())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);
+        if (ql_i8_count > 0)
+            std::fprintf(stderr, "strata: STRATA_QL_HC_I8=1: %llu down / up projections repacked for the int8 hyper-connection read\n",
+                         (unsigned long long) ql_i8_count);
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();

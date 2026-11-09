@@ -60,6 +60,13 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 /// The inverse for a path with no Q8 kernel: bf16 (round to nearest even) of d * q for `n_blocks` Q8_0 blocks.
 void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, void* stream);
 void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream);
+/// QuantLab (11/9) STRATA_QL_HC_I8=1: the Q8_0 read with int8 activations (dp4a; output-changing).  fused_gr_q8_split
+/// repacks one Q8_0 matrix in place (every block's 32 codes, then every fp16 scale: the same bytes); once every hc_q8
+/// down / up matrix is repacked, fused_gr_set_q8_i8(1) makes fused_gr_read_multi's Q8_0 read and fused_gr_dequant_q8_0
+/// take that layout.  The inject rows stay bf16 (not with STRATA_HC_Q8_INJECT); the read writes no q8_1 image.
+bool fused_gr_q8_split(uint8_t* q8, int64_t n_blocks, void* stream);
+void fused_gr_set_q8_i8(int on);
+int fused_gr_q8_i8();
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four

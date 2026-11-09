@@ -159,6 +159,11 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &dqu, qu.size()); cudaMemcpy(dqu, qu.data(), qu.size(), cudaMemcpyHostToDevice);
         cudaMalloc((void**) &dqm, (size_t) TM * (N / 32) * 36); cudaMalloc((void**) &dcnt, (N / 32) * 4);
         cudaMemset(dcnt, 0, (N / 32) * 4);
+        uint8_t *dqd_s, *dqu_s;   // QuantLab (11/9): the same Q8_0 bytes in the int8 read's split layout
+        cudaMalloc((void**) &dqd_s, qd.size()); cudaMemcpy(dqd_s, dqd, qd.size(), cudaMemcpyDeviceToDevice);
+        cudaMalloc((void**) &dqu_s, qu.size()); cudaMemcpy(dqu_s, dqu, qu.size(), cudaMemcpyDeviceToDevice);
+        K::fused_gr_q8_split(dqd_s, (int64_t) (qd.size() / 34), s);
+        K::fused_gr_q8_split(dqu_s, (int64_t) (qu.size() / 34), s);
         for (int T = t_lo; T <= t_hi; ++T) for (int apply = 0; apply < 2; ++apply) {
             K::FusedGrArgs a[TM];
             for (int t = 0; t < T; ++t) {
@@ -168,11 +173,12 @@ int main(int argc, char** argv) {
                 a[t].lo = dlo + (size_t) t * LR; a[t].rs = drs + (size_t) t * HC;
                 a[t].inject_out = dio + (size_t) t * HC; a[t].mixed = dmix + (size_t) t * N;
             }
-            std::vector<float> o[2];
+            std::vector<float> o[3];
             std::vector<uint8_t> img;
-            for (int q = 0; q < 2; ++q) {
+            for (int q = 0; q < 3; ++q) {
+                K::fused_gr_set_q8_i8(q == 2);
                 for (int t = 0; t < T; ++t) {
-                    a[t].q8_down = q ? dqd : nullptr; a[t].q8_up = q ? dqu : nullptr;
+                    a[t].q8_down = q == 2 ? dqd_s : q ? dqd : nullptr; a[t].q8_up = q == 2 ? dqu_s : q ? dqu : nullptr;
                     a[t].q8_mixed = (uint8_t*) dqm + (size_t) t * (N / 32) * 36; a[t].q8_cnt = dcnt;
                 }
                 cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
@@ -185,7 +191,19 @@ int main(int argc, char** argv) {
                 cudaMemcpy(p, dmix, (size_t) T * N * 4, cudaMemcpyDeviceToHost); p += (size_t) T * N;
                 cudaMemcpy(p, dR, (size_t) T * D * 4, cudaMemcpyDeviceToHost); p += (size_t) T * D;
                 cudaMemcpy(p, dio, (size_t) T * HC * 4, cudaMemcpyDeviceToHost);
-                if (q) { img.resize((size_t) T * (N / 32) * 36); cudaMemcpy(img.data(), dqm, img.size(), cudaMemcpyDeviceToHost); }
+                if (q == 1) { img.resize((size_t) T * (N / 32) * 36); cudaMemcpy(img.data(), dqm, img.size(), cudaMemcpyDeviceToHost); }
+            }
+            K::fused_gr_set_q8_i8(0);
+            {   // the int8 read against the Q8_0 read (fp32 activations) and the bf16 read: mixed, R (apply), inject
+                auto rel = [&](int x, int y, size_t b0, size_t n) {
+                    double nu = 0, de = 0;
+                    for (size_t i = b0; i < b0 + n; ++i) { nu += std::pow(o[x][i] - o[y][i], 2); de += std::pow(o[y][i], 2); }
+                    return std::sqrt(nu / (de > 0 ? de : 1));
+                };
+                const size_t mb = (size_t) T * LR, mn = (size_t) T * N, rb = mb + mn, rn2 = (size_t) T * D, ib = rb + rn2, in2 = (size_t) T * HC;
+                std::printf("I8 T %d apply %d | rel rms mixed vs Q8 %.4f vs bf16 %.4f (Q8 vs bf16 %.4f) | R vs Q8 %.2e | inject vs Q8 %.4f vs bf16 %.4f\n",
+                            T, apply, rel(2, 1, mb, mn), rel(2, 0, mb, mn), rel(1, 0, mb, mn), rel(2, 1, rb, rn2),
+                            rel(2, 1, ib, in2), rel(2, 0, ib, in2));
             }
             unsigned long long hq = 1469598103934665603ull;   // FNV-1a of the Q8 read's outputs and q8_1 image
             for (size_t b = 0; b < o[1].size() * 4; ++b) hq = (hq ^ ((const unsigned char*) o[1].data())[b]) * 1099511628211ull;
@@ -215,7 +233,7 @@ int main(int argc, char** argv) {
         // the engine reads a different layer's weights every time: rotate over `cold_sets` copies (13 MB each)
         std::vector<uint16_t*> cwd(cold_sets), cwu(cold_sets), cwi(cold_sets);
         const std::vector<uint8_t> qd = q8_0_of_bf16(wd, D), qu = q8_0_of_bf16(wu, LR);
-        std::vector<uint8_t*> cqd(cold_sets), cqu(cold_sets);
+        std::vector<uint8_t*> cqd(cold_sets), cqu(cold_sets), cqd_s(cold_sets), cqu_s(cold_sets);
         std::vector<float*> cwn(cold_sets);
         for (int c = 0; c < cold_sets; ++c) {
             cudaMalloc((void**) &cwd[c], wd.size() * 2); cudaMemcpy(cwd[c], wd.data(), wd.size() * 2, cudaMemcpyHostToDevice);
@@ -223,6 +241,10 @@ int main(int argc, char** argv) {
             cudaMalloc((void**) &cwi[c], wi.size() * 2); cudaMemcpy(cwi[c], wi.data(), wi.size() * 2, cudaMemcpyHostToDevice);
             cudaMalloc((void**) &cqd[c], qd.size()); cudaMemcpy(cqd[c], qd.data(), qd.size(), cudaMemcpyHostToDevice);
             cudaMalloc((void**) &cqu[c], qu.size()); cudaMemcpy(cqu[c], qu.data(), qu.size(), cudaMemcpyHostToDevice);
+            cudaMalloc((void**) &cqd_s[c], qd.size()); cudaMemcpy(cqd_s[c], qd.data(), qd.size(), cudaMemcpyHostToDevice);
+            cudaMalloc((void**) &cqu_s[c], qu.size()); cudaMemcpy(cqu_s[c], qu.data(), qu.size(), cudaMemcpyHostToDevice);
+            K::fused_gr_q8_split(cqd_s[c], (int64_t) (qd.size() / 34), s);
+            K::fused_gr_q8_split(cqu_s[c], (int64_t) (qu.size() / 34), s);
             cudaMalloc((void**) &cwn[c], wn.size() * 4); cudaMemcpy(cwn[c], wn.data(), wn.size() * 4, cudaMemcpyHostToDevice);
         }
         uint8_t* dqm; unsigned* dcnt;   // the q8_1 image of mixed (STRATA_QFUSE_HC) as the engine asks for it
@@ -233,8 +255,9 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &dst, (size_t) iters * 4 * 8);
         std::vector<unsigned long long> hst((size_t) iters * 4);
         std::vector<K::FusedGrArgs> as((size_t) cold_sets * 8);
-        for (int T = t_lo; T <= t_hi; ++T) for (int f = 0; f < 3; ++f) {
+        for (int T = t_lo; T <= t_hi; ++T) for (int f = 0; f < 4; ++f) {   // f 3: QuantLab's int8 read
             K::fused_gr_set_fast(f == 1);
+            K::fused_gr_set_q8_i8(f == 3);
             for (int c = 0; c < cold_sets; ++c)
                 for (int t = 0; t < T; ++t) {
                     K::FusedGrArgs& a = as[(size_t) c * 8 + t];
@@ -244,6 +267,7 @@ int main(int argc, char** argv) {
                     a.w_norm = cwn[c]; a.w_down = cwd[c]; a.w_up = cwu[c]; a.w_inject = cwi[c];
                     if (with_q) { a.q8_mixed = dqm + (size_t) t * (N / 32) * 36; a.q8_cnt = dcnt; }
                     if (f == 2) { a.q8_down = cqd[c]; a.q8_up = cqu[c]; }
+                    if (f == 3) { a.q8_down = cqd_s[c]; a.q8_up = cqu_s[c]; }
                     a.lo = dlo + (size_t) t * LR; a.rs = drs + (size_t) t * HC;
                     a.inject_out = dio + (size_t) t * HC; a.mixed = dmix + (size_t) t * N;
                 }
@@ -272,6 +296,7 @@ int main(int argc, char** argv) {
             std::printf("COLD(%d sets) fast %d T %d | read %6.1f us (events) | stamps median: norm %5.1f down %5.1f up %5.1f us (incl. a stamp kernel each)\n",
                         cold_sets, f, T, 1e3 * ms / iters, med(n_), med(d_), med(u_));
         }
+        K::fused_gr_set_q8_i8(0);
     }
     std::printf("fused_gr_bench: %d differing\n", failures);
     return failures ? 1 : 0;
