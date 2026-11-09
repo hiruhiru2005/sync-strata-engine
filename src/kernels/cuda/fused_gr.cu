@@ -1721,8 +1721,8 @@ __device__ __forceinline__ float4 q8_four(uint32_t q, float d) {
                        d * (float) (int8_t) ((q >> 16) & 255u), d * (float) (int8_t) (q >> 24));
 }
 
-template <int T, int MINB = 1>
-__global__ void __launch_bounds__(THREADS, MINB) gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
     __shared__ __align__(16) float xs[T][Q8_KC];
     __shared__ float red[WARPS][T];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -2477,10 +2477,8 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
     static const bool ql_lo = [] { const char* v = std::getenv("STRATA_QL_HC_LO"); return v && v[0] == '1'; }();
     static const int ql_up2 = [] { const char* v = std::getenv("STRATA_QL_HC_UP2"); const int c = v ? std::atoi(v) : 0; return c == 8 || c == 4 ? c : 0; }();
-    static const bool ql_down3 = [] { const char* v = std::getenv("STRATA_QL_HC_DOWN3"); return v && v[0] == '1'; }();
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
-    else if (ql_down3) gr_down_q8_kernel<T, 3><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     else gr_down_q8_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
 #if !STRATA_GR_FAST_BUILD
