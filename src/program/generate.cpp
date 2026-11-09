@@ -449,6 +449,12 @@ static bool ql_adapt_in_prompt() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_ADAPT_IN_PROMPT"); return v && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (11/9): STRATA_QL_SESSION_ROOT=1 - a saved session (the streamed save, STRATA_QL_SESSION_STREAM=1) also keeps
+// the chain's root checkpoint (the end of the system prompt), so a new chat restored from it reuses the system prompt.
+static bool ql_session_root() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_SESSION_ROOT"); return v && std::atoi(v) != 0; }();
+    return on;
+}
 // QuantLab (10/28): adaptive swaps on a per-expert K (mixed) layer, STRATA_QL_SWAP_MIXED=1 (opt-in until measured).
 // An exchange puts `in` into `out`'s GPU slot and `out` into `in`'s place in the packed RAM copy, and both are sized to
 // their expert - so a mixed layer pairs only experts of one blob size.  Off: a mixed layer makes no pairs.
@@ -14312,6 +14318,20 @@ int main(int argc, char** argv) {
                             }
                             const ConvCheckpoint* deepest = strata::core::session_deepest_checkpoint(checks);
                             std::vector<const ConvCheckpoint*> disk_checks;
+                            // QuantLab (11/9) STRATA_QL_SESSION_ROOT=1: the file also keeps the chain's root (its shallowest
+                            // checkpoint: the end of the system prompt and the tools, --prompt-cache-root), so a NEW chat
+                            // of the same client restored from it reads only what follows its system prompt (the session
+                            // proxy restores the file whose tools and system message match).  Written first (shallower).
+                            if (deepest != nullptr && ql_session_root()) {
+                                const ConvCheckpoint* root = nullptr;
+                                for (const ConvCheckpoint& c : checks)
+                                    if (root == nullptr || c.ids.size() < root->ids.size()) root = &c;
+                                if (root != nullptr && root != deepest && root->ids.size() < deepest->ids.size() &&
+                                    (int64_t) root->ids.size() >= std::max<int64_t>(1, o.prompt_cache_root) &&
+                                    root->ids.size() <= live.size() &&
+                                    std::equal(root->ids.begin(), root->ids.end(), live.begin()))
+                                    disk_checks.push_back(root);
+                            }
                             if (deepest != nullptr) disk_checks.push_back(deepest);
                             kept = disk_checks.size();
                             const std::vector<ConvCheckpoint> no_checks;
