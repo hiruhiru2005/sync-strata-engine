@@ -1721,8 +1721,8 @@ __device__ __forceinline__ float4 q8_four(uint32_t q, float d) {
                        d * (float) (int8_t) ((q >> 16) & 255u), d * (float) (int8_t) (q >> 24));
 }
 
-template <int T>
-__global__ void __launch_bounds__(THREADS) gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
+template <int T, int MINB = 1>
+__global__ void __launch_bounds__(THREADS, MINB) gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
     __shared__ __align__(16) float xs[T][Q8_KC];
     __shared__ float red[WARPS][T];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -2382,12 +2382,105 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_lo_kernel(GrMulti m, const f
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
 }
 
+// QuantLab (11/9) STRATA_QL_HC_UP2=<cols> (8 or 4, with lo from gr_lo_q8_kernel): gr_up_q8's rows with <cols> columns a
+// block instead of 16, so 2x / 4x the blocks (ncu on the RTX 3080: 160 blocks, 19 of 48 warps a SM resident, DRAM 15%,
+// 28.8 us at T 4), and each warp's rows (4 / 2) loaded before their dots.  Every value is gr_up_q8_kernel's expression
+// in its order: the same bits.
+template <int T, int COLS>
+__global__ void __launch_bounds__(THREADS) gr_up_q8_lo2_kernel(GrMulti m, const float* __restrict__ ssg,
+                                                               const float* __restrict__ lo_g) {
+    constexpr int RPW = HC * COLS / WARPS;   // rows a warp: 4 (COLS 8) or 2 (COLS 4)
+    static_assert(RPW >= 1 && HC * COLS == RPW * WARPS, "gr_up_q8_lo2_kernel: COLS must give whole rows a warp");
+    __shared__ __align__(16) float lo[T][LR];
+    __shared__ float rsS[T][HC];
+    __shared__ float g[T][HC][COLS];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int d0 = blockIdx.x * COLS;
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        rsS[k][c] = rsqrtf(ss / (float) N + m.a[k].eps);
+    }
+    for (int i = t; i < T * LR; i += THREADS) (&lo[0][0])[i] = lo_g[i];
+    float4 w[RPW][3];
+    float rv[RPW], wn[RPW], bo[RPW], ip[RPW];
+    bool apply = false;
+#pragma unroll
+    for (int h = 0; h < RPW; ++h) {   // every row's loads before the barrier (they need nothing of the block's)
+        const int r = warp + h * WARPS;
+        const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[h][s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[h][s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        rv[h] = 0.0f; wn[h] = 0.0f; bo[h] = 0.0f; ip[h] = 0.0f;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv[h] = a.R[i];
+            wn[h] = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo[h] = a.bo_prev[d0 + dd]; ip[h] = a.inj_prev[c]; }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < RPW; ++h) {
+        const int r = warp + h * WARPS;
+        const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const float4 x = *reinterpret_cast<const float4*>(&lo[k][v]);
+                    acc = fmaf(w[h][s].x, x.x, acc); acc = fmaf(w[h][s].y, x.y, acc);
+                    acc = fmaf(w[h][s].z, x.z, acc); acc = fmaf(w[h][s].w, x.w, acc);
+                }
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            float rr = rv[h];
+            if (apply) {
+                rr = fmaf(bo[h], 2.0f * sigmoidf_(ip[h] / (float) HC), rr);
+                m.a[lane].R_out[i] = rr;
+            }
+            const float x = rr * wn[h] * rsS[lane][c];
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * COLS; i += THREADS) {
+        const int k = i / COLS, col = i - k * COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+}
+
 template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cudaStream_t st, unsigned long long* stamp_buf,
                                   int stamp_i0) {
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
     static const bool ql_lo = [] { const char* v = std::getenv("STRATA_QL_HC_LO"); return v && v[0] == '1'; }();
+    static const int ql_up2 = [] { const char* v = std::getenv("STRATA_QL_HC_UP2"); const int c = v ? std::atoi(v) : 0; return c == 8 || c == 4 ? c : 0; }();
+    static const bool ql_down3 = [] { const char* v = std::getenv("STRATA_QL_HC_DOWN3"); return v && v[0] == '1'; }();
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    else if (ql_down3) gr_down_q8_kernel<T, 3><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     else gr_down_q8_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
 #if !STRATA_GR_FAST_BUILD
@@ -2396,6 +2489,13 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
         return;
     }
 #endif
+    if (ql_up2 != 0 && m.a[0].q8_mixed == nullptr) {   // QuantLab (11/9): lo once, then the up rows over 2x / 4x the blocks
+        float* lo_g = ssg + (size_t) T * Q8_NKC;
+        gr_lo_q8_kernel<T><<<(unsigned) ((T * PR + 255) / 256), 256, 0, st>>>(m, part, ssg, lo_g);
+        if (ql_up2 == 8) gr_up_q8_lo2_kernel<T, 8><<<N / 8, THREADS, 0, st>>>(m, ssg, lo_g);
+        else gr_up_q8_lo2_kernel<T, 4><<<N / 4, THREADS, 0, st>>>(m, ssg, lo_g);
+        return;
+    }
     if (ql_lo) {   // QuantLab (11/9): lo once, then the up rows (the scratch holds T x 10240 floats; part + ssg take T x 5200)
         float* lo_g = ssg + (size_t) T * Q8_NKC;
         gr_lo_q8_kernel<T><<<(unsigned) ((T * PR + 255) / 256), 256, 0, st>>>(m, part, ssg, lo_g);
