@@ -6,6 +6,15 @@
 #pragma once
 #include "tq.cuh"
 
+// QuantLab (11/11): STRATA_QL_TQ_MMQ_SMEM=1 (at build; default 0) - each tile load first copies the 4 KB int8 codebook
+// to shared memory (the block's threads, then a barrier) and the lanes decode from that copy instead of 8 global
+// lookups per 16 weights (the MMQ T=4 profile: long scoreboard 28%, LG throttle 26%).  The same entries: bitwise the
+// same tiles and output.  The copy is made at every tile load (the loader does not know the block's first one); the
+// tile loads of a block are block-uniform, so the barrier is reached by every thread.
+#ifndef STRATA_QL_TQ_MMQ_SMEM
+#define STRATA_QL_TQ_MMQ_SMEM 0
+#endif
+
 // Trellis types (TQ2_T, TQK6, TQK7): a 128-weight block is TQ_LANES lanes of 16 weights. Each lane
 // decodes its 4 trellis steps and requantizes them to int8 with one scale per 16 weights, filling
 // the Q8_0_16 tile layout (as IQ2_XS). One MMQ_ITER_K slice of a row is 2 blocks = 16 lanes.
@@ -36,6 +45,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = kqsx / TQ_LANES;
     const int lane = kqsx % TQ_LANES;
 
+#if STRATA_QL_TQ_MMQ_SMEM
+    __shared__ alignas(16) uint16_t s_tq_lut[TQ_LUT_POINTS];
+    for (int t = threadIdx.y*warp_size + threadIdx.x; t < TQ_LUT_POINTS/2; t += nwarps*warp_size) {
+        ((uint32_t *) s_tq_lut)[t] = ((const uint32_t *) tq_lut_i8)[t];
+    }
+    __syncthreads();
+    const uint16_t * lut = s_tq_lut;
+#else
+    const uint16_t * lut = tq_lut_i8;
+#endif // STRATA_QL_TQ_MMQ_SMEM
+
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
@@ -47,7 +67,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_t * bxi = (const block_t *) x + kbx0 + i*stride + kbx;
 
         int q[TQ_STEPS_LANE];
-        const float dq = tq_lane_to_q8<tq_type>(bxi, lane, q);
+        const float dq = tq_lane_to_q8<tq_type>(bxi, lane, q, lut);
 
 #pragma unroll
         for (int k = 0; k < TQ_STEPS_LANE; ++k) {

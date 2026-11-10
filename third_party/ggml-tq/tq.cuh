@@ -191,8 +191,11 @@ static __device__ __forceinline__ void tqp_states8(const uint8_t * qs, const int
 
 // MMQ (batched) path: lane l of block x as 16 int8 values (4 packed ints, weight order) with one float scale per
 // lane, i.e. weights ~= scale * q.  The int8 codebook (one global scale) is already int8: no decode to float.
+// QuantLab (11/11): `lut` is the int8 codebook to read: the global tq_lut_i8 (default) or its copy in shared memory
+// (STRATA_QL_TQ_MMQ_SMEM, tq-mmq-tiles.cuh) - the same entries either way.
 template <ggml_type type>
-static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int l, int q[TQ_STEPS_LANE]) {
+static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int l, int q[TQ_STEPS_LANE],
+                                                      const uint16_t * __restrict__ lut = tq_lut_i8) {
     typedef typename tq_block_info<type>::block_t block_t;
     const block_t * b = (const block_t *) x;
 
@@ -202,8 +205,8 @@ static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int 
         tqp_states8<type>(b->qs, l, s);
 #pragma unroll
         for (int i = 0; i < TQ_STEPS_LANE; ++i) {
-            const uint32_t p0 = tq_lut_i8[((s[2 * i] & TQ_STATE_MASK) * 0x9e3779b1u) >> 21];
-            const uint32_t p1 = tq_lut_i8[((s[2 * i + 1] & TQ_STATE_MASK) * 0x9e3779b1u) >> 21];
+            const uint32_t p0 = lut[((s[2 * i] & TQ_STATE_MASK) * 0x9e3779b1u) >> 21];
+            const uint32_t p1 = lut[((s[2 * i + 1] & TQ_STATE_MASK) * 0x9e3779b1u) >> 21];
             q[i] = (int) (p0 | (p1 << 16));
         }
     } else {
@@ -212,7 +215,7 @@ static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int 
 #pragma unroll
         for (int i = 0; i < TQ_STEPS_LANE; ++i) {
             const uint32_t xh = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
-            q[i] = (int) ((uint32_t) tq_lut_i8[xh >> 21] | ((uint32_t) tq_lut_i8[(xh >> 10) & 2047u] << 16));
+            q[i] = (int) ((uint32_t) lut[xh >> 21] | ((uint32_t) lut[(xh >> 10) & 2047u] << 16));
         }
     }
     // Strata's block structs hold the fp16 scale as uint16_t (the fork's as ggml_half): reinterpret, do not convert
