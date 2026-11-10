@@ -939,8 +939,13 @@ template<int TY> inline constexpr bool kq_type = (TY == 12 || TY == 13 || TY == 
 inline bool g_kq_split = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }();
 template<int TY> inline bool split_off() { return kq_type<TY> && !g_kq_split; }
 template<int TY> inline constexpr bool kTqType = (TY == 144 || TY == 145 || TY == 146);
+// QuantLab (11/11): every type that decodes through SplitTq (tq_load): the APR types and the per-expert K rates
+// (150 151 162 163 169-174).  Only the single-matrix mmvq stages these extra ones (kStageIqGrid, stage_iq_grid,
+// IqGridWords below); no grouped expert kernel is instantiated for them, so the expert launchers are unchanged.
+template<int TY> inline constexpr bool kTqMixType = (TY == 150 || TY == 151 || TY == 162 || TY == 163 || (TY >= 169 && TY <= 174));
+template<int TY> inline constexpr bool kTqAnyType = kTqType<TY> || kTqMixType<TY>;
 // the trellis types stage their int8 codebook (4 KB) too, but only where it pays: tq_stage_on() below (compute capability 6.0)
-template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29 || kTqType<TY>);
+template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29 || kTqAnyType<TY>);
 
 template<> inline constexpr bool kSplit<16> = true;
 template<> struct Split<16> {   // IQ2_XXS
@@ -1878,7 +1883,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
         stage_iq3xxs_masks(s_buf, tid, nthreads);
         __syncthreads();
         return s_buf;
-    } else if constexpr (kTqType<TY>) {
+    } else if constexpr (kTqAnyType<TY>) {
         // the trellis types' int8 codebook: 2048 u16 (4 KB), read by 8 random lookups per 16 weights
         const uint32_t* src = (const uint32_t*) tq_lut_i8;
         for (int i = tid; i < 1024; i += nthreads) s_buf[i] = src[i];
@@ -1899,7 +1904,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
 
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 struct IqGridWords {
-    static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29) ? 2048 : (TY == 17 || TY == 21 || kTqType<TY>) ? 1024 : (TY == 16 || TY == 18) ? 512 : 4;
+    static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29) ? 2048 : (TY == 17 || TY == 21 || kTqAnyType<TY>) ? 1024 : (TY == 16 || TY == 18) ? 512 : 4;
 };
 
 // mmvq_kernel with the columns taken NC at a time.  After warp_sum every lane holds the same sum, so lane c stores
@@ -2596,7 +2601,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                              float* __restrict__ gate, float* __restrict__ up) {
+                                                              float* __restrict__ gate, float* __restrict__ up, int rch) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     __shared__ __align__(16) uint16_t s_lut[STAGED ? 2048 : 8];
@@ -2605,7 +2610,8 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
         __syncthreads();
     }
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
+    for (int ch = 0; ch < rch; ++ch) {   // QuantLab (11/11): rch chunks of GU_ROWS rows per block (1: the old launch)
+    const int row = (blockIdx.x * rch + ch) * GU_ROWS + warp;             // 0 .. 2*n_ff
     if (row >= 2 * L.n_ff) return;
     const bool is_up = row >= L.n_ff;
     const int r = is_up ? row - (int) L.n_ff : row;
@@ -2644,6 +2650,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
             default: break;   // (refused at startup: tq_mix_supported)
         }
     }
+    }   // the row chunks
 }
 
 template<bool STAGED>
@@ -2652,7 +2659,7 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
                                                                 const int32_t* __restrict__ n_groups,
                                                                 const int32_t* __restrict__ ent_dst,
                                                                 const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                                float* __restrict__ out) {
+                                                                float* __restrict__ out, int rch) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     __shared__ __align__(16) uint16_t s_lut[STAGED ? 2048 : 8];
@@ -2661,7 +2668,8 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
         __syncthreads();
     }
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r = blockIdx.x * 8 + warp;
+    for (int ch = 0; ch < rch; ++ch) {   // QuantLab (11/11): rch chunks of 8 rows per block (1: the old launch)
+    const int r = (blockIdx.x * rch + ch) * 8 + warp;
     if (r >= L.n_embd) return;
     const int nb = (int) (L.n_ff / 128), hb = (int) (L.n_ff / 32), nbg = (int) (L.n_embd / 128);
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
@@ -2696,6 +2704,7 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
             default: break;
         }
     }
+    }   // the row chunks
 }
 
 // ---------------------------------------------------------------- EXPDEC (STRATA_EXPDEC=1): the group's activations
@@ -3724,6 +3733,11 @@ bool g_stage_grid_mmvq = g_stage_grid && [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID_MMVQ");
     return v != nullptr && v[0] == '1';
 }();
+// QuantLab (11/11): the trellis types only (launch_mmvq).  Off by default.
+bool ql_tq_stage_mmvq() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_TQ_STAGE_MMVQ"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 // IQ3_XXS's and IQ3_S's codebooks and sign-mask tables staged in shared memory by the grouped expert kernels (the
 // single-matrix mmvq does not): bitwise the same either way.  OPT-IN: STRATA_IQ_STAGE_TABLES=1.  The PR (#1424) made it
 // the default on compute capability 6.0 (GP100: no __dp4a, these kernels decode-bound at 70-140 GB/s); on a Tesla P100
@@ -3813,7 +3827,9 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
     if constexpr (!kSplit<TY>) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
     else if (g_old_kernels || split_off<TY>()) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
     else if constexpr (kStageIqGrid<TY>) {
-        if (!g_stage_grid_mmvq) {
+        // QuantLab (11/11): STRATA_QL_TQ_STAGE_MMVQ=1 stages the trellis types' codebook alone (the IQ types keep
+        // STRATA_IQ_STAGE_GRID_MMVQ's choice).  RTX 3080, dense 5120x17408 K8: 111.6 -> 77.8 us at T=1, bitwise the same.
+        if (!(g_stage_grid_mmvq || (kTqAnyType<TY> && g_stage_grid && ql_tq_stage_mmvq()))) {
             launch_mmvq_multi_nc<TY, false>(grid, block, s, W, rb, X, y, n_in, n_out, ncols);
             return;
         }
@@ -6627,20 +6643,24 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     if (L.gu_type == kTqMixedType) {   // QuantLab: a layer of per-expert trellis K (tq_mix.hpp), its own three passes
         const int64_t gyq = (grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
-        const dim3 gq((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gyq);
         // QuantLab (11/9): STRATA_QL_TQMIX_SMEM=1 - the codebook staged in shared memory (bitwise the same sums)
         static const bool tq_smem = [] { const char* v = std::getenv("STRATA_QL_TQMIX_SMEM"); return v && v[0] == '1'; }();
-        if (tq_smem) native_gu_tqmix_kernel<true><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-        else native_gu_tqmix_kernel<false><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        // QuantLab (11/11): STRATA_QL_TQMIX_ROWCH=n (staged kernels only, default 1) - n chunks of rows per block, so the
+        // staged codebook is copied once per n chunks (each row computed the same way: bitwise the same)
+        static const int tq_rch = [] { const char* v = std::getenv("STRATA_QL_TQMIX_ROWCH"); const int n = v ? std::atoi(v) : 1; return n < 1 ? 1 : n > 32 ? 32 : n; }();
+        const int rch = tq_smem ? tq_rch : 1;
+        const dim3 gq((unsigned) ((2 * L.n_ff + GU_ROWS * rch - 1) / (GU_ROWS * rch)), (unsigned) gyq);
+        if (tq_smem) native_gu_tqmix_kernel<true><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rch);
+        else native_gu_tqmix_kernel<false><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
         check("native_expert_grouped/gu (per-expert K)");
         const long long nhq = (long long) cap_entries * L.n_ff;
         swiglu_entries_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(gate, up, h, nhq);
         if (L.had_block > 0) hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
         quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
         check("native_expert_grouped/swiglu (per-expert K)");
-        const dim3 gdq((unsigned) ((L.n_embd + 7) / 8), (unsigned) gyq);
-        if (tq_smem) native_down_tqmix_kernel<true><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        else native_down_tqmix_kernel<false><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        const dim3 gdq((unsigned) ((L.n_embd + 8 * rch - 1) / (8 * rch)), (unsigned) gyq);
+        if (tq_smem) native_down_tqmix_kernel<true><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rch);
+        else native_down_tqmix_kernel<false><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
         check("native_expert_grouped/down (per-expert K)");
         return;
     }
