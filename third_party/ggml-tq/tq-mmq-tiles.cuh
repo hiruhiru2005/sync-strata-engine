@@ -6,11 +6,14 @@
 #pragma once
 #include "tq.cuh"
 
-// QuantLab (11/11): STRATA_QL_TQ_MMQ_SMEM=1 (at build; default 0) - each tile load first copies the 4 KB int8 codebook
-// to shared memory (the block's threads, then a barrier) and the lanes decode from that copy instead of 8 global
-// lookups per 16 weights (the MMQ T=4 profile: long scoreboard 28%, LG throttle 26%).  The same entries: bitwise the
-// same tiles and output.  The copy is made at every tile load (the loader does not know the block's first one); the
-// tile loads of a block are block-uniform, so the barrier is reached by every thread.
+// QuantLab (11/11): STRATA_QL_TQ_MMQ_SMEM=N (at build; default 0 = off) - the kernels whose column tile J is <= N copy
+// the 4 KB int8 codebook to shared memory at each tile load (the block's threads, then a barrier) and the lanes decode
+// from that copy instead of 8 global lookups per 16 weights (the MMQ T=4 profile: long scoreboard 28%, LG throttle 26%;
+// RTX 3080, dense 5120x17408 K8 at T 1-8: 138 -> 105.5 us).  The wide tiles of the prompt path (J 64-128) are left as
+// they were: there the copy and the barrier cost more than the lookups (prefill 16K/32K were slower with every J
+// staged).  The same entries: bitwise the same tiles and output.  The copy is made at every tile load (the loader
+// does not know the block's first one); the tile loads of a block are block-uniform, so every thread reaches the
+// barrier.  N = 16 covers the decode-sized products (T <= 16).
 #ifndef STRATA_QL_TQ_MMQ_SMEM
 #define STRATA_QL_TQ_MMQ_SMEM 0
 #endif
@@ -45,16 +48,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = kqsx / TQ_LANES;
     const int lane = kqsx % TQ_LANES;
 
-#if STRATA_QL_TQ_MMQ_SMEM
-    __shared__ alignas(16) uint16_t s_tq_lut[TQ_LUT_POINTS];
-    for (int t = threadIdx.y*warp_size + threadIdx.x; t < TQ_LUT_POINTS/2; t += nwarps*warp_size) {
-        ((uint32_t *) s_tq_lut)[t] = ((const uint32_t *) tq_lut_i8)[t];
-    }
-    __syncthreads();
-    const uint16_t * lut = s_tq_lut;
-#else
     const uint16_t * lut = tq_lut_i8;
-#endif // STRATA_QL_TQ_MMQ_SMEM
+    if constexpr (STRATA_QL_TQ_MMQ_SMEM > 0 && J <= STRATA_QL_TQ_MMQ_SMEM) {
+        __shared__ alignas(16) uint16_t s_tq_lut[TQ_LUT_POINTS];
+        for (int t = threadIdx.y*warp_size + threadIdx.x; t < TQ_LUT_POINTS/2; t += nwarps*warp_size) {
+            ((uint32_t *) s_tq_lut)[t] = ((const uint32_t *) tq_lut_i8)[t];
+        }
+        __syncthreads();
+        lut = s_tq_lut;
+    }
 
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
