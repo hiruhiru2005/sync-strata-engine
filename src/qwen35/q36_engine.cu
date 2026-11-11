@@ -18,6 +18,8 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/tq_lut.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -861,6 +863,7 @@ struct Layer {
 struct Model {
     strata::core::ModelGeometry g;
     std::shared_ptr<strata::GgufModel> file;   // kept mapped: the experts are placed after the engine's buffers
+    bool dense = false;                        // QuantLab 11/11: a dense qwen35 file (no routed experts, see layer())
     bool hybrid = false;                       // not every expert fits in VRAM: slots + the CPU pool
     // the packed Q8_0 decode copies (gguf weights, packed copy, bytes): given back when that lets every expert fit
     std::vector<std::tuple<const uint8_t*, uint8_t*, size_t>> packed;
@@ -947,6 +950,20 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
             const float d = f16_to_f32((uint16_t) (q[0] | (q[1] << 8)));
             for (int j = 0; j < 32; ++j) h[b * 32 + j] = d * (float) (int8_t) q[2 + j];
         }
+    } else if (K::dequant_bf16_supported((int) t.type) || K::iq_supported((int) t.type)) {
+        // QuantLab (11/11): a small tensor stored quantized (llama.cpp's Q4_K_M files of the dense qwen35 keep ssm_alpha /
+        // ssm_beta as Q4_K): its blocks dequantized to f32 on the device
+        const uint64_t nb = strata::tensor_payload_bytes(t);
+        const int64_t cols = (int64_t) t.shape[0], rows = (int64_t) (t.elements() / (uint64_t) cols);
+        void* raw = nullptr;
+        float* d = nullptr;
+        CK(cudaMalloc(&raw, nb));
+        CK(cudaMemcpy(raw, src, nb, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&d, h.size() * 4));
+        K::dequant_f32((int) t.type, raw, 0, rows, cols, d, nullptr);
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(raw));
+        return d;
     } else {
         std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16 or Q8_0\n", t.name.c_str(), t.type_name());
         std::exit(1);
@@ -962,10 +979,11 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
     const strata::GgufModel& gm = *m.file;
     if (!strata::core::geometry_from_gguf(gm.meta(), m.g, m.top_k, err)) return false;
-    if (m.g.family != strata::ModelFamily::Qwen35Moe) {
-        err = "strata-q36 runs Qwen3.6-35B-A3B (qwen35moe) files only";
+    if (!strata::model_family_qwen35_path(m.g.family)) {
+        err = "strata-q36 runs Qwen3.6-35B-A3B (qwen35moe) and the dense qwen35 files only";
         return false;
     }
+    m.dense = m.g.family == strata::ModelFamily::Qwen35Dense;   // QuantLab 11/11
     size_t checked = 0;
     if (!strata::core::check_gguf_layout(gm, m.g, err, &checked)) return false;
     const auto& g = m.g;
@@ -973,7 +991,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         err = "a geometry this driver's kernels do not take (head 256, state 128, conv 4, <= 512 experts, top-k <= 15)";
         return false;
     }
-    const std::string p = "qwen35moe.";
+    const std::string p = std::string(strata::model_family_arch(g.family)) + ".";
     if (const strata::MetaValue* v = gm.meta().get(p + "attention.layer_norm_rms_epsilon")) m.eps = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.freq_base")) m.rope_base = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.dimension_count")) m.n_rot = (int) v->u;
@@ -1053,6 +1071,12 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
             y.q_norm = f32(L(l, "attn_q_norm.weight"));
             y.k_norm = f32(L(l, "attn_k_norm.weight"));
         }
+        if (m.dense) {   // QuantLab 11/11: the dense FFN in the shared expert's matrices (layer() computes it with no gate)
+            y.sh_gate = mat(L(l, "ffn_gate.weight"));
+            y.sh_up = mat(L(l, "ffn_up.weight"));
+            y.sh_down = mat(L(l, "ffn_down.weight"));
+            continue;
+        }
         y.router = f32(L(l, "ffn_gate_inp.weight"));
         y.sh_gate = mat(L(l, "ffn_gate_shexp.weight"));
         y.sh_up = mat(L(l, "ffn_up_shexp.weight"));
@@ -1093,10 +1117,24 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.eh_proj = mat(L(l, "nextn.eh_proj.weight"));
         m.mtp_enorm = f32(L(l, "nextn.enorm.weight"));
         m.mtp_hnorm = f32(L(l, "nextn.hnorm.weight"));
-        m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
+        size_t s = 0;   // QuantLab 11/11: optional in the dense files (output_norm then, below)
+        if (!m.dense || gm.find(L(l, "nextn.shared_head_norm.weight"), &s) != nullptr)
+            m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
     }
     m.out_norm = f32("output_norm.weight");
-    m.head = mat("output.weight");
+    if (m.has_mtp && m.mtp_shnorm == nullptr) {
+        m.mtp_shnorm = m.out_norm;
+        std::fprintf(stderr, "strata-q36: no nextn.shared_head_norm: the MTP block ends with output_norm\n");
+    }
+    {   // QuantLab 11/11: a dense file without output.weight ties the head to the embedding
+        size_t s = 0;
+        if (m.dense && gm.find("output.weight", &s) == nullptr) {
+            m.head = mat("token_embd.weight");
+            std::fprintf(stderr, "strata-q36: no output.weight: the head reads token_embd\n");
+        } else {
+            m.head = mat("output.weight");
+        }
+    }
     {
         size_t s = 0;
         const strata::TensorInfo* t = find("token_embd.weight", s);
@@ -1112,6 +1150,25 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     std::fprintf(stderr, "strata-q36: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
                  ms_since(t0) / 1000.0);
+    {   // QuantLab (11/11): a trellis GGUF quantized with its own codebook carries it beside the file, in a pack's format
+        // (4096 fp16 bit patterns, 8192 bytes): <model>.tq_lut_f16.bin, or STRATA_Q36_TQ_LUT=<file>.  The int8 copy the
+        // decode reads is derived from it (tq_lut_i8_from_f16) and both go to every device copy before the first kernel.
+        std::string lp;
+        if (const char* e = std::getenv("STRATA_Q36_TQ_LUT"); e && *e) lp = e;
+        else {
+            const std::string cand = path + ".tq_lut_f16.bin";
+            if (FILE* f = std::fopen(cand.c_str(), "rb")) { std::fclose(f); lp = cand; }
+        }
+        if (!lp.empty()) {
+            std::string le;
+            std::vector<uint16_t> i8(K::kTqLutPoints);
+            int copies = 0;
+            if (!K::tq_lut_load(lp, le)) { err = "trellis codebook " + lp + ": " + le; return false; }
+            K::tq_lut_i8_from_f16(K::tq_lut_f16_host(), i8.data());
+            if (!K::tq_lut_device_upload(K::tq_lut_f16_host(), i8.data(), copies, le)) { err = le; return false; }
+            std::fprintf(stderr, "strata-q36: trellis codebook from %s (%d device copies)\n", lp.c_str(), copies);
+        }
+    }
     return true;
 }
 
@@ -1366,7 +1423,9 @@ struct Engine {
             std::exit(1);
         }
         att_s = dalloc(kAttScoreFloats);
-        sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
+        // f32mm's K-split partials: the router (n_expert + 1 rows) and the GDN alpha / beta (ssm_v_heads rows) use them.
+        // QuantLab 11/11: sized for both - a dense file has no experts, and n_expert + 1 = 1 overflowed on alpha / beta
+        sk_part = dalloc((size_t) kSplitK * T * (size_t) std::max<int64_t>(g.n_expert + 1, g.ssm_v_heads));
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
         k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
@@ -2000,6 +2059,28 @@ struct Engine {
             mm(L.wo, att, y, T);
         }
         add_rms_post(L, T);
+        if (m->dense) {
+            // QuantLab (11/11): the dense FFN of a qwen35 file: the shared expert's products (sh_* hold ffn_gate / ffn_up /
+            // ffn_down, n_ff_shexp = n_ff) without its gate, then the residual add and the next norm
+            if (T > kGemmT) {
+                k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+                apply(L.sh_gate, xq, sg, T);
+                apply(L.sh_up, xq, su, T);
+                k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
+                mm(L.sh_down, shh, sy, T);
+            } else {
+                if (!xq_post) quant(h, N, T, xq);
+                if (!shared_gu(L, T)) {
+                    apply(L.sh_gate, xq, sg, T);
+                    apply(L.sh_up, xq, su, T);
+                    K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);   // SwiGLU and its q8_1 image in one launch
+                }
+                mmq(L.sh_down, q8, sy, T);
+            }
+            xq_ready = false;
+            k_add_rms<<<T, kThreads, 0, st>>>(x, sy, wn, hout, N, m->eps);
+            return;
+        }
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
         // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
@@ -3848,7 +3929,7 @@ int strata::qwen35::run(int argc, char** argv) {
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
     E.init(m, ctx, chunk, batch, vision);
-    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
+    if (!m.dense && !place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {   // dense: no experts
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }

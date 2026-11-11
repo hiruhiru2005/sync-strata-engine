@@ -3141,7 +3141,7 @@ int main(int argc, char** argv) {
         bool qwen35 = false;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
-            qwen35 = strata::model_family(meta) == strata::ModelFamily::Qwen35Moe;
+            qwen35 = strata::model_family_qwen35_path(strata::model_family(meta));   // QuantLab 11/11: the dense qwen35 too
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }

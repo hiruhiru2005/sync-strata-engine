@@ -60,7 +60,19 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     num("ssm.inner_size", g.ssm_value_dim);
     num("full_attention_interval", g.qsa_interval);
     g.head_dim = key_length;
-    if (family == strata::ModelFamily::Qwen35Moe) {
+    const bool dense = family == strata::ModelFamily::Qwen35Dense;
+    if (dense) {
+        // QuantLab (11/11): the dense FFN is computed by the qwen35 path's shared-expert products, so its width goes to
+        // both n_ff and n_ff_shexp; no routed experts
+        g.n_expert = 0;
+        top_k = 0;
+        g.n_expert_used = 0;
+        num("feed_forward_length", g.n_ff);
+        g.n_ff_shexp = g.n_ff;
+        g.qsa_interval = 4;   // llama.cpp's default when the key is absent
+        num("full_attention_interval", g.qsa_interval);
+    }
+    if (family == strata::ModelFamily::Qwen35Moe || dense) {
         num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
@@ -81,8 +93,8 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         err = buf;
         return false;
     };
-    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 || g.n_expert <= 0 ||
-        top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
+    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 ||
+        (!dense && (g.n_expert <= 0 || top_k <= 0 || top_k > g.n_expert)) || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
         g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 || g.qsa_interval < 2)
         return bad("a geometry key is zero or out of range");
     if (value_length >= 0 && value_length != key_length) return bad("attention.key_length != attention.value_length");
@@ -156,6 +168,12 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     const int64_t N = g.n_embd, NE = g.n_expert, FF = g.n_ff, FS = g.n_ff_shexp;
     std::vector<TensorWant> t;
     auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
+    if (g.family == strata::ModelFamily::Qwen35Dense) {
+        // QuantLab (11/11): the dense FFN, every layer (the MTP block's too)
+        add("ffn_gate.weight", {N, FF});
+        add("ffn_up.weight", {N, FF});
+        add("ffn_down.weight", {FF, N});
+    } else {
     // MoE, every layer (the MTP block's too)
     add("ffn_gate_inp.weight", {N, NE});
     add("ffn_gate_inp_shexp.weight", {N});
@@ -165,6 +183,7 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     add("ffn_gate_exps.weight", {N, FF, NE});
     add("ffn_up_exps.weight", {N, FF, NE});
     add("ffn_down_exps.weight", {FF, N, NE});
+    }
     if (g.has_hyper_connections()) {
         // gated residual (Flash-Next): `gr_read` transposes, so the file's orientation is [hc_dim, hc_lr] / [hc_lr, hc_dim]
         const int64_t H = g.hc_dim();
@@ -212,7 +231,8 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
         add("nextn.eh_proj.weight", {2 * N, N});
         add("nextn.enorm.weight", {N});
         add("nextn.hnorm.weight", {N});
-        add("nextn.shared_head_norm.weight", {N});
+        // optional in llama.cpp's qwen35 (dense) loader: the engine falls back to output_norm there
+        if (g.family != strata::ModelFamily::Qwen35Dense) add("nextn.shared_head_norm.weight", {N});
     }
     return t;
 }
@@ -222,7 +242,8 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
 inline std::vector<TensorWant> global_tensors(const ModelGeometry& g) {
     std::vector<TensorWant> t;
     t.push_back({"token_embd.weight", {g.n_embd, g.n_vocab}});
-    t.push_back({"output.weight", {g.n_embd, g.n_vocab}});
+    // the small dense qwen35 files tie the head to the embedding (no output.weight): the engine reads token_embd then
+    if (g.family != strata::ModelFamily::Qwen35Dense) t.push_back({"output.weight", {g.n_embd, g.n_vocab}});
     if (g.has_hyper_connections()) {
         t.push_back({"output_hc_down.weight", {g.hc_dim(), g.hc_lr}});
         t.push_back({"output_hc_up.weight", {g.hc_lr, g.hc_dim()}});

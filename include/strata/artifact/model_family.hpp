@@ -16,13 +16,21 @@ enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
+    /// QuantLab (11/11): the dense members of the same family (GGUF architecture qwen35: Qwen3.5 0.8B..27B, Qwen3.8-27B):
+    /// the same layers as qwen35moe with a plain SwiGLU FFN (ffn_gate / ffn_up / ffn_down) in place of the MoE.  They run
+    /// on the qwen35moe path (src/qwen35), whose shared-expert products compute that FFN.
+    Qwen35Dense,
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
     if (arch == "qwen4exp") return ModelFamily::Qwen4Exp;
     if (arch == "qwen35moe") return ModelFamily::Qwen35Moe;
+    if (arch == "qwen35") return ModelFamily::Qwen35Dense;
     return ModelFamily::Unknown;
 }
+
+/// The families the qwen35moe path (src/qwen35) runs.
+inline bool model_family_qwen35_path(ModelFamily f) { return f == ModelFamily::Qwen35Moe || f == ModelFamily::Qwen35Dense; }
 
 /// The GGUF architecture string (also the metadata key prefix: "<arch>.block_count").
 inline const char* model_family_arch(ModelFamily f) {
@@ -31,6 +39,8 @@ inline const char* model_family_arch(ModelFamily f) {
         return "qwen4exp";
     case ModelFamily::Qwen35Moe:
         return "qwen35moe";
+    case ModelFamily::Qwen35Dense:
+        return "qwen35";
     default:
         return "";
     }
@@ -43,6 +53,8 @@ inline const char* model_family_title(ModelFamily f) {
         return "Qwen3.8-Flash-Next";
     case ModelFamily::Qwen35Moe:
         return "Qwen3.6-35B-A3B";
+    case ModelFamily::Qwen35Dense:
+        return "a dense Qwen3.5 / Qwen3.8 model";
     default:
         return "an unknown model";
     }

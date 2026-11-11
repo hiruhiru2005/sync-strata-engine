@@ -664,6 +664,29 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+// QuantLab (11/11): the dense qwen35 files (Qwen3.5 0.8B..27B, Qwen3.8-27B): the same keys without the expert ones and
+// with feed_forward_length; nextn_predict_layers is optional (a file without the MTP block has none) and
+// full_attention_interval too (llama.cpp's default is 4).
+inline std::string check_architecture_qwen35(const GgufFile& g) {
+    static const char* const keys[] = {
+        "qwen35.block_count", "qwen35.embedding_length", "qwen35.feed_forward_length", "qwen35.attention.head_count",
+        "qwen35.attention.head_count_kv", "qwen35.attention.key_length", "qwen35.attention.value_length",
+        "qwen35.ssm.conv_kernel", "qwen35.ssm.state_size", "qwen35.ssm.group_count", "qwen35.ssm.time_step_rank",
+        "qwen35.ssm.inner_size",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    const MetaValue* nl = g.get("qwen35.block_count");
+    if (const MetaValue* mtp = g.get("qwen35.nextn_predict_layers"); mtp && mtp->u >= nl->u)
+        return "qwen35.nextn_predict_layers is not smaller than qwen35.block_count";
+    if (const MetaValue* fi = g.get("qwen35.full_attention_interval"); fi && fi->u < 2)
+        return "qwen35.full_attention_interval must be at least 2 (the GDN / attention pattern)";
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -851,6 +874,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Qwen35Dense) return check_architecture_qwen35(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
