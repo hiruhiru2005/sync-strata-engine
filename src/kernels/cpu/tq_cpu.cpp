@@ -392,8 +392,12 @@ void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t 
         else tq_detail::tq_rows_avx512_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
     }
-    static const bool avx2_compute = [] { const char* v = std::getenv("STRATA_TQ_BIH3_AVX2"); return v && v[0] == '1'; }();
-    if (bih3 && avx2_compute && !bih3_table_only() && (isa == TqIsa::avx2 || isa == TqIsa::avx2vnni || isa == TqIsa::avx2e)) {
+    // STRATA_TQ_BIH3_AVX2: 1 = every bih3 row computed, 2 = only the wide rows (n >= 2048: gate / up, two thirds of
+    // the work; the 640-wide down rows keep the table: on Zen 4 the computed rows were 9-18% faster at n 2560 and
+    // 0-13% slower at n 640, strata-desktop's split)
+    static const int avx2_compute = [] { const char* v = std::getenv("STRATA_TQ_BIH3_AVX2"); return v ? std::atoi(v) : 0; }();
+    if (bih3 && (avx2_compute == 1 || (avx2_compute == 2 && n >= 2048)) && !bih3_table_only() &&
+        (isa == TqIsa::avx2 || isa == TqIsa::avx2vnni || isa == TqIsa::avx2e)) {
         // QuantLab (11/12): the AVX2 bih3 rows (and their AVX-VNNI / EVEX copies), opt-in: on Zen 4 they measured
         // the table rows' speed (-17 .. +15%), so the table rows stay the default until a Raptor Lake measures them
         if (isa == TqIsa::avx2vnni) tq_detail::tq_rows_avxvnni_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
