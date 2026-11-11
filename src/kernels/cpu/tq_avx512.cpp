@@ -313,5 +313,9 @@ void tq_rows_avx2e_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t r
                         int nt, float* const* out, int r0, int r1, const TqScales& sc) {
     STRATA_TQ_DISPATCH_K(kb, evex::rows_r1_t, table, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
+void tq_rows_avx2e_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                             float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, evex::rows_r1_bih3_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
+}
 
 }  // namespace strata::kernels::cpu::tq_detail

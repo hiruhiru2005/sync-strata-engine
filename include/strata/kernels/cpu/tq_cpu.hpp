@@ -115,6 +115,9 @@ struct TqAct {
     // STRATA_TQ_BIH3_LANES=1 (the lane-wise rows): per 4 values -384 * their sum, and their sub-block's scale
     alignas(64) int32_t c4[kTqMaxN / 4];
     alignas(64) float d4[kTqMaxN / 4];
+    // the AVX2 bih3 rows (tq_avx2_rows.inl rows_r1_bih3_t): per 4 values [a0, a1] and [a2, a3] in separate arrays
+    alignas(64) int16_t qp0[kTqMaxN / 2];
+    alignas(64) int16_t qp1[kTqMaxN / 2];
 };
 void unpack_act(const void* q8_0, int n, TqAct& a);
 /// QuantLab (10/31): one matrix's R1Q2 scales.  With them a block is its 4K code bytes only (no fp16 d): the block's
@@ -141,6 +144,14 @@ void tq_rows_avx512_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n,
 /// summation order: equal to the scalar kernel to the float rounding, not bitwise).
 void tq_rows_avx512_r1q2_bih3_lanes(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                                     float* const* out, int r0, int r1, const TqScales& sc);
+/// QuantLab (11/12): the bih3 R1Q2 rows on AVX2 (VPSHUFB states, int16 point pairs, VPMADDWD), AVX-VNNI (VPDPWSSD) and
+/// their EVEX test copy (avx2e): bitwise the scalar kernel's, as the AVX-512 rows.
+void tq_rows_avx2_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                            float* const* out, int r0, int r1, const TqScales& sc);
+void tq_rows_avxvnni_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                               float* const* out, int r0, int r1, const TqScales& sc);
+void tq_rows_avx2e_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                             float* const* out, int r0, int r1, const TqScales& sc);
 // QuantLab (11/4): the AVX-VNNI copies of the AVX2 rows (tq_avx2.cpp) and their EVEX test copies (tq_avx512.cpp)
 bool tq_avxvnni_built();
 void tq_rows_avxvnni(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,

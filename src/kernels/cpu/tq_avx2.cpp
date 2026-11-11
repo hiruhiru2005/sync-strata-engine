@@ -125,6 +125,18 @@ void tq_rows_avx2_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t ro
                        float* const* out, int r0, int r1, const TqScales& sc) {
     STRATA_TQ_DISPATCH_K(kb, plain::rows_r1_t, table, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
+void tq_rows_avx2_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                            float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, plain::rows_r1_bih3_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
+}
+void tq_rows_avxvnni_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                               float* const* out, int r0, int r1, const TqScales& sc) {
+#if STRATA_AVXVNNI
+    STRATA_TQ_DISPATCH_K(kb, vnni::rows_r1_bih3_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
+#else
+    tq_rows_avx2_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+#endif
+}
 
 // QuantLab (11/4): the AVX-VNNI copies (callers check tq_isa_ok(TqIsa::avx2vnni) first; a build without the
 // intrinsics runs the plain rows here)

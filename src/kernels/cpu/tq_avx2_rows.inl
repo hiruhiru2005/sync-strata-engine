@@ -126,6 +126,139 @@ STRATA_TQ_ROWS_FN void rows_r1_t(const int16_t* table, const uint8_t* w, size_t 
     }
 }
 
+// ---- QuantLab (11/12): the bih3 R1Q2 rows (types 180 + K), the points computed (no table), bitwise the scalar kernel's.
+// States: per group of 4 (t = 4m .. 4m+3) a 16-byte window of the block (a direct load, or for the windows that wrap
+// around the circular stream, bytes from the block's first and last 16), VPSHUFB to the 4 bytes of each state's dword,
+// VPSRLVD, the 15-bit mask; two groups make a YMM of 8 states = 32 weights = one Q8_0 sub-block.  Points: x_i = s * C_i
+// (VPMULLD), then per state the two int16 words U1 = [v0, v1], U2 = [v2, v3] (v_j = T0.bj + T1.bj + T2.bj, 0..765) by
+// VPSHUFB of the x_i's bytes and adds; VPMADDWD against the activations split in pairs (TqAct::qp0 = [a0, a1],
+// qp1 = [a2, a3] per state; VPDPWSSD on the VNNI copies), the 8 lanes summed per sub-block: sum_j v_j * a_j exactly;
+// minus 384 * the sub-block's sum (TqAct::bsum), x 64 = the table rows' S[k], and the scalar kernel's float steps.
+template <int KB>
+struct Bih3Win {
+    int dir[8];                      // group m's direct load byte, -1: from F (the first 16 bytes) and E (the last 16)
+    alignas(16) uint8_t idx[8][16];  // the shuffle of the direct window, or of E
+    alignas(16) uint8_t idxf[8][16]; // the shuffle of F (for the groups that are not direct)
+    alignas(32) uint32_t sh[4][8];   // per YMM g (groups 2g, 2g+1): the right shifts
+    Bih3Win() {
+        constexpr int NB = 4 * KB;
+        for (int m = 0; m < 8; ++m) {
+            int need[4][4];   // state i's 4 bytes (unwrapped stream indices)
+            for (int i = 0; i < 4; ++i) {
+                const int t = 4 * m + i;
+                if (KB == 8) {
+                    need[i][0] = t; need[i][1] = (t + 31) & 31; need[i][2] = need[i][3] = -1;
+                    sh[m >> 1][4 * (m & 1) + i] = 0;
+                } else {
+                    const int off = (31 - t) * KB, b = off >> 3;
+                    for (int j = 0; j < 4; ++j) need[i][j] = b + j;
+                    sh[m >> 1][4 * (m & 1) + i] = (uint32_t) (off & 7);
+                }
+            }
+            int lo = 1 << 30, hi = -1;
+            for (auto& r : need)
+                for (int v : r)
+                    if (v >= 0) { lo = v < lo ? v : lo; hi = v > hi ? v : hi; }
+            dir[m] = (NB >= 16 && hi < NB && hi - lo < 16 && lo + 16 <= NB) ? lo : -1;
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) {
+                    const int v = need[i][j];
+                    uint8_t& e = idx[m][4 * i + j];
+                    uint8_t& f = idxf[m][4 * i + j];
+                    e = f = 0x80;
+                    if (v < 0) continue;
+                    if (dir[m] >= 0) { e = (uint8_t) (v - dir[m]); continue; }
+                    const int w = v % NB;
+                    if (NB < 16 || w < 16) f = (uint8_t) w;          // from F (the whole block when it is short)
+                    else if (w >= NB - 16) e = (uint8_t) (w - (NB - 16));
+                    else std::abort();                                 // a wrapped window with a middle byte: never
+                }
+        }
+    }
+};
+
+template <int KB>
+STRATA_TQ_ROWS_FN void rows_r1_bih3_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                                      float* const* out, int r0, int r1, const TqScales& sc) {
+    const int nb = n / 128;
+    constexpr int NB = 4 * KB;
+    static const Bih3Win<KB> W;
+    const __m256i m15 = _mm256_set1_epi32(0x7FFF);
+    const __m256i c0 = _mm256_set1_epi32((int) 0x9E3779B1u), c1 = _mm256_set1_epi32((int) 0x85EBCA6Bu);
+    const __m256i c2 = _mm256_set1_epi32((int) 0xC2B2AE35u), c3 = _mm256_set1_epi32((int) 0x27D4EB2Fu);
+    // per dword lane d: U1 = [x0.b1 + x1.b2 + x2.b3 | x0.b2 + x1.b3 + x3.b1], U2 = [x0.b3 + x2.b1 + x3.b2 | x1.b1 + x2.b2 + x3.b3]
+    // (each term one VPSHUFB of one x_i: bytes to positions 0 / 2 of the dword, zeros elsewhere)
+    const __m256i u1a = _mm256_set1_epi32((int) 0x80028001u), u1b = _mm256_set1_epi32((int) 0x80038002u);
+    const __m256i u1c = _mm256_set1_epi32((int) 0x80808003u), u1d = _mm256_set1_epi32((int) 0x80018080u);
+    const __m256i u2a = _mm256_set1_epi32((int) 0x80808003u), u2b = _mm256_set1_epi32((int) 0x80018080u);
+    const __m256i u2c = _mm256_set1_epi32((int) 0x80028001u), u2d = _mm256_set1_epi32((int) 0x80038002u);
+    const __m256i lane4 = _mm256_setr_epi8(0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12, 0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8,
+                                           12, 12, 12, 12);
+    // the dword-relative masks above get + 4 d per lane (0x80 stays >= 0x80: still a zero byte)
+    const __m256i U1A = _mm256_add_epi8(u1a, lane4), U1B = _mm256_add_epi8(u1b, lane4), U1C = _mm256_add_epi8(u1c, lane4),
+                  U1D = _mm256_add_epi8(u1d, lane4), U2A = _mm256_add_epi8(u2a, lane4), U2B = _mm256_add_epi8(u2b, lane4),
+                  U2C = _mm256_add_epi8(u2c, lane4), U2D = _mm256_add_epi8(u2d, lane4);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        const uint8_t* qr = sc.q + (size_t) r * sc.qbytes;
+        __m128 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* qs = x + (size_t) i * NB;
+            __m128i F, E;
+            if constexpr (NB >= 16) {
+                F = _mm_loadu_si128((const __m128i*) qs);
+                E = _mm_loadu_si128((const __m128i*) (qs + NB - 16));
+            } else {   // K 2 (8 bytes), K 3 (12 bytes): the whole block in F
+                F = _mm_loadl_epi64((const __m128i*) qs);
+                if constexpr (NB > 8) F = _mm_insert_epi32(F, (int) tq_ld32(qs + 8), 2);
+                E = F;
+            }
+            __m256i U1[4], U2[4];
+            for (int g = 0; g < 4; ++g) {
+                __m128i s4[2];
+                for (int h = 0; h < 2; ++h) {
+                    const int m = 2 * g + h;
+                    if (W.dir[m] >= 0)
+                        s4[h] = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*) (qs + W.dir[m])),
+                                                 _mm_load_si128((const __m128i*) W.idx[m]));
+                    else
+                        s4[h] = _mm_or_si128(_mm_shuffle_epi8(E, _mm_load_si128((const __m128i*) W.idx[m])),
+                                             _mm_shuffle_epi8(F, _mm_load_si128((const __m128i*) W.idxf[m])));
+                }
+                const __m256i s = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_set_m128i(s4[1], s4[0]), _mm256_load_si256((const __m256i*) W.sh[g])), m15);
+                const __m256i x0 = _mm256_mullo_epi32(s, c0), x1 = _mm256_mullo_epi32(s, c1);
+                const __m256i x2 = _mm256_mullo_epi32(s, c2), x3 = _mm256_mullo_epi32(s, c3);
+                U1[g] = _mm256_add_epi16(_mm256_add_epi16(_mm256_shuffle_epi8(x0, U1A), _mm256_shuffle_epi8(x1, U1B)),
+                                         _mm256_add_epi16(_mm256_shuffle_epi8(x2, U1C), _mm256_shuffle_epi8(x3, U1D)));
+                U2[g] = _mm256_add_epi16(_mm256_add_epi16(_mm256_shuffle_epi8(x0, U2A), _mm256_shuffle_epi8(x1, U2B)),
+                                         _mm256_add_epi16(_mm256_shuffle_epi8(x2, U2C), _mm256_shuffle_epi8(x3, U2D)));
+            }
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(sc.colscale[i]) * sc.p2[(qr[i >> 2] >> (2 * (i & 3))) & 3]);
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* p0 = (const __m256i*) (a[t]->qp0 + 64 * i);
+                const __m256i* p1 = (const __m256i*) (a[t]->qp1 + 64 * i);
+                const __m256i d0 = dot2(U1[0], _mm256_load_si256(p0 + 0), U2[0], _mm256_load_si256(p1 + 0));
+                const __m256i d1 = dot2(U1[1], _mm256_load_si256(p0 + 1), U2[1], _mm256_load_si256(p1 + 1));
+                const __m256i d2 = dot2(U1[2], _mm256_load_si256(p0 + 2), U2[2], _mm256_load_si256(p1 + 2));
+                const __m256i d3 = dot2(U1[3], _mm256_load_si256(p0 + 3), U2[3], _mm256_load_si256(p1 + 3));
+                const __m256i hh = _mm256_hadd_epi32(_mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
+                const __m128i s1 = _mm_sub_epi32(_mm_add_epi32(_mm256_castsi256_si128(hh), _mm256_extracti128_si256(hh, 1)),
+                                                 _mm_load_si128((const __m128i*) (a[t]->bsum + 4 * i)));
+                const __m128 scl = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(_mm_slli_epi32(s1, 6)), scl, acc[t]);
+            }
+        }
+        const float rb = tq_half_to_float(sc.rowbase[r]);
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = (((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f)) * rb;
+        }
+    }
+}
+
 #undef STRATA_TQ_WEIGHTS8
 #undef STRATA_TQ_SUMS4
 #undef STRATA_TQ_INLINE

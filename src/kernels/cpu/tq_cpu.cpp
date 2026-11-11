@@ -288,6 +288,11 @@ void unpack_act(const void* q8_0, int n, TqAct& a) {
         for (int g = 0; g < 8; ++g) {
             a.c4[8 * b + g] = -384 * ((int32_t) q[4 * g] + q[4 * g + 1] + q[4 * g + 2] + q[4 * g + 3]);
             a.d4[8 * b + g] = a.d[b];
+            const int j = 8 * b + g;   // the state's index in the row
+            a.qp0[2 * j] = q[4 * g];
+            a.qp0[2 * j + 1] = q[4 * g + 1];
+            a.qp1[2 * j] = q[4 * g + 2];
+            a.qp1[2 * j + 1] = q[4 * g + 3];
         }
     }
 }
@@ -385,6 +390,15 @@ void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t 
         static const bool lanes = [] { const char* v = std::getenv("STRATA_TQ_BIH3_LANES"); return v && v[0] == '1'; }();
         if (lanes) tq_detail::tq_rows_avx512_r1q2_bih3_lanes(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         else tq_detail::tq_rows_avx512_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        return;
+    }
+    static const bool avx2_compute = [] { const char* v = std::getenv("STRATA_TQ_BIH3_AVX2"); return v && v[0] == '1'; }();
+    if (bih3 && avx2_compute && !bih3_table_only() && (isa == TqIsa::avx2 || isa == TqIsa::avx2vnni || isa == TqIsa::avx2e)) {
+        // QuantLab (11/12): the AVX2 bih3 rows (and their AVX-VNNI / EVEX copies), opt-in: on Zen 4 they measured
+        // the table rows' speed (-17 .. +15%), so the table rows stay the default until a Raptor Lake measures them
+        if (isa == TqIsa::avx2vnni) tq_detail::tq_rows_avxvnni_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        else if (isa == TqIsa::avx2e) tq_detail::tq_rows_avx2e_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        else tq_detail::tq_rows_avx2_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
     }
     if (isa == TqIsa::avx512) {

@@ -322,6 +322,18 @@ void check_r1q2(int type, int n) {
         double rms2 = 0;
         for (size_t i = 0; i < (size_t) NT * rows; ++i) rms2 += (double) o_new[i] * o_new[i];
         const double orms = std::sqrt(rms2 / (NT * rows)) + 1e-12;
+        // the AVX2 bih3 rows (STRATA_TQ_BIH3_AVX2=1; plain AVX2 and the EVEX copy of the VNNI rows): bitwise the scalar's
+        for (int v = 0; v < 2; ++v) {
+            bool ok = true;
+            for (int nt = 1; nt <= NT; ++nt) {
+                if (v == 0) tq_detail::tq_rows_avx2_r1q2_bih3(K, wn.data(), rb_new, n, aptr, nt, pi, 0, rows, sc);
+                else tq_detail::tq_rows_avx2e_r1q2_bih3(K, wn.data(), rb_new, n, aptr, nt, pi, 0, rows, sc);
+                ok = ok && same_bits(o_isa.data(), o_new.data(), (size_t) nt * rows);
+            }
+            std::printf("type %d n %d R1Q2 bih3 computed rows %s vs the scalar R1Q2 kernel: %s\n", type, n,
+                        v == 0 ? "avx2 " : "avx2e", ok ? "bitwise equal" : "DIFFERENT");
+            if (!ok) fail("R1Q2 bih3 AVX2 computed rows differ", type, n);
+        }
         tq_detail::tq_rows_avx512_r1q2_bih3_lanes(K, wn.data(), rb_new, n, aptr, NT, pi, 0, rows, sc);
         double lw = 0;
         for (size_t i = 0; i < (size_t) NT * rows; ++i)
@@ -415,6 +427,15 @@ void bench(int type, int n, int rows) {
             const double t_l = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3_lanes(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
             std::printf("bench type %d n %4d avx512 bih3 rows alone nt %d: exact %6.1f, lane-wise %6.1f ns/block (%+.0f%%)\n",
                         type, n, nt, t_e, t_l, 100.0 * (t_l / t_e - 1.0));
+            // the AVX2 rows alone: the table rows (the default) against the computed ones (STRATA_TQ_BIH3_AVX2=1)
+            const int16_t* tb = tq_state_table_for(type);
+            const double t_t = time_ns([&] { tq_detail::tq_rows_avx2_r1q2(K, tb, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
+            const double t_c = time_ns([&] { tq_detail::tq_rows_avx2_r1q2_bih3(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
+            const double t_te = time_ns([&] { tq_detail::tq_rows_avx2e_r1q2(K, tb, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
+            const double t_ce = time_ns([&] { tq_detail::tq_rows_avx2e_r1q2_bih3(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
+            std::printf("bench type %d n %4d avx2 rows alone nt %d: table %6.1f, computed %6.1f (%+.0f%%); avx2e table %6.1f, "
+                        "computed %6.1f (%+.0f%%) ns/block\n", type, n, nt, t_t, t_c, 100.0 * (t_c / t_t - 1.0), t_te, t_ce,
+                        100.0 * (t_ce / t_te - 1.0));
         }
     }
 }
