@@ -4100,9 +4100,13 @@ static bool ql_tq_v3() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_TQ_V3"); return v && v[0] == '1'; }();
     return on;
 }
-template<int NC, bool EXACT_N>
+// PROBE (speed only, the output is wrong, STRATA_QL_TQ_V3_PROBE=n, T=1): 1 = A no activation loads (constants), 2 = B no
+// weight loads (made from the block index), 3 = C half the codebook lookups (the first word stands for both), 4 = D no
+// lookups (the hash bits stand for the points), 5 = A + D.  strata-desktop's split of v3's LSU time (11/11).
+template<int NC, bool EXACT_N, int PROBE = 0>
 __global__ void __launch_bounds__(32 * kTqLaneLutWarps) tq_v3_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                                      float* __restrict__ y, int n_in, int n_out, int ncols) {
+    constexpr bool kNoAct = PROBE == 1 || PROBE == 5, kNoW = PROBE == 2, kHalfLds = PROBE == 3, kNoLds = PROBE == 4 || PROBE == 5;
     __shared__ uint32_t s_lut[256 * 32];
     for (int i = threadIdx.x; i < 256 * 32; i += 32 * kTqLaneLutWarps) s_lut[i] = (uint32_t) tq_lut_i8[i >> 5];
     __syncthreads();
@@ -4125,9 +4129,17 @@ __global__ void __launch_bounds__(32 * kTqLaneLutWarps) tq_v3_k8_kernel(const ui
             for (int kb = grp; kb < nb; kb += 8) {
                 const uint8_t* blk = wr + (uint32_t) kb * 34u;
                 const uint16_t* q16 = (const uint16_t*) (blk + 2) + 4 * m;
-                const uint32_t p = blk[prev];
-                const uint32_t w01 = q16[0], w23 = q16[1], w45 = q16[2], w67 = q16[3];
-                const float dw = tq_h2f(*(const uint16_t*) blk);
+                uint32_t p, w01, w23, w45, w67;
+                float dw;
+                if constexpr (kNoW) {
+                    const uint32_t h = ((uint32_t) kb * 0x9E37u + (uint32_t) row * 0x85EBu + (uint32_t) lane) & 0xFFFFu;
+                    p = h & 0xFF; w01 = h; w23 = h ^ 0x5A5Au; w45 = h ^ 0xA5A5u; w67 = h ^ 0x3C3Cu;
+                    dw = 1.0f;
+                } else {
+                    p = blk[prev];
+                    w01 = q16[0]; w23 = q16[1]; w45 = q16[2]; w67 = q16[3];
+                    dw = tq_h2f(*(const uint16_t*) blk);
+                }
                 const uint32_t pm = p & 0x7Fu, m01 = w01 & 0x7F7Fu, m23 = w23 & 0x7F7Fu, m45 = w45 & 0x7F7Fu,
                                m67 = w67 & 0x7F7Fu;
                 uint32_t st[8];
@@ -4143,8 +4155,14 @@ __global__ void __launch_bounds__(32 * kTqLaneLutWarps) tq_v3_k8_kernel(const ui
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     const uint32_t x = st[j] * 0x9e3779b1u;
-                    const uint32_t w0 = *(const uint32_t*) (sl + (((x >> 14) & 0x7F80u) | lane4));
-                    const uint32_t w1 = *(const uint32_t*) (sl + (((x >> 3) & 0x7F80u) | lane4));
+                    uint32_t w0, w1;
+                    if constexpr (kNoLds) {
+                        w0 = x >> 16;
+                        w1 = x >> 8;
+                    } else {
+                        w0 = *(const uint32_t*) (sl + (((x >> 14) & 0x7F80u) | lane4));
+                        w1 = kHalfLds ? w0 : *(const uint32_t*) (sl + (((x >> 3) & 0x7F80u) | lane4));
+                    }
                     q[j] = (int) __byte_perm(w0, w1, 0x5410u);
                 }
                 const int kk = kb * 4 + m;
@@ -4152,7 +4170,14 @@ __global__ void __launch_bounds__(32 * kTqLaneLutWarps) tq_v3_k8_kernel(const ui
                 for (int c = 0; c < NC; ++c) {
                     if (EXACT_N || c < n) {
                         const int4* xa = (const int4*) (g_tqx_i8 + (size_t) cc[c] * kTqxMaxIn + (size_t) kk * 32);
-                        const int4 v0 = xa[0], v1 = xa[1];
+                        int4 v0, v1;
+                        if constexpr (kNoAct) {
+                            v0 = make_int4(kk, kk + 1, kk + 2, kk + 3);
+                            v1 = make_int4(kk ^ 5, kk ^ 6, kk ^ 7, kk ^ 9);
+                        } else {
+                            v0 = xa[0];
+                            v1 = xa[1];
+                        }
                         int sumi = 0;
                         sumi = ggml_cuda_dp4a(q[0], v0.x, sumi);
                         sumi = ggml_cuda_dp4a(q[1], v0.y, sumi);
@@ -4162,7 +4187,7 @@ __global__ void __launch_bounds__(32 * kTqLaneLutWarps) tq_v3_k8_kernel(const ui
                         sumi = ggml_cuda_dp4a(q[5], v1.y, sumi);
                         sumi = ggml_cuda_dp4a(q[6], v1.z, sumi);
                         sumi = ggml_cuda_dp4a(q[7], v1.w, sumi);
-                        s[c] += dw * g_tqx_d[cc[c] * (kTqxMaxIn / 32) + kk] * (float) sumi;
+                        s[c] += dw * (kNoAct ? 1.0f : g_tqx_d[cc[c] * (kTqxMaxIn / 32) + kk]) * (float) sumi;
                     }
                 }
             }
@@ -4176,17 +4201,155 @@ __global__ void __launch_bounds__(32 * kTqLaneLutWarps) tq_v3_k8_kernel(const ui
         }
     }
 }
-template<int NC, bool EXACT_N>
+template<int NC, bool EXACT_N, int PROBE = 0>
 void launch_tq_v3_k8_nc(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     static const int blocks = [] {
         int dev = 0, sms = 0, per = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v3_k8_kernel<NC, EXACT_N>, 32 * kTqLaneLutWarps, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v3_k8_kernel<NC, EXACT_N, PROBE>, 32 * kTqLaneLutWarps, 0);
         return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
     }();
     const dim3 grid((unsigned) std::min((n_out + kTqLaneLutWarps - 1) / kTqLaneLutWarps, blocks)), block(32 * kTqLaneLutWarps);
-    tq_v3_k8_kernel<NC, EXACT_N><<<grid, block, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+    tq_v3_k8_kernel<NC, EXACT_N, PROBE><<<grid, block, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+}
+static int ql_tq_v3_probe() {
+    static const int p = [] { const char* v = std::getenv("STRATA_QL_TQ_V3_PROBE"); return v ? std::atoi(v) : 0; }();
+    return p;
+}
+
+// ---- QuantLab (11/11, strata-desktop's v4): v3 with (1) R rows a warp sharing one read of the activations per block
+// (the lane's q8_1 block of each column is the same for every row), and (2) the lane's bytes of a block in three 64-bit
+// loads.  The 8 blocks a warp step covers (272 bytes) start on a 16-byte boundary when the row is a whole number of
+// such chunks (nb % 8 == 0, row_bytes = 34 nb).  Inside the chunk, block g = lane >> 2 starts at B = 34 g; lane
+// m = lane & 3 needs its byte before (B + 1 + 8m for m >= 1, B + 33 for m = 0), its 8 code bytes (B + 2 + 8m ..) and the
+// block's d (B, B + 1).  Q = the 16 bytes from (B + 1 + 8m) & ~7 hold the byte before (m >= 1) and the 8 codes; X = the
+// 8 bytes from (B + 33) & ~7 (m = 0: its byte before) or B & ~7 (m >= 1: the d).  Every offset is fixed per lane.
+// STRATA_QL_TQ_V4=1 (opt-in until measured); output as v3's (not bitwise the 16-weight kernels').
+static bool ql_tq_v4() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_TQ_V4"); return v && v[0] == '1'; }();
+    return on;
+}
+template<int R, int NC, bool EXACT_N>
+__global__ void __launch_bounds__(32 * kTqLaneLutWarps) tq_v4_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                                     float* __restrict__ y, int n_in, int n_out, int ncols) {
+    __shared__ uint32_t s_lut[256 * 32];
+    for (int i = threadIdx.x; i < 256 * 32; i += 32 * kTqLaneLutWarps) s_lut[i] = (uint32_t) tq_lut_i8[i >> 5];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const uint32_t lane4 = (uint32_t) lane << 2;
+    const int m = lane & 3, g = lane >> 2;
+    const int nch = n_in / 1024;                         // chunks of 8 blocks
+    const char* sl = (const char*) s_lut;
+    // the lane's fixed offsets inside a chunk
+    const int B = 34 * g, o = (2 * g + 1) & 7;           // o = (B + 1 + 8m) % 8 = (B + 33) % 8
+    const int offQ = (B + 1 + 8 * m) & ~7;
+    const int offX = m == 0 ? ((B + 33) & ~7) : (B & ~7);
+    const uint32_t shQ = 8u * (uint32_t) (o - 1);        // brings the d (and the byte before) to bits 0..15
+    const int st = o + 1;                                // the first code byte inside Q (2, 4, 6 or 8)
+    const int kq = st >> 2;                              // its 32-bit word (0, 1 or 2)
+    const uint32_t shc = 8u * (uint32_t) (st & 3);       // and the bit shift inside it (16 or 0)
+    for (int row0 = (blockIdx.x * kTqLaneLutWarps + warp) * R; row0 < n_out; row0 += gridDim.x * kTqLaneLutWarps * R) {
+        for (int c0 = 0; c0 < ncols; c0 += NC) {
+            const int n = EXACT_N ? NC : min(NC, ncols - c0);
+            int cc[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) cc[c] = c0 + (EXACT_N ? c : min(c, n - 1));
+            float acc[R][NC];
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+            for (int ch = 0; ch < nch; ++ch) {
+                const int kk = (ch * 8 + g) * 4 + m;             // the lane's q8_1 block
+                int4 xv0[NC], xv1[NC];
+                float xd[NC];
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    if (EXACT_N || c < n) {
+                        const int4* xa = (const int4*) (g_tqx_i8 + (size_t) cc[c] * kTqxMaxIn + (size_t) kk * 32);
+                        xv0[c] = xa[0];
+                        xv1[c] = xa[1];
+                        xd[c] = g_tqx_d[cc[c] * (kTqxMaxIn / 32) + kk];
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int row = row0 + r;
+                    if (row >= n_out) break;
+                    const uint8_t* chunk = w + (size_t) row * row_bytes + (size_t) ch * 272;
+                    const uint2 q0 = *(const uint2*) (chunk + offQ), q1 = *(const uint2*) (chunk + offQ + 8);
+                    const uint2 xw = *(const uint2*) (chunk + offX);
+                    const unsigned long long Q0 = ((unsigned long long) q0.y << 32) | q0.x;
+                    const unsigned long long X = ((unsigned long long) xw.y << 32) | xw.x;
+                    const uint32_t t0 = (uint32_t) (Q0 >> shQ), t1 = (uint32_t) (X >> shQ);
+                    const uint32_t dsrc = m == 0 ? t0 : t1, psrc = m == 0 ? t1 : t0;   // d in bits 0..15, the byte before in 8..15
+                    const float dw = tq_h2f(dsrc & 0xFFFFu);
+                    const uint32_t wq[4] = {q0.x, q0.y, q1.x, q1.y};
+                    const uint32_t a = kq == 0 ? wq[0] : kq == 1 ? wq[1] : wq[2];
+                    const uint32_t b = kq == 0 ? wq[1] : kq == 1 ? wq[2] : wq[3];
+                    const uint32_t c = kq == 0 ? wq[2] : wq[3];
+                    const uint32_t C0 = __funnelshift_r(a, b, shc), C1 = __funnelshift_r(b, c, shc);   // codes 0..3, 4..7
+                    uint32_t s[8];
+                    s[0] = __byte_perm(C0, psrc, 0x0050u) & 0x7FFFu;
+                    s[1] = __byte_perm(C0, C0, 0x0001u) & 0x7FFFu;
+                    s[2] = __byte_perm(C0, C0, 0x0012u) & 0x7FFFu;
+                    s[3] = __byte_perm(C0, C0, 0x0023u) & 0x7FFFu;
+                    s[4] = __byte_perm(C1, C0, 0x0070u) & 0x7FFFu;
+                    s[5] = __byte_perm(C1, C1, 0x0001u) & 0x7FFFu;
+                    s[6] = __byte_perm(C1, C1, 0x0012u) & 0x7FFFu;
+                    s[7] = __byte_perm(C1, C1, 0x0023u) & 0x7FFFu;
+                    int q[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const uint32_t x = s[j] * 0x9e3779b1u;
+                        const uint32_t w0 = *(const uint32_t*) (sl + (((x >> 14) & 0x7F80u) | lane4));
+                        const uint32_t w1 = *(const uint32_t*) (sl + (((x >> 3) & 0x7F80u) | lane4));
+                        q[j] = (int) __byte_perm(w0, w1, 0x5410u);
+                    }
+#pragma unroll
+                    for (int c2 = 0; c2 < NC; ++c2) {
+                        if (EXACT_N || c2 < n) {
+                            int sumi = 0;
+                            sumi = ggml_cuda_dp4a(q[0], xv0[c2].x, sumi);
+                            sumi = ggml_cuda_dp4a(q[1], xv0[c2].y, sumi);
+                            sumi = ggml_cuda_dp4a(q[2], xv0[c2].z, sumi);
+                            sumi = ggml_cuda_dp4a(q[3], xv0[c2].w, sumi);
+                            sumi = ggml_cuda_dp4a(q[4], xv1[c2].x, sumi);
+                            sumi = ggml_cuda_dp4a(q[5], xv1[c2].y, sumi);
+                            sumi = ggml_cuda_dp4a(q[6], xv1[c2].z, sumi);
+                            sumi = ggml_cuda_dp4a(q[7], xv1[c2].w, sumi);
+                            acc[r][c2] += dw * xd[c2] * (float) sumi;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int row = row0 + r;
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    float v = acc[r][c];
+                    if (EXACT_N || c < n) v = warp_sum(v);
+                    if (row < n_out && c < n && lane == c) y[(size_t) (c0 + c) * n_out + row] = v;
+                }
+            }
+            if (EXACT_N) break;
+        }
+    }
+}
+template<int R, int NC, bool EXACT_N>
+void launch_tq_v4_k8_nc(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    static const int blocks = [] {
+        int dev = 0, sms = 0, per = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v4_k8_kernel<R, NC, EXACT_N>, 32 * kTqLaneLutWarps, 0);
+        return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
+    }();
+    const int rows_per_block = kTqLaneLutWarps * R;
+    const dim3 grid((unsigned) std::min((n_out + rows_per_block - 1) / rows_per_block, blocks)), block(32 * kTqLaneLutWarps);
+    tq_v4_k8_kernel<R, NC, EXACT_N><<<grid, block, 0, s>>>(W, rb, y, n_in, n_out, ncols);
 }
 
 // False (nothing launched) outside the scratch's limits: the caller runs mmvq_multi_kernel then.
@@ -4197,6 +4360,39 @@ bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* 
     const int xb = n_in / 32;
     tq_x_planar_kernel<<<(unsigned) ((xb * ncols + 127) / 128), 128, 0, s>>>(X, xb, ncols);
     if constexpr (TY == 144) {   // QuantLab (11/11): strata-desktop's v3 (above), opt-in
+        if (ql_tq_v4() && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v4 (above): chunks of 8 blocks
+            // rows a warp: 4 shares the activations most, but leaves too few warps on a short output, where a long row
+            // also makes the uneven tail long (RTX 3080, K8, T 1 / 3 us: 5120x17408 R4 48.0 / 56.5; 17408x5120 R1 52.3 /
+            // 86.6, R2 62.0 / 77.8, R4 72.6 / 85.5; 5120x10240, 5120x6144 and 6144x5120 best at R2).  So 4 from 16384 rows;
+            // a row of 16384 or more inputs: 1 for one column, else 2; otherwise 2.  STRATA_QL_TQ_V4_R=1|2|4 forces it.
+            static const int r_env = [] { const char* v = std::getenv("STRATA_QL_TQ_V4_R"); return v ? std::atoi(v) : 0; }();
+            const int R = r_env == 1 || r_env == 2 || r_env == 4 ? r_env
+                        : n_out >= 16384 ? 4 : n_in >= 16384 ? (ncols == 1 ? 1 : 2) : 2;
+#define QL_V4_CASES(RR)                                                                                       \
+            switch (ncols) {                                                                                  \
+                case 1: launch_tq_v4_k8_nc<RR, 1, true>(W, rb, y, n_in, n_out, 1, s); break;                  \
+                case 2: launch_tq_v4_k8_nc<RR, 2, true>(W, rb, y, n_in, n_out, 2, s); break;                  \
+                case 3: launch_tq_v4_k8_nc<RR, 3, true>(W, rb, y, n_in, n_out, 3, s); break;                  \
+                case 4: launch_tq_v4_k8_nc<RR, 4, true>(W, rb, y, n_in, n_out, 4, s); break;                  \
+                case 5: launch_tq_v4_k8_nc<RR, 5, true>(W, rb, y, n_in, n_out, 5, s); break;                  \
+                default: launch_tq_v4_k8_nc<(RR > 2 ? 2 : RR), 8, false>(W, rb, y, n_in, n_out, ncols, s); break; \
+            }
+            if (R == 4) { QL_V4_CASES(4) }
+            else if (R == 2) { QL_V4_CASES(2) }
+            else { QL_V4_CASES(1) }
+#undef QL_V4_CASES
+            return true;
+        }
+        if (ql_tq_v3() && ncols == 1 && ql_tq_v3_probe() > 0) {   // speed-only probes (wrong output)
+            switch (ql_tq_v3_probe()) {
+                case 1: launch_tq_v3_k8_nc<1, true, 1>(W, rb, y, n_in, n_out, 1, s); break;
+                case 2: launch_tq_v3_k8_nc<1, true, 2>(W, rb, y, n_in, n_out, 1, s); break;
+                case 3: launch_tq_v3_k8_nc<1, true, 3>(W, rb, y, n_in, n_out, 1, s); break;
+                case 4: launch_tq_v3_k8_nc<1, true, 4>(W, rb, y, n_in, n_out, 1, s); break;
+                default: launch_tq_v3_k8_nc<1, true, 5>(W, rb, y, n_in, n_out, 1, s); break;
+            }
+            return true;
+        }
         if (ql_tq_v3()) {
             switch (ncols) {
                 case 1: launch_tq_v3_k8_nc<1, true>(W, rb, y, n_in, n_out, 1, s); break;
