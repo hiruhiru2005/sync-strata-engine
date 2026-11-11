@@ -712,6 +712,13 @@ __device__ __forceinline__ void tq_states4(const uint8_t* qs, int l, uint32_t s[
 // sum|gpu - ref| / sum|ref| < 3e-2 (the bound every expert type's CPU and GPU paths get there); the prompt path's
 // fp16 dequantizers against to_float at < 1e-6, their fp16 output equal to the fp16 of the float one.
 struct TqLane { int q[4]; float d; };
+// QuantLab (11/11): STRATA_QL_TQ_LUT_EXP=N (at build; default 0 = the codebook as it is).  SPEED PROBE ONLY - the
+// weights come out WRONG for N > 0: how much faster the decode would be with a smaller codebook or one lookup per
+// step (the QTIP HYB / FLUTE shape), before anyone re-quantizes for it.  1 = 512 entries, 2 = 256 entries (two u16
+// lookups as now, the index masked), 3 = one u32 lookup of 1024 entries (4 KB), 4 = one u32 lookup of 256 entries (1 KB).
+#ifndef STRATA_QL_TQ_LUT_EXP
+#define STRATA_QL_TQ_LUT_EXP 0
+#endif
 // STAGED: the int8 codebook is read from shared memory (s_lut: the 2048 u16 of tq_lut_i8, copied by stage_iq_grid)
 // instead of the global table.  The same 16-bit entries, so the same weights.
 template<int TY, bool STAGED = false>
@@ -724,7 +731,18 @@ __device__ __forceinline__ TqLane tq_load(const void* __restrict__ vbq, int kbx,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
-        r.q[i] = (int) ((uint32_t) lut[x >> 21] | ((uint32_t) lut[(x >> 10) & 2047u] << 16));
+#if STRATA_QL_TQ_LUT_EXP == 1
+        r.q[i] = (int) ((uint32_t) lut[(x >> 21) & 511u] | ((uint32_t) lut[(x >> 10) & 511u] << 16));
+#elif STRATA_QL_TQ_LUT_EXP == 2
+        r.q[i] = (int) ((uint32_t) lut[(x >> 21) & 255u] | ((uint32_t) lut[(x >> 10) & 255u] << 16));
+#elif STRATA_QL_TQ_LUT_EXP == 3
+        r.q[i] = (int) ((const uint32_t*) lut)[x >> 22];
+#elif STRATA_QL_TQ_LUT_EXP == 4
+        r.q[i] = (int) ((const uint32_t*) lut)[x >> 24];
+#else
+        // tq_lut_mask: 2047, or 255 for a 256-point codebook stored periodically (tq_lut_i8.cuh): the same values
+        r.q[i] = (int) ((uint32_t) lut[(x >> 21) & tq_lut_mask] | ((uint32_t) lut[(x >> 10) & tq_lut_mask] << 16));
+#endif
     }
     r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
     return r;

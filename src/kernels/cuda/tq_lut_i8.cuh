@@ -138,8 +138,23 @@ alignas(16) static const __device__ uint16_t tq_lut_i8[2048] = {
 
 // QuantLab (11/4): a pack's own codebook (tq_lut_f16.bin, strata/kernels/tq_lut.hpp) overwrites this translation
 // unit's copy of tq_lut_i8 before the first kernel runs (tq_lut_registry.h; CUDA only)
+// QuantLab (11/11): the decode's index mask (iq_kernels.cu tq_load).  2047 = every point (the built-in table); 255 when
+// the uploaded table repeats with period 256 (a 256-point codebook stored as 8 copies, the 11/11 u16_256 table): the
+// same values come from the first 512 bytes, which the lookups then stay inside (a warp's 32 lookups touch 4 cache
+// lines instead of up to 32; RTX 3080 dense K8 gemv 133 -> 75 us).  Bitwise the same weights.  STRATA_QL_TQ_SMALL_LUT=0
+// keeps 2047.
+#if defined(__CUDACC__) || defined(__HIPCC__) || defined(__HIP__)   // (src/kernels/tq_lut.cpp reads the table on the host)
+static __constant__ uint32_t tq_lut_mask = 2047u;
+#endif
 #if defined(__CUDACC__) && !defined(__HIPCC__) && !defined(__HIP__)
 #include "tq_lut_registry.h"
-static const ::strata_tq_lut::Register strata_tq_lut_i8_register(
-    [](const uint16_t*, const uint16_t* i8) -> int { return (int) cudaMemcpyToSymbol(tq_lut_i8, i8, sizeof(tq_lut_i8)); });
+#include <cstdlib>
+static const ::strata_tq_lut::Register strata_tq_lut_i8_register([](const uint16_t*, const uint16_t* i8) -> int {
+    bool periodic = true;
+    for (int i = 256; i < 2048 && periodic; ++i) periodic = i8[i] == i8[i & 255];
+    const char* off = std::getenv("STRATA_QL_TQ_SMALL_LUT");
+    const uint32_t mask = periodic && !(off && off[0] == '0') ? 255u : 2047u;
+    const int rc = (int) cudaMemcpyToSymbol(tq_lut_i8, i8, sizeof(tq_lut_i8));
+    return rc != 0 ? rc : (int) cudaMemcpyToSymbol(tq_lut_mask, &mask, sizeof(mask));
+});
 #endif
