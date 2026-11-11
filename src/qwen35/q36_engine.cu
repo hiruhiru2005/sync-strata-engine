@@ -52,6 +52,7 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -864,6 +865,11 @@ struct Model {
     strata::core::ModelGeometry g;
     std::shared_ptr<strata::GgufModel> file;   // kept mapped: the experts are placed after the engine's buffers
     bool dense = false;                        // QuantLab 11/11: a dense qwen35 file (no routed experts, see layer())
+    // QuantLab (11/11): an APR trellis matrix (K::native_tq_type) holds W' = (W . s) H per 128 input columns, so its input
+    // goes in rotated, x' = H (s . x) per 128 (K::hadamard_rows); the signs s depend on the input width only and come
+    // from the signs file beside the GGUF (strata-desktop's gguf_q27.py: q27_signs.txt).  Empty: nothing is rotated.
+    bool tq_any = false;
+    std::map<int, const float*> rot_signs;     // width -> device signs
     bool hybrid = false;                       // not every expert fits in VRAM: slots + the CPU pool
     // the packed Q8_0 decode copies (gguf weights, packed copy, bytes): given back when that lets every expert fit
     std::vector<std::tuple<const uint8_t*, uint8_t*, size_t>> packed;
@@ -1017,6 +1023,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         w.type = (int) t->type;
         w.n_in = (int) t->shape[0];
         w.n_out = (int) t->shape[1];
+        if (K::native_tq_type(w.type)) m.tq_any = true;
         if (!K::native_mmvq_supported(w.type)) {
             std::fprintf(stderr, "strata-q36: %s is %s, which the native MMVQ does not take\n", name.c_str(), t->type_name());
             std::exit(1);
@@ -1169,6 +1176,56 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
             std::fprintf(stderr, "strata-q36: trellis codebook from %s (%d device copies)\n", lp.c_str(), copies);
         }
     }
+    if (m.tq_any) {   // QuantLab (11/11): the rotation signs of the trellis matrices' inputs (see Model::rot_signs)
+        // STRATA_Q36_TQ_SIGNS=<file>, else q27_signs.txt beside the GGUF, else <gguf>.signs.txt.  Text: "block 128",
+        // then "signs <width> s_1 .. s_width" lines (+1 / -1).  STRATA_Q36_TQ_NOROT=1 runs without (wrong outputs
+        // unless the file's trellis matrices were not rotated).
+        std::string sp;
+        auto exists = [](const std::string& f) {
+            if (FILE* h = std::fopen(f.c_str(), "rb")) { std::fclose(h); return true; }
+            return false;
+        };
+        if (const char* e = std::getenv("STRATA_Q36_TQ_SIGNS"); e && *e) sp = e;
+        else {
+            const size_t cut = path.find_last_of("/\\");
+            const std::string dir = cut == std::string::npos ? std::string() : path.substr(0, cut + 1);
+            if (exists(dir + "q27_signs.txt")) sp = dir + "q27_signs.txt";
+            else if (exists(path + ".signs.txt")) sp = path + ".signs.txt";
+        }
+        if (std::getenv("STRATA_Q36_TQ_NOROT")) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_TQ_NOROT: the trellis matrices' inputs are NOT rotated\n");
+        } else if (sp.empty()) {
+            err = "the trellis matrices need their rotation signs (q27_signs.txt beside the GGUF, or STRATA_Q36_TQ_SIGNS)";
+            return false;
+        } else {
+            std::ifstream f(sp);
+            std::string tok;
+            int block = 0;
+            while (f >> tok) {
+                if (tok == "block") {
+                    f >> block;
+                } else if (tok == "signs") {
+                    int w = 0;
+                    f >> w;
+                    std::vector<float> sv((size_t) std::max(0, w));
+                    for (auto& v : sv) {
+                        std::string a;
+                        f >> a;
+                        v = std::strtof(a.c_str(), nullptr) < 0.f ? -1.0f : 1.0f;
+                    }
+                    if (!f || w <= 0 || w % 128 != 0) { err = "signs file " + sp + ": a bad signs line"; return false; }
+                    const float* d = K::hadamard_device_signs(sv.data(), w);
+                    if (!d) { err = "signs file " + sp + ": the upload failed"; return false; }
+                    m.rot_signs[w] = d;
+                }
+            }
+            if (block != 128 || m.rot_signs.empty()) { err = "signs file " + sp + ": no 'block 128' or no signs"; return false; }
+            std::string ws;
+            for (const auto& [w, d] : m.rot_signs) ws += " " + std::to_string(w);
+            std::fprintf(stderr, "strata-q36: trellis inputs rotated (Hadamard 128 with the signs of %s: widths%s)\n",
+                         sp.c_str(), ws.c_str());
+        }
+    }
     return true;
 }
 
@@ -1246,6 +1303,7 @@ struct Engine {
     void *mq_x = nullptr, *mq_hq = nullptr;
     float *mq_gu = nullptr, *mq_h = nullptr;
     __half* x16 = nullptr;
+    float* xrot = nullptr;   // QuantLab (11/11): a trellis matrix's rotated input (Model::rot_signs)
     bool use_graph = true;
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
 
@@ -1418,6 +1476,7 @@ struct Engine {
         CK(cudaMalloc(&q8, K::native_q8_1_bytes(max_in, 1) * T));
         CK(cudaMalloc(&xq, K::native_q8_1_bytes((int) N, 1) * T));
         x16 = dalloc_t<__half>(T * (size_t) max_in);
+        if (!m->rot_signs.empty()) xrot = dalloc(T * (size_t) max_in);
         if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
             std::exit(1);
@@ -1585,8 +1644,20 @@ struct Engine {
 
     /// y [T][n_out] = W x [T][n_in] on the native MMVQ, 8 columns per launch.
     void mm(const Mat& w, const float* xin, float* out, int T) {
-        prep(xin, w.n_in, T, q8);
+        prep(xin, w.n_in, T, q8, rot_of(w));
         apply(w, q8, out, T);
+    }
+    /// QuantLab (11/11): w is a trellis matrix whose input goes in rotated (Model::rot_signs)
+    bool rot_of(const Mat& w) const { return !m->rot_signs.empty() && K::native_tq_type(w.type); }
+    /// x [T][n] rotated per 128 values with the width's signs into xrot
+    const float* rotate(const float* xin, int n, int T) {
+        const auto it = m->rot_signs.find(n);
+        if (it == m->rot_signs.end()) {
+            std::fprintf(stderr, "strata-q36: no trellis rotation signs for input width %d\n", n);
+            std::exit(1);
+        }
+        K::hadamard_rows(xin, xrot, T, n, 128, it->second, st);
+        return xrot;
     }
     /// y [T][n_out] = W [n_out][n_in] (f32) x [T][n_in]: a decode batch on the warp-per-row kernel, a prompt chunk on
     /// cuBLAS's FP32 GEMM (the router and the GDN alpha / beta stay in FP32, as llama.cpp keeps them).
@@ -1622,7 +1693,8 @@ struct Engine {
     /// A batch above kGemmT tokens (a prompt chunk) runs its projections as GEMMs (prefill::Gemm::native: the GGUF
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
     static constexpr int kGemmT = 8;
-    void prep(const float* xin, int n, int T, void* q) {
+    void prep(const float* xin, int n, int T, void* q, bool rot = false) {
+        if (rot) xin = rotate(xin, n, T);
         if (T > kGemmT) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
         else quant(xin, n, T, q);
     }
@@ -1631,7 +1703,10 @@ struct Engine {
         else mmq(w, q, out, T);
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
-    void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
+    void quant(const float* xin, int n, int T, void* q, bool rot = false) {
+        if (rot) xin = rotate(xin, n, T);
+        K::native_quantize_q8_1(xin, q, n * T, 1, st);
+    }
     // ---- decode kernels of this engine (q36_kernels.cuh), each the old kernel's bits (STRATA_Q36_VERIFY=1 compares)
     bool fast_k = std::getenv("STRATA_Q36_OLD_KERNELS") == nullptr;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
@@ -1724,18 +1799,18 @@ struct Engine {
                 }
         }
     }
-    void prep_in(int T) {
-        if (xq_ready && T <= kGemmT) {
+    void prep_in(int T, bool rot = false) {
+        if (xq_ready && T <= kGemmT && !rot) {
             xq_ready = false;
             return;
         }
         xq_ready = false;
-        prep(h, (int) m->g.n_embd, T, xq);
+        prep(h, (int) m->g.n_embd, T, xq, rot);
     }
     void add_rms_post(const Layer& L, int T) {
         const int N = (int) m->g.n_embd;
         xq_post = false;
-        if (fast_k && T <= kGemmT) {
+        if (fast_k && T <= kGemmT && !rot_of(L.sh_gate)) {
             if (verify_k) {
                 if (!vx_) {
                     CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
@@ -1949,7 +2024,7 @@ struct Engine {
             float* hc_b = verify ? v_hc[li] : hc;
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
-            prep_in(T);
+            prep_in(T, rot_of(L.qkv));
             apply(L.qkv, xq, qkv_b, T);
             apply(L.zg, xq, z, T);
             if (T <= kGemmT) {
@@ -1986,7 +2061,7 @@ struct Engine {
             }
             mm(L.ssm_out, gdn_y, y, T);
         } else {
-            prep_in(T);
+            prep_in(T, rot_of(L.wq));
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
@@ -2063,13 +2138,19 @@ struct Engine {
             // QuantLab (11/11): the dense FFN of a qwen35 file: the shared expert's products (sh_* hold ffn_gate / ffn_up /
             // ffn_down, n_ff_shexp = n_ff) without its gate, then the residual add and the next norm
             if (T > kGemmT) {
-                k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+                prep(h, N, T, xq, rot_of(L.sh_gate));   // FP16 into x16 (rotated for a trellis gate / up)
+                apply(L.sh_gate, xq, sg, T);
+                apply(L.sh_up, xq, su, T);
+                k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
+                mm(L.sh_down, shh, sy, T);
+            } else if (rot_of(L.sh_down)) {   // QuantLab (11/11): trellis: the SwiGLU in float, then rotated for down
+                if (!xq_post) quant(h, N, T, xq, rot_of(L.sh_gate));
                 apply(L.sh_gate, xq, sg, T);
                 apply(L.sh_up, xq, su, T);
                 k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
                 mm(L.sh_down, shh, sy, T);
             } else {
-                if (!xq_post) quant(h, N, T, xq);
+                if (!xq_post) quant(h, N, T, xq, rot_of(L.sh_gate));
                 if (!shared_gu(L, T)) {
                     apply(L.sh_gate, xq, sg, T);
                     apply(L.sh_up, xq, su, T);

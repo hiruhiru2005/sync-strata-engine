@@ -426,6 +426,7 @@ namespace {
 bool iq_only(int t) {
     // QuantLab (10/31): the trellis dense matrices (STRATA_QL_DENSE_TQ) dequantize like the i-quants (dq_dispatch)
     if (t == 144 || t == 145 || t == 146 || (t >= 169 && t <= 174)) return true;
+    if (t >= 186 && t <= 194) return true;   // QuantLab (11/11): bih3 (computed points)
     return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29;
 }
 }  // namespace

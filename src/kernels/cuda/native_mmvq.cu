@@ -3442,7 +3442,7 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 // QuantLab (10/31, STRATA_QL_DENSE_TQ): the APR trellis types as dense matrices (Hadamard-rotated input, see native_dense)
 bool native_tq_type(int t) noexcept {
-    return t == 144 || t == 145 || t == 146 || (t >= 169 && t <= 174);
+    return t == 144 || t == 145 || t == 146 || (t >= 169 && t <= 174) || (t >= 186 && t <= 194);   // 186..194: bih3 (11/11)
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
@@ -3470,6 +3470,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 16: case 17: case 18: case 21: case 22: case 29:
         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
     case 144: case 145: case 146: case 169: case 170: case 171: case 172: case 173: case 174:   // QuantLab trellis
+    case 186: case 187: case 188: case 189: case 190: case 191: case 192: case 193: case 194:   // bih3 (11/11)
         block_elems = 128; block_bytes = (int) iq_row_bytes(ggml_type, 128); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
@@ -3499,6 +3500,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 16: case 17: case 18: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 144: case 145: case 146: case 169: case 170: case 171: case 172: case 173: case 174:   // QuantLab trellis
+    case 186: case 187: case 188: case 189: case 190: case 191: case 192: case 193: case 194:   // bih3 (11/11)
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }

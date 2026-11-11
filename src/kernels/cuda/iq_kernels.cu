@@ -636,7 +636,43 @@ template<> struct TqInfo<172> { using block_t = block_tq_any<12>; static constex
 // 10/26: K 13 and 14 (173, 174) for the v2 packs' down rows; tq_states4 reads their states one step at a time
 template<> struct TqInfo<173> { using block_t = block_tq_any<13>; static constexpr int K = 13; };
 template<> struct TqInfo<174> { using block_t = block_tq_any<14>; static constexpr int K = 14; };
+// QuantLab (11/11): the bih3 trellis types 180 + K (186..194, K 6..14; strata-desktop's tq.py QL_TQ_CB=bih3): the same
+// block (fp16 d + 32 steps of K bits) and the same state windows as the table types (K 8 the TQ2_T bytes of 144, the
+// others the bitstream windows of 145 / 146 / 169..174), but a step's 4 weights are computed from its 15-bit state
+// instead of looked up (no codebook file): x_i = s * C_i (C = 0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35, 0x27D4EB2F), and
+// weight j = (byte j of each of T0 = [x0.b1 x0.b2 x0.b3 x1.b1], T1 = [x1.b2 x1.b3 x2.b1 x2.b2], T2 = [x2.b3 x3.b1 x3.b2
+// x3.b3], unsigned) summed - 384, / 128, times d.
+template<> struct TqInfo<186> { using block_t = block_tq_any<6>; static constexpr int K = 6; };
+template<> struct TqInfo<187> { using block_t = block_tq_any<7>; static constexpr int K = 7; };
+template<> struct TqInfo<188> { using block_t = block_tq_any<8>; static constexpr int K = 8; };
+template<> struct TqInfo<189> { using block_t = block_tq_any<9>; static constexpr int K = 9; };
+template<> struct TqInfo<190> { using block_t = block_tq_any<10>; static constexpr int K = 10; };
+template<> struct TqInfo<191> { using block_t = block_tq_any<11>; static constexpr int K = 11; };
+template<> struct TqInfo<192> { using block_t = block_tq_any<12>; static constexpr int K = 12; };
+template<> struct TqInfo<193> { using block_t = block_tq_any<13>; static constexpr int K = 13; };
+template<> struct TqInfo<194> { using block_t = block_tq_any<14>; static constexpr int K = 14; };
+template<int TY> inline constexpr bool kTqBih3 = TY >= 186 && TY <= 194;
+template<int TY> inline constexpr bool kTqBytes8 = TY == 144 || TY == 188;   // the TQ2_T byte states (K 8)
+// the three byte planes of a bih3 step (bytes unsigned; weight j = sum of byte j of the three - 384)
+__device__ __forceinline__ void tq_bih3p(uint32_t s, uint32_t& p0, uint32_t& p1, uint32_t& p2) {
+    const uint32_t x0 = s * 0x9E3779B1u, x1 = s * 0x85EBCA6Bu, x2 = s * 0xC2B2AE35u, x3 = s * 0x27D4EB2Fu;
+    p0 = __byte_perm(x0, x1, 0x5321u);
+    p1 = __byte_perm(x1, x2, 0x6532u);
+    p2 = __byte_perm(x2, x3, 0x7653u);
+}
 __device__ __forceinline__ float tq_h2f(uint32_t bits) { return __half2float(__ushort_as_half((unsigned short) bits)); }
+// the four unscaled weights of a bih3 step (a.x, a.y, b.x, b.y), as tq_step's
+__device__ __forceinline__ void tq_step_bih3(uint32_t s, float2& a, float2& b) {
+    uint32_t p0, p1, p2;
+    tq_bih3p(s & 0x7FFFu, p0, p1, p2);
+    float w[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        w[j] = (float) ((int) ((p0 >> (8 * j)) & 255u) + (int) ((p1 >> (8 * j)) & 255u) + (int) ((p2 >> (8 * j)) & 255u) - 384) *
+               (1.0f / 128.0f);
+    a = make_float2(w[0], w[1]);
+    b = make_float2(w[2], w[3]);
+}
 // the four unscaled weights of the step with state s: (a.x, a.y, b.x, b.y)
 __device__ __forceinline__ void tq_step(uint32_t s, float2& a, float2& b) {
     const uint32_t* lut = (const uint32_t*) tq_lut_f16;
@@ -657,7 +693,7 @@ __device__ __forceinline__ void tq_step(uint32_t s, float2& a, float2& b) {
 template<int TY>
 __device__ __forceinline__ void tq_states4(const uint8_t* qs, int l, uint32_t s[4]) {
     const uint16_t* qs16 = (const uint16_t*) qs;
-    if constexpr (TY == 144) {   // s_t = qs[(t + 31) % 32] << 8 | qs[t]
+    if constexpr (kTqBytes8<TY>) {   // s_t = qs[(t + 31) % 32] << 8 | qs[t]
         const uint32_t w01 = STRATA_TQ_LD16(qs16 + 2 * l + 0), w23 = STRATA_TQ_LD16(qs16 + 2 * l + 1);
         const uint32_t prev = qs[(4 * l + 31) & 31];
         const uint32_t b0 = w01 & 0xFF, b1 = w01 >> 8, b2 = w23 & 0xFF, b3 = w23 >> 8;
@@ -3552,7 +3588,8 @@ __device__ void dq_tq(const void* vx, int64_t ibs, dst_t* yy, int tid) {
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         float2 a, c;
-        tq_step(s[2 * half + i], a, c);
+        if constexpr (kTqBih3<TY>) tq_step_bih3(s[2 * half + i], a, c);
+        else tq_step(s[2 * half + i], a, c);
         y[4 * i + 0] = cvt<dst_t>(d * a.x);
         y[4 * i + 1] = cvt<dst_t>(d * a.y);
         y[4 * i + 2] = cvt<dst_t>(d * c.x);
@@ -3627,6 +3664,16 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 172: dq_tq<172>(vx, ibs, y, tid); break;
         case 173: dq_tq<173>(vx, ibs, y, tid); break;
         case 174: dq_tq<174>(vx, ibs, y, tid); break;
+        // QuantLab (11/11): the bih3 types (computed points)
+        case 186: dq_tq<186>(vx, ibs, y, tid); break;
+        case 187: dq_tq<187>(vx, ibs, y, tid); break;
+        case 188: dq_tq<188>(vx, ibs, y, tid); break;
+        case 189: dq_tq<189>(vx, ibs, y, tid); break;
+        case 190: dq_tq<190>(vx, ibs, y, tid); break;
+        case 191: dq_tq<191>(vx, ibs, y, tid); break;
+        case 192: dq_tq<192>(vx, ibs, y, tid); break;
+        case 193: dq_tq<193>(vx, ibs, y, tid); break;
+        case 194: dq_tq<194>(vx, ibs, y, tid); break;
         default: break;
     }
 }
@@ -3699,6 +3746,7 @@ bool is_iq(int t) {
     // QuantLab: the per-expert K rates (dq_dispatch only; no grouped or MMVQ kernel lists them, so
     // native_expert_supported still refuses them as a layer's one format)
     if (t == 150 || t == 151 || t == 162 || t == 163 || (t >= 169 && t <= 174)) return true;
+    if (t >= 186 && t <= 194) return true;   // QuantLab (11/11): bih3
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149;
@@ -3959,7 +4007,7 @@ template<int TY> struct TqKOf { static constexpr int value = TqInfo<TY>::K; };
 template<> struct TqKOf<144> { static constexpr int value = 8; };   // TQ2_T: byte-aligned, K 8
 template<int TY>
 __device__ __forceinline__ uint32_t tq_state1(const uint8_t* qs, int t) {   // step t (0..31) of a block, as tq_states4
-    if constexpr (TY == 144) {
+    if constexpr (kTqBytes8<TY>) {
         return ((uint32_t) qs[(t + 31) & 31] << 8) | qs[t];
     } else {
         constexpr int K = TqInfo<TY>::K, nwords = 2 * K;
@@ -5055,7 +5103,8 @@ __device__ __forceinline__ void tq_v10_block(const uint8_t* __restrict__ ba, con
 }
 template<bool U8, bool A128 = false>
 __global__ void __launch_bounds__(32 * kTqV7Warps) tq_v9_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
-                                                                   float* __restrict__ y, int n_in, int n_out, int ncols) {
+                                                                   float* __restrict__ y, int n_in, int n_out, int ncols,
+                                                                   float post) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ float s_red[kTqV7Warps][32][4];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -5092,13 +5141,13 @@ __global__ void __launch_bounds__(32 * kTqV7Warps) tq_v9_k8_kernel(const uint8_t
                 v2 += s_red[q][lane][2];
                 v3 += s_red[q][lane][3];
             }
-            if (ra < n_out) {
-                if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + ra, v0);
-                if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + ra, v1);
+            if (ra < n_out) {   // post: the weights' scale beyond the activations' (1 for the speed probes)
+                if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + ra, v0 * post);
+                if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + ra, v1 * post);
             }
             if (rb < n_out) {
-                if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + rb, v2);
-                if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + rb, v3);
+                if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + rb, v2 * post);
+                if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + rb, v3 * post);
             }
         }
         __syncthreads();
@@ -5109,7 +5158,8 @@ __global__ void __launch_bounds__(32 * kTqV7Warps) tq_v9_k8_kernel(const uint8_t
 #endif
 }
 template<bool U8>
-void launch_tq_v9_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+void launch_tq_v9_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s,
+                     float post = 1.0f) {
     static const int blocks = [] {
         int dev = 0, sms = 0, per = 0;
         cudaGetDevice(&dev);
@@ -5119,7 +5169,7 @@ void launch_tq_v9_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out,
     }();
     const int ntiles = (n_out + 15) / 16;
     cudaMemsetAsync(y, 0, sizeof(float) * (size_t) ncols * (size_t) n_out, s);
-    tq_v9_k8_kernel<U8><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+    tq_v9_k8_kernel<U8><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols, post);
 }
 template<bool U8>
 void launch_tq_v10_k8(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
@@ -5134,7 +5184,108 @@ void launch_tq_v10_k8(const uint8_t* W, size_t rb, const block_q8_1* X, float* y
     const int xb = n_in / 32, ny = ncols * n_out, nth = std::max(xb / 4 * ncols, ny);
     tq_x_planar128_kernel<<<(unsigned) ((nth + 255) / 256), 256, 0, s>>>(X, xb, ncols, y, ny);   // also zeroes y
     const int ntiles = (n_out + 15) / 16;
-    tq_v9_k8_kernel<U8, true><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+    tq_v9_k8_kernel<U8, true><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols,
+                                                                                            1.0f);
+}
+
+// ---- QuantLab (11/11): decode of the bih3 types (186..194) for any K, 1..8 columns: one warp a row, a lane takes
+// 4 steps (16 weights, tq_states4's windows) at a time; the planes' bytes made signed (u - 128 = (u ^ 0x80) as int8) and
+// dotted with the q8_1 activations by dp4a, 12 for 16 weights.  The correct path for every K (the fast K 8 kernels
+// above are routed in launch_tq_bih3).
+template<int TY, int NC>
+__global__ void __launch_bounds__(128) tq_bih3_mmvq_kernel(const uint8_t* __restrict__ w, size_t rb,
+                                                           const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                           int n_in, int n_out) {
+    using blk_t = typename TqInfo<TY>::block_t;
+    const int lane = threadIdx.x & 31, row = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (row >= n_out) return;
+    const blk_t* br = (const blk_t*) (w + (size_t) row * rb);
+    const int nu = (n_in / 128) * 8, xb = n_in / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.f;
+    for (int u = lane; u < nu; u += 32) {
+        const int b = u >> 3, l = u & 7;
+        const blk_t* blk = br + b;
+        uint32_t s[4];
+        tq_states4<TY>(blk->qs, l, s);
+        int P[4][3];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint32_t p0, p1, p2;
+            tq_bih3p(s[i] & 0x7FFFu, p0, p1, p2);
+            P[i][0] = (int) (p0 ^ 0x80808080u);
+            P[i][1] = (int) (p1 ^ 0x80808080u);
+            P[i][2] = (int) (p2 ^ 0x80808080u);
+        }
+        const float dw = tq_h2f(blk->d) * (1.0f / 128.0f);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const block_q8_1* xq = x + (size_t) c * xb + 4 * b + (l >> 1);
+            const int* qi = (const int*) xq->qs + 4 * (l & 1);
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int a = qi[i];
+                sumi = ggml_cuda_dp4a(P[i][0], a, sumi);
+                sumi = ggml_cuda_dp4a(P[i][1], a, sumi);
+                sumi = ggml_cuda_dp4a(P[i][2], a, sumi);
+            }
+            acc[c] += dw * __low2float(xq->ds) * (float) sumi;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_sum(acc[c]);
+        if (lane == 0) y[(size_t) c * n_out + row] = v;
+    }
+}
+template<int TY>
+void launch_tq_bih3_ty(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
+                       cudaStream_t s) {
+    const dim3 grid((unsigned) ((n_out + 3) / 4)), block(128);
+    switch (ncols) {
+        case 1: tq_bih3_mmvq_kernel<TY, 1><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+        case 2: tq_bih3_mmvq_kernel<TY, 2><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+        case 3: tq_bih3_mmvq_kernel<TY, 3><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+        case 4: tq_bih3_mmvq_kernel<TY, 4><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+        case 5: tq_bih3_mmvq_kernel<TY, 5><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+        case 6: tq_bih3_mmvq_kernel<TY, 6><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+        case 7: tq_bih3_mmvq_kernel<TY, 7><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+        default: tq_bih3_mmvq_kernel<TY, 8><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out); break;
+    }
+}
+// STRATA_QL_BIH3_FAST=0 keeps every call on the generic kernel (for the parity checks)
+static bool ql_bih3_fast() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_BIH3_FAST"); return !(v && v[0] == '0'); }();
+    return on;
+}
+void launch_tq_bih3(int t, const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
+                    cudaStream_t s) {
+    if (ncols < 1 || ncols > 8 || n_in % 128 != 0) {
+        std::fprintf(stderr, "iq_mmvq: bih3 type %d takes 1..8 columns and n_in a multiple of 128 (got %d, %d)\n", t, ncols,
+                     n_in);
+        std::exit(1);
+    }
+    // K 8, 2..8 columns: v9's tensor-core kernel (bytes unsigned - 128) on the planar activations
+    if (t == 188 && ql_bih3_fast() && ncols >= 2 && n_in % 1024 == 0 && n_in <= kTqxMaxIn &&
+        rb == (size_t) (n_in / 128) * 34u) {
+        const int xb = n_in / 32;
+        tq_x_planar_kernel<<<(unsigned) ((xb * ncols + 127) / 128), 128, 0, s>>>(X, xb, ncols);
+        launch_tq_v9_k8<true>(W, rb, y, n_in, n_out, ncols, s, (1.0f / 128.0f) / TQ_LUT_I8_SCALE);
+        return;
+    }
+    switch (t) {
+        case 186: launch_tq_bih3_ty<186>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 187: launch_tq_bih3_ty<187>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 188: launch_tq_bih3_ty<188>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 189: launch_tq_bih3_ty<189>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 190: launch_tq_bih3_ty<190>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 191: launch_tq_bih3_ty<191>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 192: launch_tq_bih3_ty<192>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 193: launch_tq_bih3_ty<193>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        default: launch_tq_bih3_ty<194>(W, rb, X, y, n_in, n_out, ncols, s); break;
+    }
 }
 
 // False (nothing launched) outside the scratch's limits: the caller runs mmvq_multi_kernel then.
@@ -7129,6 +7280,8 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 162: return (size_t) (n / 128) * (2 + 4 * 2);
         case 163: return (size_t) (n / 128) * (2 + 4 * 3);
         case 169: case 170: case 171: case 172: case 173: case 174: return (size_t) (n / 128) * (2 + 4 * (t - 160));
+        case 186: case 187: case 188: case 189: case 190: case 191: case 192: case 193: case 194:   // bih3 (11/11)
+            return (size_t) (n / 128) * (2 + 4 * (t - 180));
         default: return 0;
     }
 }
@@ -7145,6 +7298,11 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     cudaStream_t s = (cudaStream_t) stream;
     const auto* W = (const uint8_t*) w;
     const auto* X = (const block_q8_1*) x_q8_1;
+    if (t >= 186 && t <= 194) {   // QuantLab (11/11): bih3
+        launch_tq_bih3(t, W, rb, X, y, n_in, n_out, ncols, s);
+        check("iq_mmvq");
+        return;
+    }
     switch (t) {
 #define STRATA_MMVQ(T) case T: launch_mmvq<T>(W, rb, X, y, n_in, n_out, ncols, s); break;
         STRATA_MMVQ_FMTS(STRATA_MMVQ)
