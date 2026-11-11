@@ -29,6 +29,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -39,9 +40,17 @@
 
 namespace cpu = strata::kernels::cpu;
 namespace k = strata::kernels;
+namespace strata::kernels {   // QuantLab (11/12) iq_kernels.cu: the bandwidth yardstick (--bw)
+void ql_bw_probe(const unsigned long long* d_ptrs, const unsigned long long* d_sizes, int n, int blocks_x, int unroll,
+                 unsigned* d_out, cudaStream_t s);
+}
 
 namespace {
-constexpr int NT = 3, NE = 12;   // 10/26: (2,3) .. (13,14)
+int NT = 3, NE = 12;   // 10/26: (2,3) .. (13,14); 11/12: --nt / --ne
+// QuantLab (11/12) --kmix: the experts' K as Sync-M deals them (gate/up K 4..12 weighted like experts_k.txt, down K + 1),
+// for a launch shaped like the decode's (--ne 18 --nt 1: ~18 VRAM experts a layer, 1-2 tokens each)
+bool g_kmix = false;
+constexpr int kKmix[18] = {8, 9, 7, 10, 6, 8, 9, 7, 5, 11, 12, 8, 10, 6, 9, 7, 4, 8};
 constexpr int64_t H = 2560, FF = 640;
 
 bool g_bih3 = false;   // QuantLab (11/12) --bih3: the types 180 + K (points computed from the state)
@@ -151,14 +160,19 @@ float r1q2_d(const cpu::NativeFmt& f, const uint8_t* blob, int m, int64_t r, int
 int main(int argc, char** argv) {
     bool had = false, r1q2 = false;
     int time_n = 0;
+    bool bw = false;   // QuantLab (11/12) --bw: the read-only yardstick
     std::string lut, dump;   // QuantLab (11/9) --dump PREFIX: the grouped GPU output to PREFIX.<grid>.bin
     for (int i = 1; i < argc; ++i) {
         had = had || std::string(argv[i]) == "--hadamard";
         r1q2 = r1q2 || std::string(argv[i]) == "--r1q2";
         g_bih3 = g_bih3 || std::string(argv[i]) == "--bih3";
+        g_kmix = g_kmix || std::string(argv[i]) == "--kmix";
+        if (std::string(argv[i]) == "--nt" && i + 1 < argc) NT = std::max(1, std::min(8, std::atoi(argv[++i])));
+        if (std::string(argv[i]) == "--ne" && i + 1 < argc) NE = std::max(1, std::min(64, std::atoi(argv[++i])));
         if (std::string(argv[i]) == "--lut" && i + 1 < argc) lut = argv[++i];
         if (std::string(argv[i]) == "--dump" && i + 1 < argc) dump = argv[++i];
         if (std::string(argv[i]) == "--time" && i + 1 < argc) time_n = std::atoi(argv[++i]);   // QuantLab (11/12)
+        bw = bw || std::string(argv[i]) == "--bw";
     }
     if (!lut.empty()) {   // QuantLab (11/4): the codebook on both sides, as the engine sets it from a pack
         std::string err;
@@ -189,8 +203,8 @@ int main(int argc, char** argv) {
     std::mt19937 rng(20261025);
     std::uniform_real_distribution<float> sd(0.004f, 0.02f);
     for (int e = 0; e < NE; ++e) {
-        kg[e] = 2 + e;
-        kd[e] = 3 + e;
+        kg[e] = g_kmix ? kKmix[e % 18] : 2 + (e % 12);
+        kd[e] = kg[e] + 1;
         std::string err;
         if (!cpu::native_fmt(tq_type(kg[e]), tq_type(kd[e]), H, FF, fmt[e], err)) {
             std::printf("native_fmt K %d/%d: %s  FAIL\n", kg[e], kd[e], err.c_str());
@@ -234,22 +248,20 @@ int main(int argc, char** argv) {
         std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes)),
             hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
         std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
-        const void* a[NT];
-        float* fp[NT];
-        const void* hp[NT];
-        float* op[NT];
+        std::vector<const void*> a(NT), hp(NT);
+        std::vector<float*> fp(NT), op(NT);
         for (int t = 0; t < NT; ++t) {
             cpu::native_quant_act(f, x.data() + t * H, act[t].data());
             a[t] = act[t].data();
             fp[t] = ff[t].data();
         }
-        cpu::native_gu_rows(f, blob[e].data(), a, NT, fp, 0, (int) FF);
+        cpu::native_gu_rows(f, blob[e].data(), a.data(), NT, fp.data(), 0, (int) FF);
         for (int t = 0; t < NT; ++t) {
             cpu::native_quant_h(f, ff[t].data(), hq[t].data());   // (rotates h when the down is folded)
             hp[t] = hq[t].data();
             op[t] = want.data() + ((size_t) e * NT + t) * H;
         }
-        cpu::native_down_rows(f, blob[e].data(), hp, NT, op, 0, (int) H);
+        cpu::native_down_rows(f, blob[e].data(), hp.data(), NT, op.data(), 0, (int) H);
     }
 
     // (b) the GPU: the experts packed like a mixed layer in experts.bin, one group each, tagged pointers
@@ -339,6 +351,49 @@ int main(int argc, char** argv) {
         cudaEventElapsedTime(&ms, e0, e1);
         std::printf("  time: %d experts x %d tokens, one grouped launch %.2f us (mean of %d)\n", NE, NT,
                     1000.0 * ms / time_n, time_n);
+    }
+    // QuantLab (11/12) --bw: how fast this GPU reads the same bytes doing nothing else - the experts' blobs from NE places
+    // (expert-shaped) and the whole arena as one run (dense-shaped), and a 256 MiB run for the card's peak
+    if (bw) {
+        uint8_t* d_big = nullptr;
+        unsigned* d_o = nullptr;
+        unsigned long long *d_p = nullptr, *d_sz = nullptr;
+        const size_t big = (size_t) 256 << 20;
+        if (!ck(cudaMalloc((void**) &d_big, big), "big") || !ck(cudaMemset(d_big, 1, big), "big set") ||
+            !ck(cudaMalloc((void**) &d_o, 16), "o") || !ck(cudaMalloc((void**) &d_p, 8 * (NE + 1)), "p") ||
+            !ck(cudaMalloc((void**) &d_sz, 8 * (NE + 1)), "sz"))
+            return 1;
+        auto run = [&](const char* what, const std::vector<unsigned long long>& hp, const std::vector<unsigned long long>& hs,
+                       int bx, int unroll) {
+            cudaMemcpy(d_p, hp.data(), 8 * hp.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_sz, hs.data(), 8 * hs.size(), cudaMemcpyHostToDevice);
+            double bytes = 0;
+            for (unsigned long long v : hs) bytes += (double) v;
+            for (int i = 0; i < 20; ++i) k::ql_bw_probe(d_p, d_sz, (int) hp.size(), bx, unroll, d_o, s);
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            const int reps = 1000;
+            cudaEventRecord(e0, s);
+            for (int i = 0; i < reps; ++i) k::ql_bw_probe(d_p, d_sz, (int) hp.size(), bx, unroll, d_o, s);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double us = 1000.0 * ms / reps;
+            std::printf("  bw %-34s blocks %3d x %2zu, unroll %d: %8.2f us, %6.1f GB/s (%.1f MB)\n", what, bx, hp.size(), unroll, us,
+                        bytes / (us * 1e3), bytes / 1e6);
+        };
+        std::vector<unsigned long long> ep(NE), es(NE), dp(1), ds(1), bp(1), bs(1);
+        for (int e = 0; e < NE; ++e) { ep[e] = (unsigned long long) (d_arena + off[e]); es[e] = blob[e].size() / 16 * 16; }
+        dp[0] = (unsigned long long) d_arena; ds[0] = total / 16 * 16;
+        bp[0] = (unsigned long long) d_big; bs[0] = big;
+        for (int unroll : {1, 4})
+            for (int bx : {8, 16, 32, 64}) run("experts (NE places)", ep, es, bx, unroll);
+        for (int unroll : {1, 4})
+            for (int bx : {136, 272, 544, 1088}) run("dense (the arena as one run)", dp, ds, bx, unroll);
+        for (int unroll : {1, 4})
+            for (int bx : {272, 1088, 4352}) run("dense 256 MiB", bp, bs, bx, unroll);
     }
     // (c) the prompt path's dequantizers against the host decode
     uint16_t* d_h = nullptr;

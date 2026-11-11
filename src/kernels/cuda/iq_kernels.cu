@@ -2552,7 +2552,14 @@ __device__ __forceinline__ TqLane tq_load_codes(const uint8_t* __restrict__ qs, 
     return r;
 }
 // row_dot_multi for one R1Q2 row: block kbx's scale colscale[kbx] * p2[q]; the caller multiplies by the row's rowbase
-template<int TY, int NC, bool STAGED = false>
+// QuantLab (11/12) PROBE (STRATA_QL_TQMIX_PROBE, task 4's cut-outs; SPEED ONLY, the sums are wrong for PROBE > 0):
+// 1 = no activation reads and no dp4a (the codes, states, points and scales stay), 2 = the codes' words and the scales
+// read only (no states, no points), 3 = the states but no points.  Each folds what it kept into the sum (no dead code).
+template<int TY> __host__ __device__ constexpr int tq_k_of() {   // K of a trellis type (TQ2_T: 8, TqInfo has no K for it)
+    if constexpr (TY == 144) return 8;
+    else return TqInfo<TY>::K;
+}
+template<int TY, int NC, bool STAGED = false, int PROBE = 0>
 __device__ __forceinline__ void row_dot_multi_r1(const uint8_t* row, const uint16_t* __restrict__ colscale,
                                                  const uint8_t* __restrict__ qrow, const float* __restrict__ p2,
                                                  const block_q8_1* x, const int (&off)[NC], int n, int nb, int lane,
@@ -2566,8 +2573,28 @@ __device__ __forceinline__ void row_dot_multi_r1(const uint8_t* row, const uint1
         // scale / 128.  The same lanes, order and warp_sum as the table rows.
         for (int k = lane; k < nb * 8; k += 32) {
             const int kbx = k >> 3, l = k & 7;
+            if constexpr (PROBE == 2) {
+                constexpr int K = tq_k_of<TY>(), NW = 2 * K;
+                const uint16_t* q16 = (const uint16_t*) (row + (size_t) kbx * CB);
+                const int wb = ((28 - 4 * l) * K) >> 4;
+                const uint32_t v = (uint32_t) q16[wb % NW] ^ ((uint32_t) q16[(wb + 1) % NW] << 3) ^
+                                   ((uint32_t) q16[(wb + 2) % NW] << 7) ^ ((uint32_t) q16[(wb + 3) % NW] << 11);
+                const float dw = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3];
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < n) s[c] += dw * (float) v;
+                continue;
+            }
             uint32_t st[4];
             tq_states4<TY>(row + (size_t) kbx * CB, l, st);
+            if constexpr (PROBE == 3) {
+                const float dw = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3];
+                const uint32_t v = st[0] ^ (st[1] << 3) ^ (st[2] << 7) ^ (st[3] << 11);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < n) s[c] += dw * (float) v;
+                continue;
+            }
             int P[4][3];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -2578,6 +2605,15 @@ __device__ __forceinline__ void row_dot_multi_r1(const uint8_t* row, const uint1
                 P[i][2] = (int) (p2b ^ 0x80808080u);
             }
             const float dw = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3] * (1.0f / 128.0f);
+            if constexpr (PROBE == 1) {
+                int v = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) v ^= P[i][0] ^ (P[i][1] << 1) ^ (P[i][2] << 2);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < n) s[c] += dw * (float) v;
+                continue;
+            }
 #pragma unroll
             for (int c = 0; c < NC; ++c)
                 if (c < n) {
@@ -2601,8 +2637,34 @@ __device__ __forceinline__ void row_dot_multi_r1(const uint8_t* row, const uint1
     }
     for (int k = lane; k < nb * 8; k += 32) {
         const int kbx = k >> 3, iqs = 4 * (k & 7);
+        if constexpr (PROBE == 2 || PROBE == 3) {
+            const float dw = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3];
+            uint32_t v = 0;
+            if constexpr (PROBE == 2) {
+                constexpr int K = tq_k_of<TY>(), NW = 2 * K;
+                const uint16_t* q16 = (const uint16_t*) (row + (size_t) kbx * CB);
+                const int wb = ((28 - iqs) * K) >> 4;
+                v = (uint32_t) q16[wb % NW] ^ ((uint32_t) q16[(wb + 1) % NW] << 3) ^ ((uint32_t) q16[(wb + 2) % NW] << 7) ^
+                    ((uint32_t) q16[(wb + 3) % NW] << 11);
+            } else {
+                uint32_t st[4];
+                tq_states4<TY>(row + (size_t) kbx * CB, iqs / 4, st);
+                v = st[0] ^ (st[1] << 3) ^ (st[2] << 7) ^ (st[3] << 11);
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c < n) s[c] += dw * (float) v;
+            continue;
+        }
         TqLane w = tq_load_codes<TY, STAGED>(row + (size_t) kbx * CB, iqs, s_lut);
         w.d = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3];
+        if constexpr (PROBE == 1) {
+            const int v = w.q[0] ^ (w.q[1] << 1) ^ (w.q[2] << 2) ^ (w.q[3] << 3);
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c < n) s[c] += w.d * (float) v;
+            continue;
+        }
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (c < n) s[c] += tq_apply(w, x + off[c] + kbx * 4, iqs);
@@ -2649,7 +2711,7 @@ __device__ __forceinline__ void tqmix_down_rows(const uint8_t* wr, const block_q
     }
 }
 
-template<int TY, bool STAGED = false>
+template<int TY, bool STAGED = false, int PROBE = 0>
 __device__ __forceinline__ void tqmix_gu_rows_r1(const uint8_t* wr, const uint16_t* colscale, const uint8_t* qrow,
                                                  const float* p2, float rbase, const block_q8_1* __restrict__ xq,
                                                  const int32_t* __restrict__ ent_tok, int e0, int e1, int xb, int nb,
@@ -2661,13 +2723,13 @@ __device__ __forceinline__ void tqmix_gu_rows_r1(const uint8_t* wr, const uint16
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
         float s[GRP_NC];
-        row_dot_multi_r1<TY, GRP_NC, STAGED>(wr, colscale, qrow, p2, xq, off, n, nb, lane, s, s_lut);
+        row_dot_multi_r1<TY, GRP_NC, STAGED, PROBE>(wr, colscale, qrow, p2, xq, off, n, nb, lane, s, s_lut);
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c)
             if (c < n && lane == c) dst[(size_t) (e + c) * n_ff + r] = s[c] * rbase;
     }
 }
-template<int TY, bool STAGED = false>
+template<int TY, bool STAGED = false, int PROBE = 0>
 __device__ __forceinline__ void tqmix_down_rows_r1(const uint8_t* wr, const uint16_t* colscale, const uint8_t* qrow,
                                                    const float* p2, float rbase, const block_q8_1* __restrict__ hq,
                                                    const int32_t* __restrict__ ent_dst, int e0, int e1, int hb, int nb,
@@ -2679,7 +2741,7 @@ __device__ __forceinline__ void tqmix_down_rows_r1(const uint8_t* wr, const uint
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
         float s[GRP_NC];
-        row_dot_multi_r1<TY, GRP_NC, STAGED>(wr, colscale, qrow, p2, hq, off, n, nb, lane, s, s_lut);
+        row_dot_multi_r1<TY, GRP_NC, STAGED, PROBE>(wr, colscale, qrow, p2, hq, off, n, nb, lane, s, s_lut);
 #pragma unroll
         for (int c = 0; c < GRP_NC; ++c)
             if (c < n && lane == c) out[(size_t) ent_dst[e + c] * n_embd + r] = s[c] * rbase;
@@ -2695,7 +2757,7 @@ __device__ __forceinline__ const uint8_t* r1q2_scales_at(const uint8_t* blob, in
 // QuantLab (11/9): STAGED (STRATA_QL_TQMIX_SMEM=1) - the R1Q2 rows read the int8 codebook from shared memory, staged
 // once per block before any warp leaves (a warp's 32 lookups land in ~27 different 32-byte sectors of the 4 KB global
 // table; in shared memory they cost the bank conflicts only).  The same entries, so bitwise the same sums.
-template<bool STAGED>
+template<bool STAGED, int PROBE = 0>
 __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
@@ -2733,7 +2795,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
             const uint8_t* qrow = sc + (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) r * qge;
             const float* p2 = L.p2[is_up ? 1 : 0];
             const float rbase = tq_h2f(rb[r]);
-#define STRATA_TQ_MIX_GU_R1(K, T) case K: tqmix_gu_rows_r1<T, STAGED>(wr, cs, qrow, p2, rbase, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r, s_lut); break;
+#define STRATA_TQ_MIX_GU_R1(K, T) case K: tqmix_gu_rows_r1<T, STAGED, PROBE>(wr, cs, qrow, p2, rbase, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r, s_lut); break;
             if (L.tq_bih3) {   // QuantLab (11/12): a bih3 layer (types 180 + K)
                 switch (kg) {
                     STRATA_TQ_MIX_KS_B(STRATA_TQ_MIX_GU_R1)
@@ -2760,7 +2822,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
     }   // the row chunks
 }
 
-template<bool STAGED>
+template<bool STAGED, int PROBE = 0>
 __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
@@ -2794,7 +2856,7 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
             const uint16_t* cs = (const uint16_t*) (sc + (size_t) L.n_embd * 2);
             const uint8_t* qrow = sc + (size_t) L.n_embd * 2 + (size_t) nb * 2 + (size_t) r * qdf;
             const float rbase = tq_h2f(rb[r]);
-#define STRATA_TQ_MIX_DOWN_R1(K, T) case K: tqmix_down_rows_r1<T, STAGED>(wr, cs, qrow, L.p2[2], rbase, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r, s_lut); break;
+#define STRATA_TQ_MIX_DOWN_R1(K, T) case K: tqmix_down_rows_r1<T, STAGED, PROBE>(wr, cs, qrow, L.p2[2], rbase, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r, s_lut); break;
             if (L.tq_bih3) {   // QuantLab (11/12): a bih3 layer (types 180 + K)
                 switch (kd) {
                     STRATA_TQ_MIX_KS_B(STRATA_TQ_MIX_DOWN_R1)
@@ -8312,6 +8374,42 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
     return gu || down;
 }
 
+// ---- QuantLab (11/12): the bandwidth yardstick of tq_mix_parity --bw (task 4: how fast this GPU reads expert-shaped
+// data at all).  Region blockIdx.y, 16-byte loads (__ldg), U independent loads in flight per thread, XOR-folded; the
+// result is written only when it equals an unlikely constant, so nothing is stored but the loads stay.
+template<int U>
+__global__ void ql_bw_probe_kernel(const unsigned long long* __restrict__ ptrs, const unsigned long long* __restrict__ sizes,
+                                   int n, unsigned* __restrict__ out) {
+    const int r = blockIdx.y;
+    if (r >= n) return;
+    const uint4* p = (const uint4*) ptrs[r];
+    const size_t nv = (size_t) (sizes[r] / 16);
+    const size_t step = (size_t) gridDim.x * blockDim.x;
+    uint32_t acc[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) acc[u] = 0;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < nv; i += step * U) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const size_t j = i + (size_t) u * step;
+            if (j < nv) {
+                const uint4 v = __ldg(p + j);
+                acc[u] ^= v.x ^ v.y ^ v.z ^ v.w;
+            }
+        }
+    }
+    uint32_t a = 0;
+#pragma unroll
+    for (int u = 0; u < U; ++u) a ^= acc[u];
+    if (a == 0x9E3779B1u) out[0] = a;
+}
+void ql_bw_probe(const unsigned long long* d_ptrs, const unsigned long long* d_sizes, int n, int blocks_x, int unroll,
+                 unsigned* d_out, cudaStream_t s) {
+    const dim3 g((unsigned) blocks_x, (unsigned) n);
+    if (unroll >= 4) ql_bw_probe_kernel<4><<<g, 256, 0, s>>>(d_ptrs, d_sizes, n, d_out);
+    else ql_bw_probe_kernel<1><<<g, 256, 0, s>>>(d_ptrs, d_sizes, n, d_out);
+}
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -8340,7 +8438,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         static const int tq_rch = [] { const char* v = std::getenv("STRATA_QL_TQMIX_ROWCH"); const int n = v ? std::atoi(v) : 1; return n < 1 ? 1 : n > 32 ? 32 : n; }();
         const int rch = tq_smem ? tq_rch : 1;
         const dim3 gq((unsigned) ((2 * L.n_ff + GU_ROWS * rch - 1) / (GU_ROWS * rch)), (unsigned) gyq);
-        if (tq_smem) native_gu_tqmix_kernel<true><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rch);
+        // QuantLab (11/12) STRATA_QL_TQMIX_PROBE=1..3: task 4's cut-outs (SPEED ONLY: wrong sums), R1Q2 layers, unstaged
+        static const int tq_probe = [] { const char* v = std::getenv("STRATA_QL_TQMIX_PROBE"); return v ? std::atoi(v) : 0; }();
+        if (tq_probe == 1 && !tq_smem) native_gu_tqmix_kernel<false, 1><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
+        else if (tq_probe == 2 && !tq_smem) native_gu_tqmix_kernel<false, 2><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
+        else if (tq_probe == 3 && !tq_smem) native_gu_tqmix_kernel<false, 3><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
+        else if (tq_smem) native_gu_tqmix_kernel<true><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rch);
         else native_gu_tqmix_kernel<false><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
         check("native_expert_grouped/gu (per-expert K)");
         const long long nhq = (long long) cap_entries * L.n_ff;
@@ -8349,7 +8452,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
         check("native_expert_grouped/swiglu (per-expert K)");
         const dim3 gdq((unsigned) ((L.n_embd + 8 * rch - 1) / (8 * rch)), (unsigned) gyq);
-        if (tq_smem) native_down_tqmix_kernel<true><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rch);
+        if (tq_probe == 1 && !tq_smem) native_down_tqmix_kernel<false, 1><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
+        else if (tq_probe == 2 && !tq_smem) native_down_tqmix_kernel<false, 2><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
+        else if (tq_probe == 3 && !tq_smem) native_down_tqmix_kernel<false, 3><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
+        else if (tq_smem) native_down_tqmix_kernel<true><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rch);
         else native_down_tqmix_kernel<false><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
         check("native_expert_grouped/down (per-expert K)");
         return;
