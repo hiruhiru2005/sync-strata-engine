@@ -3142,8 +3142,10 @@ int main(int argc, char** argv) {
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
             qwen35 = strata::model_family_qwen35_path(strata::model_family(meta));   // QuantLab 11/11: the dense qwen35 too
-        } catch (const std::exception&) {
-            // not readable here: the normal path below reports it
+        } catch (const std::exception& e) {
+            // not readable here: the normal path below reports it (QuantLab 11/11: say why, the q36 path was missed
+            // silently on a file the switch could not open)
+            std::fprintf(stderr, "family switch: %s: %s\n", argv[i + 1], e.what());
         }
         if (qwen35) return strata::qwen35::run(argc, argv);
         break;
