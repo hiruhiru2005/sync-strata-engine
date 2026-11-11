@@ -4950,7 +4950,110 @@ __device__ __forceinline__ void tq_v9_block(const uint8_t* __restrict__ ba, cons
     acc2 += dwb * sb0;
     acc3 += dwb * sb1;
 }
+// ---- QuantLab (11/11, strata-desktop's proposal): v10 = v9 with lane t holding steps 8t..8t+7 of the block (mma sb
+// takes steps 8t + 2sb and 8t + 2sb + 1, against the activations 32t + 8sb .. + 7), so a lane reads its row's 8 code bytes
+// and the byte before at once (2 x u32 + u16 for an odd block, u16 + u32 + u16 + u16 for an even one: the block's
+// parity is the warp's), and one mma spans the block's four 32-value groups: the activations get one scale a 128 values
+// (tq_x_planar128_kernel re-rounds the q8_1 values to the largest of the four d - SPEED PROBE; the real path would
+// quantize from float), and the block's 12 mma add into one C, one int-to-float and one scale a block.
+// planar128 also zeroes y.  STRATA_QL_TQ_V10=1 (signed) | 2 (unsigned - 128); K8, 1..8 columns.
+__device__ __align__(16) int8_t g_tqx_i8b[kTqxMaxCols * kTqxMaxIn];
+__device__ float g_tqx_d128[kTqxMaxCols * (kTqxMaxIn / 128)];
+__device__ int g_tqx_s128[kTqxMaxCols * (kTqxMaxIn / 128)];
+__global__ void tq_x_planar128_kernel(const block_q8_1* __restrict__ x, int xb, int ncols, float* __restrict__ y, int ny) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < ny) y[i] = 0.f;
+    const int xg = xb / 4;   // 128-value groups a column
+    if (i >= xg * ncols) return;
+    const int c = i / xg, j = i - c * xg;
+    const block_q8_1* src = x + (size_t) c * xb + 4 * j;
+    float d[4], dm = 0.f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) { d[q] = __low2float(src[q].ds); dm = fmaxf(dm, fabsf(d[q])); }
+    const float inv = dm > 0.f ? 1.f / dm : 0.f;
+    int sum = 0;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const float f = d[q] * inv;
+        int8_t* dst = g_tqx_i8b + (size_t) c * kTqxMaxIn + (size_t) j * 128 + 32 * q;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const int v = __float2int_rn((float) src[q].qs[k] * f);
+            dst[k] = (int8_t) v;
+            sum += v;
+        }
+    }
+    g_tqx_d128[c * (kTqxMaxIn / 128) + j] = dm * TQ_LUT_I8_SCALE;
+    g_tqx_s128[c * (kTqxMaxIn / 128) + j] = -384 * sum;
+}
 template<bool U8>
+__device__ __forceinline__ void tq_v10_block(const uint8_t* __restrict__ ba, const uint8_t* __restrict__ bb, int kb, int t,
+                                             int colB, int c0, int c1, int ncols, float& acc0, float& acc1, float& acc2,
+                                             float& acc3) {
+    const float dwa = tq_h2f(*(const uint16_t*) ba), dwb = tq_h2f(*(const uint16_t*) bb);
+    // the lane's 8 code bytes (W0: steps 8t..8t+3, W1: 8t+4..8t+7) and the byte before (high byte of P)
+    auto words = [&](const uint8_t* base, uint32_t& W0, uint32_t& W1, uint32_t& P) {
+        const uint8_t* q = base + 2 + 8 * t;
+        if (kb & 1) {   // 34kb + 2 + 8t is 4-aligned
+            W0 = *(const uint32_t*) q;
+            W1 = *(const uint32_t*) (q + 4);
+        } else {        // 2 mod 4
+            const uint32_t lo = *(const uint16_t*) q, mid = *(const uint32_t*) (q + 2), hi = *(const uint16_t*) (q + 6);
+            W0 = lo | (mid << 16);
+            W1 = (mid >> 16) | (hi << 16);
+        }
+        P = *(const uint16_t*) (base + 2 + ((8 * t - 2) & 31));
+    };
+    uint32_t Wa0, Wa1, Pa, Wb0, Wb1, Pb;
+    words(ba, Wa0, Wa1, Pa);
+    words(bb, Wb0, Wb1, Pb);
+    int2 bx[4] = {make_int2(0, 0), make_int2(0, 0), make_int2(0, 0), make_int2(0, 0)};
+    if (colB >= 0) {
+        const int4* xa = (const int4*) (g_tqx_i8b + (size_t) colB * kTqxMaxIn + (size_t) kb * 128 + 32 * t);
+        const int4 v0 = xa[0], v1 = xa[1];
+        bx[0] = make_int2(v0.x, v0.y);
+        bx[1] = make_int2(v0.z, v0.w);
+        bx[2] = make_int2(v1.x, v1.y);
+        bx[3] = make_int2(v1.z, v1.w);
+    }
+    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    if constexpr (U8) {
+        d0 = d2 = c0 < ncols ? g_tqx_s128[c0 * (kTqxMaxIn / 128) + kb] : 0;
+        d1 = d3 = c1 < ncols ? g_tqx_s128[c1 * (kTqxMaxIn / 128) + kb] : 0;
+    }
+#pragma unroll
+    for (int sb = 0; sb < 4; ++sb) {
+        // states (q[s-1] << 8 | q[s]) & 0x7FFF of steps 8t + 2sb and 8t + 2sb + 1
+        uint32_t sa0, sa1, sb0, sb1;
+        if (sb == 0) {
+            sa0 = __byte_perm(Wa0, Pa, 0x0050u); sa1 = __byte_perm(Wa0, Wa0, 0x0001u);
+            sb0 = __byte_perm(Wb0, Pb, 0x0050u); sb1 = __byte_perm(Wb0, Wb0, 0x0001u);
+        } else if (sb == 1) {
+            sa0 = __byte_perm(Wa0, Wa0, 0x0012u); sa1 = __byte_perm(Wa0, Wa0, 0x0023u);
+            sb0 = __byte_perm(Wb0, Wb0, 0x0012u); sb1 = __byte_perm(Wb0, Wb0, 0x0023u);
+        } else if (sb == 2) {
+            sa0 = __byte_perm(Wa1, Wa0, 0x0070u); sa1 = __byte_perm(Wa1, Wa1, 0x0001u);
+            sb0 = __byte_perm(Wb1, Wb0, 0x0070u); sb1 = __byte_perm(Wb1, Wb1, 0x0001u);
+        } else {
+            sa0 = __byte_perm(Wa1, Wa1, 0x0012u); sa1 = __byte_perm(Wa1, Wa1, 0x0023u);
+            sb0 = __byte_perm(Wb1, Wb1, 0x0012u); sb1 = __byte_perm(Wb1, Wb1, 0x0023u);
+        }
+        uint32_t A0[3], A1[3], A2[3], A3[3];
+        tq_bih3_planes(sa0 & 0x7FFFu, A0[0], A0[1], A0[2]);
+        tq_bih3_planes(sb0 & 0x7FFFu, A1[0], A1[1], A1[2]);
+        tq_bih3_planes(sa1 & 0x7FFFu, A2[0], A2[1], A2[2]);
+        tq_bih3_planes(sb1 & 0x7FFFu, A3[0], A3[1], A3[2]);
+#pragma unroll
+        for (int p = 0; p < 3; ++p) tq_mma16832<U8>(d0, d1, d2, d3, A0[p], A1[p], A2[p], A3[p], bx[sb].x, bx[sb].y);
+    }
+    const float dx0 = c0 < ncols ? g_tqx_d128[c0 * (kTqxMaxIn / 128) + kb] : 0.f;
+    const float dx1 = c1 < ncols ? g_tqx_d128[c1 * (kTqxMaxIn / 128) + kb] : 0.f;
+    acc0 += dwa * dx0 * (float) d0;
+    acc1 += dwa * dx1 * (float) d1;
+    acc2 += dwb * dx0 * (float) d2;
+    acc3 += dwb * dx1 * (float) d3;
+}
+template<bool U8, bool A128 = false>
 __global__ void __launch_bounds__(32 * kTqV7Warps) tq_v9_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                                    float* __restrict__ y, int n_in, int n_out, int ncols) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -4969,8 +5072,12 @@ __global__ void __launch_bounds__(32 * kTqV7Warps) tq_v9_k8_kernel(const uint8_t
         const uint8_t* wb = w + (size_t) (rb < n_out ? rb : 0) * row_bytes;
         float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
 #pragma unroll 2
-        for (int kb = ch0 * 8 + warp; kb < ch1 * 8; kb += 8)
-            tq_v9_block<U8>(wa + (size_t) kb * 34, wb + (size_t) kb * 34, kb, t, colB, c0, c1, ncols, acc0, acc1, acc2, acc3);
+        for (int kb = ch0 * 8 + warp; kb < ch1 * 8; kb += 8) {
+            if constexpr (A128)
+                tq_v10_block<U8>(wa + (size_t) kb * 34, wb + (size_t) kb * 34, kb, t, colB, c0, c1, ncols, acc0, acc1, acc2, acc3);
+            else
+                tq_v9_block<U8>(wa + (size_t) kb * 34, wb + (size_t) kb * 34, kb, t, colB, c0, c1, ncols, acc0, acc1, acc2, acc3);
+        }
         s_red[warp][lane][0] = acc0;
         s_red[warp][lane][1] = acc1;
         s_red[warp][lane][2] = acc2;
@@ -5014,6 +5121,21 @@ void launch_tq_v9_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out,
     cudaMemsetAsync(y, 0, sizeof(float) * (size_t) ncols * (size_t) n_out, s);
     tq_v9_k8_kernel<U8><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
 }
+template<bool U8>
+void launch_tq_v10_k8(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
+                      cudaStream_t s) {
+    static const int blocks = [] {
+        int dev = 0, sms = 0, per = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v9_k8_kernel<U8, true>, 32 * kTqV7Warps, 0);
+        return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
+    }();
+    const int xb = n_in / 32, ny = ncols * n_out, nth = std::max(xb / 4 * ncols, ny);
+    tq_x_planar128_kernel<<<(unsigned) ((nth + 255) / 256), 256, 0, s>>>(X, xb, ncols, y, ny);   // also zeroes y
+    const int ntiles = (n_out + 15) / 16;
+    tq_v9_k8_kernel<U8, true><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+}
 
 // False (nothing launched) outside the scratch's limits: the caller runs mmvq_multi_kernel then.
 template<int TY>
@@ -5021,6 +5143,14 @@ bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* 
                        cudaStream_t s) {
     if (ncols < 1 || ncols > kTqxMaxCols || n_in > kTqxMaxIn || n_in % 128 != 0) return false;
     const int xb = n_in / 32;
+    if constexpr (TY == 144) {   // v10 (speed probe, above): its own planar step (128-value scales, zeroes y)
+        static const int v10 = [] { const char* v = std::getenv("STRATA_QL_TQ_V10"); return v ? std::atoi(v) : 0; }();
+        if (v10 && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {
+            if (v10 == 2) launch_tq_v10_k8<true>(W, rb, X, y, n_in, n_out, ncols, s);
+            else launch_tq_v10_k8<false>(W, rb, X, y, n_in, n_out, ncols, s);
+            return true;
+        }
+    }
     tq_x_planar_kernel<<<(unsigned) ((xb * ncols + 127) / 128), 128, 0, s>>>(X, xb, ncols);
     if constexpr (TY == 144) {   // QuantLab (11/11): strata-desktop's v3 (above), opt-in
         static const int v9 = [] { const char* v = std::getenv("STRATA_QL_TQ_V9"); return v ? std::atoi(v) : 0; }();
