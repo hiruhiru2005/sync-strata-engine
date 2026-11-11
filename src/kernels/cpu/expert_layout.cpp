@@ -627,6 +627,24 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                     at_l += cls[c].bytes;
                     if (cls[c].bytes > biggest) biggest = cls[c].bytes;
                 }
+                {   // QuantLab (11/12): the GPU's mixed kernels take one family a layer (NativeExpertLayout::tq_bih3),
+                    // and its bih3 rows read R1Q2 blocks only
+                    auto bih3 = [](int t) { return t >= 182 && t <= 194; };
+                    const bool b0 = bih3(cls[0].gu_type);
+                    for (const NativeFmt& c : cls)
+                        if (bih3(c.gu_type) != b0 || bih3(c.d_type) != b0) {
+                            err = "experts_k.txt: layer " + std::to_string(l) +
+                                  " mixes the bih3 types (182..194) with the codebook types";
+                            return false;
+                        }
+                    if (b0)
+                        for (const NativeFmt& c : cls)
+                            if (!c.r1q2) {
+                                err = "experts_k.txt: layer " + std::to_string(l) +
+                                      "'s bih3 experts need R1Q2 blocks (r1q2.txt): the GPU has no bih3 rows with fp16 d";
+                                return false;
+                            }
+                }
                 if (biggest != L.bytes[(size_t) l]) {
                     err = "experts_k.txt: layer " + std::to_string(l) + "'s largest expert is " + std::to_string(biggest) +
                           " B but native_experts.txt gives " + std::to_string(L.bytes[(size_t) l]);

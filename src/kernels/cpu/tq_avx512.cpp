@@ -121,6 +121,104 @@ void rows_r1_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, 
     }
 }
 
+// QuantLab (11/12): the bih3 R1Q2 rows (types 180 + K), the points computed instead of looked up (bench_decode's SM 6,
+// measured ~2x the table rows on Zen 5 for K 8).  Per block: the 32 states (scalar, as rows8), 16 a ZMM; x_i = s * C_i
+// (VPMULLD); the planes T0 = [x0.b1 x0.b2 x0.b3 x1.b1], T1 = [x1.b2 x1.b3 x2.b1 x2.b2], T2 = [x2.b3 x3.b1 x3.b2 x3.b3]
+// (unsigned bytes) by VPTERNLOG; per token VPDPBUSD of each plane against the int8 activations, the lanes summed per
+// Q8_0 sub-block, minus 384 * the sub-block's sum: S'[k] = sum (b0 + b1 + b2 - 384) * q, exact.  The table rows' S[k]
+// is 64 * S'[k] exactly (their weights are (sum - 384) * 64), so after the shift the float steps are the scalar
+// kernel's lane for lane: bitwise equal.
+// the per-sub-block sums of A (states 0..15) and B (16..31): [A lanes 0-7, A 8-15, B 0-7, B 8-15]
+inline __m128i reduce_halves(__m512i A, __m512i B) {
+    const __m256i x = _mm256_hadd_epi32(_mm512_castsi512_si256(A), _mm512_extracti64x4_epi64(A, 1));
+    const __m256i y = _mm256_hadd_epi32(_mm512_castsi512_si256(B), _mm512_extracti64x4_epi64(B, 1));
+    const __m256i z = _mm256_hadd_epi32(x, y);
+    return _mm_add_epi32(_mm256_castsi256_si128(z), _mm256_extracti128_si256(z, 1));
+}
+// The 32 states of a block in two ZMM without a trip through memory: the block's 4K bytes in one ZMM (masked load),
+// per lane t one VPERMB of the 4 bytes from byte (31 - t) K / 8 on (circular over the 4K bytes, as the stream is), a
+// VPSRLVD by ((31 - t) K) & 7, the 15-bit mask - tq_state's bits.  K 8 (TQ2_T's byte states): bytes t and t - 1.
+template <int KB>
+struct Bih3States {
+    alignas(64) uint8_t idx[2][64];
+    alignas(64) uint32_t sh[2][16];
+    Bih3States() {
+        constexpr int NB = 4 * KB;
+        for (int g = 0; g < 2; ++g)
+            for (int l = 0; l < 16; ++l) {
+                const int t = 16 * g + l;
+                if (KB == 8) {
+                    idx[g][4 * l + 0] = (uint8_t) t;
+                    idx[g][4 * l + 1] = (uint8_t) ((t + 31) & 31);
+                    idx[g][4 * l + 2] = idx[g][4 * l + 3] = 0;
+                    sh[g][l] = 0;
+                } else {
+                    const int off = (31 - t) * KB, b = off >> 3;
+                    for (int j = 0; j < 4; ++j) idx[g][4 * l + j] = (uint8_t) ((b + j) % NB);
+                    sh[g][l] = (uint32_t) (off & 7);
+                }
+            }
+    }
+};
+template <int KB>
+void rows_r1_bih3_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                    int r1, const TqScales& sc) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 4 * KB;
+    static const Bih3States<KB> S;
+    const __m512i ix0 = _mm512_load_si512(S.idx[0]), ix1 = _mm512_load_si512(S.idx[1]);
+    const __m512i sh0 = _mm512_load_si512(S.sh[0]), sh1 = _mm512_load_si512(S.sh[1]);
+    const __m512i m15 = _mm512_set1_epi32(0x7FFF);
+    const __mmask64 lm = (__mmask64) (bsz >= 64 ? ~0ull : (1ull << bsz) - 1);
+    const __m512i c0 = _mm512_set1_epi32((int) 0x9E3779B1u), c1 = _mm512_set1_epi32((int) 0x85EBCA6Bu);
+    const __m512i c2 = _mm512_set1_epi32((int) 0xC2B2AE35u), c3 = _mm512_set1_epi32((int) 0x27D4EB2Fu);
+    const __m512i m24 = _mm512_set1_epi32((int) 0xFF000000u), m16 = _mm512_set1_epi32((int) 0xFFFF0000u);
+    const __m512i m8 = _mm512_set1_epi32((int) 0xFFFFFF00u);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        const uint8_t* qr = sc.q + (size_t) r * sc.qbytes;
+        __m128 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* qs = x + (size_t) i * bsz;
+            const __m512i blk = _mm512_maskz_loadu_epi8(lm, qs);
+            __m512i u[6];
+            for (int g = 0; g < 2; ++g) {
+                const __m512i s = _mm512_and_si512(
+                    _mm512_srlv_epi32(_mm512_permutexvar_epi8(g ? ix1 : ix0, blk), g ? sh1 : sh0), m15);
+                const __m512i x0 = _mm512_mullo_epi32(s, c0), x1 = _mm512_mullo_epi32(s, c1);
+                const __m512i x2 = _mm512_mullo_epi32(s, c2), x3 = _mm512_mullo_epi32(s, c3);
+                // VPTERNLOG 0xEA = (a & b) | c
+                u[3 * g] = _mm512_ternarylogic_epi32(m24, _mm512_slli_epi32(x1, 16), _mm512_srli_epi32(x0, 8), 0xEA);
+                u[3 * g + 1] = _mm512_ternarylogic_epi32(m16, _mm512_slli_epi32(x2, 8), _mm512_srli_epi32(x1, 16), 0xEA);
+                u[3 * g + 2] = _mm512_ternarylogic_epi32(m8, x3, _mm512_srli_epi32(x2, 24), 0xEA);
+            }
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(sc.colscale[i]) * sc.p2[(qr[i >> 2] >> (2 * (i & 3))) & 3]);
+            for (int t = 0; t < nt; ++t) {
+                const int8_t* a8 = a[t]->q8 + 128 * i;
+                const __m512i qa = _mm512_load_si512(a8), qb = _mm512_load_si512(a8 + 64);
+                const __m512i z = _mm512_setzero_si512();
+                __m512i A = _mm512_dpbusd_epi32(z, u[0], qa);
+                A = _mm512_dpbusd_epi32(A, u[1], qa);
+                A = _mm512_dpbusd_epi32(A, u[2], qa);
+                __m512i B = _mm512_dpbusd_epi32(z, u[3], qb);
+                B = _mm512_dpbusd_epi32(B, u[4], qb);
+                B = _mm512_dpbusd_epi32(B, u[5], qb);
+                const __m128i s1 = _mm_sub_epi32(reduce_halves(A, B), _mm_load_si128((const __m128i*) (a[t]->bsum + 4 * i)));
+                const __m128i s = _mm_slli_epi32(s1, 6);   // the table rows' S[k] (weights x 2^13)
+                const __m128 scl = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), scl, acc[t]);
+            }
+        }
+        const float rb = tq_half_to_float(sc.rowbase[r]);
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = (((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f)) * rb;
+        }
+    }
+}
+
 // QuantLab (11/4): the AVX2 rows' VNNI copy with the EVEX VPDPWSSD ymm (AVX512-VL/VNNI), so this CPU class tests
 // the AVX-VNNI code of tq_avx2_rows.inl (STRATA_TQ_ISA=avx2e; never chosen by default)
 namespace evex {
@@ -138,6 +236,10 @@ void tq_rows_avx512(int kb, const int16_t* table, const uint8_t* w, size_t row_b
 void tq_rows_avx512_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
                          int nt, float* const* out, int r0, int r1, const TqScales& sc) {
     STRATA_TQ_DISPATCH_K(kb, rows_r1_t, table, w, row_bytes, n, a, nt, out, r0, r1, sc)
+}
+void tq_rows_avx512_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                              float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, rows_r1_bih3_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
 
 void tq_rows_avx2e(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,

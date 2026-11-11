@@ -131,6 +131,14 @@ inline const char* ggml_type_name(uint32_t t) {
     case 149:
         return "TQP7";
     // QuantLab (11/11): the bih3 trellis (180 + K, points computed from the state; strata-desktop's tq.py)
+    case 182:
+        return "TQB2";
+    case 183:
+        return "TQB3";
+    case 184:
+        return "TQB4";
+    case 185:
+        return "TQB5";
     case 186:
         return "TQB6";
     case 187:
@@ -290,7 +298,8 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 128;
         bytes = 58;
         return true;
-    // QuantLab (11/11): bih3, 128 values = fp16 scale + 32 steps of K bits (K = type - 180, 6..14)
+    // QuantLab (11/11): bih3, 128 values = fp16 scale + 32 steps of K bits (K = type - 180, 6..14; 11/12: 2..5 too)
+    case 182: case 183: case 184: case 185:
     case 186: case 187: case 188: case 189: case 190: case 191: case 192: case 193: case 194:
         elems = 128;
         bytes = 2 + 4 * ((int) t - 180);

@@ -30,8 +30,12 @@ inline int qlk_k(int t) {
     return (k == 2 || k == 3 || (k >= 9 && k <= 14)) ? k : 0;
 }
 inline bool is_tq(int t) { return (t >= 144 && t <= 149) || qlk_k(t) > 0; }   // 144-146 TQ/TQK, 147-149 the pair trellis (Gyro-L)
-inline int64_t type_blck(int t) { return is_tq(t) ? 128 : (int64_t) ggml_blck_size((ggml_type) t); }
+// QuantLab (11/12): the bih3 types 180 + K (K 2..14) have no MMQ tile (supported() refuses them: the FP16 path), but the
+// planner asks their sizes, which must not index ggml's type table past its end
+inline int bih3_k(int t) { return t >= 182 && t <= 194 ? t - 180 : 0; }
+inline int64_t type_blck(int t) { return is_tq(t) || bih3_k(t) > 0 ? 128 : (int64_t) ggml_blck_size((ggml_type) t); }
 inline size_t type_bytes(int t) {
+    if (bih3_k(t) > 0) return (size_t) (2 + 4 * bih3_k(t));
     if (qlk_k(t) > 0) return (size_t) (2 + 4 * qlk_k(t));
     return t == 144 ? 34 : t == 145 ? 26 : t == 146 ? 30 : t == 147 ? 42 : t == 148 ? 50 : t == 149 ? 58
                                                                                      : ggml_type_size((ggml_type) t);

@@ -44,7 +44,9 @@ namespace {
 constexpr int NT = 3, NE = 12;   // 10/26: (2,3) .. (13,14)
 constexpr int64_t H = 2560, FF = 640;
 
+bool g_bih3 = false;   // QuantLab (11/12) --bih3: the types 180 + K (points computed from the state)
 int tq_type(int K) {
+    if (g_bih3) return cpu::kTqBih3Base + K;
     switch (K) {
         case 8: return 144;
         case 6: return 145;
@@ -101,6 +103,17 @@ void decode_codes(const uint8_t* qs, int K, float d, float* y) {
                 s |= (uint32_t) ((qs[bit >> 3] >> (bit & 7)) & 1) << j;
             }
         }
+        if (g_bih3) {   // QuantLab (11/12): strata-desktop's tq.py bih3, written out once more here
+            const uint32_t st = s & 0x7FFFu;
+            const uint32_t x0 = st * 0x9E3779B1u, x1 = st * 0x85EBCA6Bu, x2 = st * 0xC2B2AE35u, x3 = st * 0x27D4EB2Fu;
+            const uint32_t T0 = (x0 >> 8) | ((x1 >> 8) & 255u) << 24;
+            const uint32_t T1 = (x1 >> 16) | ((x2 >> 8) & 0xFFFFu) << 16;
+            const uint32_t T2 = (x2 >> 24) | (x3 & 0xFFFFFF00u);
+            for (int j = 0; j < 4; ++j)
+                y[4 * t + j] = d * (float) ((int) ((T0 >> (8 * j)) & 255u) + (int) ((T1 >> (8 * j)) & 255u) +
+                                            (int) ((T2 >> (8 * j)) & 255u) - 384) / 128.0f;
+            continue;
+        }
         const uint32_t x = (s & TQ_STATE_MASK) * 0x9e3779b1u;
         const uint32_t a = x >> 21, c = (x >> 10) & 2047u;
         const uint16_t* L = strata::kernels::tq_lut_f16_host();   // QuantLab (11/4): tq_lut_f16 unless --lut replaced it
@@ -141,6 +154,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         had = had || std::string(argv[i]) == "--hadamard";
         r1q2 = r1q2 || std::string(argv[i]) == "--r1q2";
+        g_bih3 = g_bih3 || std::string(argv[i]) == "--bih3";
         if (std::string(argv[i]) == "--lut" && i + 1 < argc) lut = argv[++i];
         if (std::string(argv[i]) == "--dump" && i + 1 < argc) dump = argv[++i];
     }
@@ -158,7 +172,8 @@ int main(int argc, char** argv) {
                     strata::kernels::tq_lut_sha256().c_str(), strata::kernels::tq_lut_builtin() ? "the built-in one" : "not built-in",
                     (double) strata::kernels::tq_lut_max_abs(strata::kernels::tq_lut_f16_host()), copies);
     }
-    std::printf("tq_mix_parity: %d experts of per-expert trellis K in one grouped launch%s%s\n", NE,
+    if (g_bih3 && !r1q2) { std::printf("--bih3 takes --r1q2 (the GPU reads bih3 experts as R1Q2 blobs only)  FAIL\n"); return 1; }
+    std::printf("tq_mix_parity: %d experts of per-expert trellis K in one grouped launch%s%s%s\n", NE, g_bih3 ? " (bih3)" : "",
                 had ? " (Hadamard-folded down: identity signs, block 128)" : "", r1q2 ? " (R1Q2 blobs)" : "");
     // R1Q2's per-matrix table p2[q] = 2^(lo + q * step) (the SAR1Q2 layers' lo ~ -0.25, step ~ 0.17)
     float P2[3][4];
@@ -279,6 +294,7 @@ int main(int argc, char** argv) {
     k::quantize_q8_1_rows(d_x, NT, H, d_xq, s);
     k::NativeExpertLayout L = k::native_expert_layout(145, 146, H, FF);   // the geometry; the K come from the tags
     L.gu_type = L.d_type = k::kTqMixedType;
+    L.tq_bih3 = g_bih3;   // QuantLab (11/12)
     if (had) L.had_block = 128;   // d_signs nullptr: identity signs, as the CPU side
     if (r1q2) {
         L.r1q2 = true;

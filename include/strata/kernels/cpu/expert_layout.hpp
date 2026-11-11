@@ -49,6 +49,11 @@ struct ExpertLayout {
     }
     bool any_mixed() const { return !mixed_layer.empty(); }
     bool layer_mixed(int64_t layer) const { return !mixed_layer.empty() && mixed_layer[(size_t) layer] != 0; }
+    /// QuantLab (11/12): whether a mixed layer's experts are the bih3 types (180 + K; all of them or none, checked at load)
+    bool layer_bih3(int64_t layer) const {
+        return layer_mixed(layer) && !cls_fmt[(size_t) layer].empty() && cls_fmt[(size_t) layer][0].gu_type >= 182 &&
+               cls_fmt[(size_t) layer][0].gu_type <= 194;
+    }
     size_t eidx(int64_t layer, int64_t expert) const { return (size_t) layer * (size_t) n_expert + (size_t) expert; }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
         if (layer_mixed(layer)) return eoff[eidx(layer, expert)];

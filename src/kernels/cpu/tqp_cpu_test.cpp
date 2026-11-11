@@ -46,10 +46,10 @@ int ql_kbits(int t) {
 }
 bool old_supported(int t) {
     return t == 144 || t == 145 || t == 146 || t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T ||
-           ql_kbits(t) != 0;
+           ql_kbits(t) != 0 || (t >= 182 && t <= 194);   // QuantLab (11/12): bih3
 }
 int old_kbits(int t) {
-    return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : (t == kTqTypeK5X || t == kTqTypeK5T) ? 5 : (t == kTqTypeK4X || t == kTqTypeK4T) ? 4 : ql_kbits(t);
+    return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : (t == kTqTypeK5X || t == kTqTypeK5T) ? 5 : (t == kTqTypeK4X || t == kTqTypeK4T) ? 4 : (t >= 182 && t <= 194) ? t - 180 : ql_kbits(t);
 }
 
 void check_predicates() {
@@ -409,14 +409,15 @@ int main(int argc, char** argv) {
             break;
         }
     if (!args.empty() && args[0] == "--bench") {
-        for (int type : {145, 146, 170, 171})
+        for (int type : {145, 146, 170, 171, 186, 187, 190, 191})   // QuantLab (11/12): + bih3 K 6, 7, 10, 11
             for (int n : {2560, 640}) bench(type, n, n == 2560 ? 640 : 2560);
         return 0;
     }
     check_predicates();
     for (int type : {147, 148, 149}) check_type(type, true);
     for (int type : {144, 145, 146}) check_type(type, false);
-    for (int type : {145, 146, 144, 172, 174})   // QuantLab (10/31): R1Q2 blocks (K 6, 7, 8, 12, 14)
+    // QuantLab (10/31): R1Q2 blocks (K 6, 7, 8, 12, 14); (11/12) the bih3 types K 2, 3, 5, 8, 10, 13, 14
+    for (int type : {145, 146, 144, 172, 174, 182, 183, 185, 188, 190, 193, 194})
         for (int n : {2560, 640}) check_r1q2(type, n);
     std::printf("tqp_cpu_test: %d failures\n", g_fail);
     return g_fail ? 1 : 0;

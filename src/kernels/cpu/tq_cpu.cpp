@@ -47,6 +47,20 @@ void fill_table_computed() {
     for (uint32_t s = 0; s <= tq_detail::kTqStateMask; ++s) tq_detail::comp_state4(s, g_table_c + 4 * s);
 }
 
+// QuantLab (11/12): the bih3 points (iq_kernels.cu tq_bih3p: T0 = [x0.b1 x0.b2 x0.b3 x1.b1], T1 = [x1.b2 x1.b3 x2.b1
+// x2.b2], T2 = [x2.b3 x3.b1 x3.b2 x3.b3], weight j = (T0.bj + T1.bj + T2.bj - 384) / 128), x 2^13 = (sum - 384) * 64
+alignas(64) int16_t g_table_b[(tq_detail::kTqStateMask + 1) * 4];
+void fill_table_bih3() {
+    auto by = [](uint32_t x, int k) { return (int) ((x >> (8 * k)) & 255u); };
+    for (uint32_t s = 0; s <= tq_detail::kTqStateMask; ++s) {
+        const uint32_t x0 = s * 0x9E3779B1u, x1 = s * 0x85EBCA6Bu, x2 = s * 0xC2B2AE35u, x3 = s * 0x27D4EB2Fu;
+        const int t0[4] = {by(x0, 1), by(x0, 2), by(x0, 3), by(x1, 1)};
+        const int t1[4] = {by(x1, 2), by(x1, 3), by(x2, 1), by(x2, 2)};
+        const int t2[4] = {by(x2, 3), by(x3, 1), by(x3, 2), by(x3, 3)};
+        for (int j = 0; j < 4; ++j) g_table_b[4 * s + j] = (int16_t) ((t0[j] + t1[j] + t2[j] - 384) * 64);
+    }
+}
+
 int env_isa_cap() {
     const char* e = std::getenv("STRATA_TQ_ISA");
     if (e == nullptr || *e == 0) return 2;
@@ -183,12 +197,22 @@ const int16_t* tq_state_table_computed() {
     return g_table_c;
 }
 
-const int16_t* tq_state_table_for(int t) { return (t == kTqTypeK5X || t == kTqTypeK4X) ? tq_state_table_computed() : tq_state_table(); }
+const int16_t* tq_state_table_bih3() {
+    static std::once_flag once;
+    std::call_once(once, fill_table_bih3);
+    return g_table_b;
+}
+
+const int16_t* tq_state_table_for(int t) {
+    if (tq_bih3_type(t)) return tq_state_table_bih3();   // QuantLab (11/12)
+    return (t == kTqTypeK5X || t == kTqTypeK4X) ? tq_state_table_computed() : tq_state_table();
+}
 
 bool tq_supported(int t) noexcept {
     return t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149 ||
            t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T ||
-           t == 150 || t == 151 || (t >= kTqPseudoBase + 2 && t <= kTqPseudoBase + 14 && tq_kbits(t) != 0);   // QuantLab
+           t == 150 || t == 151 || (t >= kTqPseudoBase + 2 && t <= kTqPseudoBase + 14 && tq_kbits(t) != 0) ||   // QuantLab
+           tq_bih3_type(t);   // QuantLab (11/12): bih3
 }
 
 // QuantLab: 150 TQK5 and 151 TQK4 (the Gyro SPEC ids) and the local-only pseudo types kTqPseudoBase + K for the rates
@@ -200,6 +224,7 @@ int tq_kbits(int t) noexcept {
     if (t == 145) return 6;
     if (t == 147 || t == kTqTypeK5X || t == kTqTypeK5T || t == 150) return 5;
     if (t == kTqTypeK4X || t == kTqTypeK4T || t == 151) return 4;
+    if (tq_bih3_type(t)) return t - kTqBih3Base;   // QuantLab (11/12): bih3, K 2..14
     const int k = t - kTqPseudoBase;
     if ((k >= 2 && k <= 3) || (k >= 9 && k <= 14)) return k;   // QuantLab, 10/26: K 13, 14 (v2 packs' down rows)
     return 0;
@@ -253,7 +278,13 @@ void unpack_act(const void* q8_0, int n, TqAct& a) {
     for (int b = 0; b < n / 32; ++b, p += 34) {   // block_q8_0: fp16 d, 32 x int8
         a.d[b] = tq_half_to_float(tq_ld16(p));
         const int8_t* q = (const int8_t*) (p + 2);
-        for (int j = 0; j < 32; ++j) a.q[32 * b + j] = q[j];
+        int32_t sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            a.q[32 * b + j] = q[j];
+            a.q8[32 * b + j] = q[j];   // QuantLab (11/12): the bih3 rows' side
+            sum += q[j];
+        }
+        a.bsum[b] = 384 * sum;
     }
 }
 
@@ -336,10 +367,20 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
     rows_on(isa, tq_kbits(ggml_type), tab, w, row_bytes, n, s.ptr, nt, out, r0, r1);
 }
 
+// QuantLab (11/12): STRATA_TQ_BIH3_TABLE=1 - the bih3 types on the table rows on AVX-512 too (A/B; the same bits)
+static bool bih3_table_only() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_TQ_BIH3_TABLE"); return v && v[0] == '1'; }();
+    return on;
+}
 // QuantLab (10/31): R1Q2 blocks (4K bytes, tq_detail::TqScales), each ISA its own kernel as rows_on
 void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n,
-                const tq_detail::TqAct* const* a, int nt, float* const* out, int r0, int r1, const tq_detail::TqScales& sc) {
+                const tq_detail::TqAct* const* a, int nt, float* const* out, int r0, int r1, const tq_detail::TqScales& sc,
+                bool bih3 = false) {
 #if defined(STRATA_TQ_X86)
+    if (isa == TqIsa::avx512 && bih3 && !bih3_table_only()) {   // QuantLab (11/12): computed, no table
+        tq_detail::tq_rows_avx512_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        return;
+    }
     if (isa == TqIsa::avx512) {
         tq_detail::tq_rows_avx512_r1q2(kb, tab, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
@@ -364,7 +405,8 @@ void tq_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, 
                   float* const* out, int r0, int r1, const tq_detail::TqScales& sc) {
     if (!tq_isa_ok(isa) || (ggml_type >= 147 && ggml_type <= 149)) std::abort();   // a caller bug
     const ActSet& s = unpack_all(act, n, nt);
-    rows_r1_on(isa, tq_kbits(ggml_type), tq_state_table_for(ggml_type), w, row_bytes, n, s.ptr, nt, out, r0, r1, sc);
+    rows_r1_on(isa, tq_kbits(ggml_type), tq_state_table_for(ggml_type), w, row_bytes, n, s.ptr, nt, out, r0, r1, sc,
+               tq_bih3_type(ggml_type));
 }
 void tq_gu_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                      const void* const* act, int nt, float* const* ff, int r0, int r1, const tq_detail::TqScales& g,
@@ -382,8 +424,8 @@ void tq_gu_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_ro
         up[t] = ubuf.data() + (size_t) t * nr;
     }
     const int kb = tq_kbits(ggml_type);
-    rows_r1_on(isa, kb, tab, blob, gu_row, n, s.ptr, nt, gp, r0, r1, g);
-    rows_r1_on(isa, kb, tab, blob + up_off, gu_row, n, s.ptr, nt, up, r0, r1, u);
+    rows_r1_on(isa, kb, tab, blob, gu_row, n, s.ptr, nt, gp, r0, r1, g, tq_bih3_type(ggml_type));
+    rows_r1_on(isa, kb, tab, blob + up_off, gu_row, n, s.ptr, nt, up, r0, r1, u, tq_bih3_type(ggml_type));
     for (int t = 0; t < nt; ++t)
         for (int r = r0; r < r1; ++r) {
             const float gv = gp[t][r], uv = up[t][r];

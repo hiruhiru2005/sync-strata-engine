@@ -2352,7 +2352,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 // QuantLab v6: a per-expert K layer - each group's pointer carries its K (the host plan tags it)
-                if (lay.layer_mixed(l)) L.gu_type = L.d_type = strata::kernels::kTqMixedType;
+                if (lay.layer_mixed(l)) {
+                    L.gu_type = L.d_type = strata::kernels::kTqMixedType;
+                    L.tq_bih3 = lay.layer_bih3(l);   // QuantLab (11/12): the bih3 types' rows
+                }
                 if (f.r1q2) {   // QuantLab (10/31): R1Q2 blocks (the mixed-layer kernels read the scales)
                     L.r1q2 = true;
                     for (int m = 0; m < 3; ++m)

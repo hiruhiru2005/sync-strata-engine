@@ -44,6 +44,13 @@ inline constexpr int kTqTypeK5T = 226;   ///< version 1: K = 5 with the fork's p
 inline constexpr int kTqTypeK4T = 227;   ///< version 1: K = 4, point table
 /// QuantLab: local-only trellis types kTqPseudoBase + K (K = 2, 3, 9..14) for the rates the Gyro SPEC has no id for.
 inline constexpr int kTqPseudoBase = 160;
+/// QuantLab (11/11, 11/12): the bih3 types kTqBih3Base + K (K = 2..14): the table types' blocks and state windows, but a
+/// step's 4 weights computed from its 15-bit state (no codebook): x_i = s * C_i, weight j = (byte j of T0 + T1 + T2 -
+/// 384) / 128 (iq_kernels.cu's tq_bih3p).  Here they run on the same kernels with their own state table (exact: x 64).
+inline constexpr int kTqBih3Base = 180;
+inline constexpr bool tq_bih3_type(int t) noexcept { return t >= kTqBih3Base + 2 && t <= kTqBih3Base + 14; }
+/// The state table of the bih3 types (32768 x 4 int16, the weights x 2^13 like the others).
+const int16_t* tq_state_table_bih3();
 /// TQ2_T (144), TQK6 (145), TQK7 (146), TQP5/6/7 (147..149), the experimental TQK5X / TQK4X / TQK5T / TQK4T, and QuantLab's
 /// TQK5 (150), TQK4 (151) and pseudo types kTqPseudoBase + K.
 bool tq_supported(int ggml_type) noexcept;
@@ -101,6 +108,10 @@ namespace tq_detail {
 struct TqAct {
     alignas(64) int16_t q[kTqMaxN];
     alignas(64) float d[kTqMaxN / 32];
+    // QuantLab (11/12): the bih3 rows' side (tq_rows_avx512_r1q2_bih3): the int8 values as they are, and per Q8_0
+    // sub-block 384 * its sum (the planes' -128 three times)
+    alignas(64) int8_t q8[kTqMaxN];
+    alignas(64) int32_t bsum[kTqMaxN / 32];
 };
 void unpack_act(const void* q8_0, int n, TqAct& a);
 /// QuantLab (10/31): one matrix's R1Q2 scales.  With them a block is its 4K code bytes only (no fp16 d): the block's
@@ -118,6 +129,11 @@ void tq_rows_avx2_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_
                        int nt, float* const* out, int r0, int r1, const TqScales& sc);
 void tq_rows_avx512_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
                          int nt, float* const* out, int r0, int r1, const TqScales& sc);
+/// QuantLab (11/12): the R1Q2 rows of the bih3 types computed (no table): 16 states a ZMM, x_i by VPMULLD, the three
+/// byte planes by VPTERNLOG, VPDPBUSD against the int8 activations, minus 384 * the sub-block sums: the scalar kernel's
+/// exact S[k] (/ 64), so bitwise equal to it.  STRATA_TQ_BIH3_TABLE=1 keeps the table rows instead (A/B).
+void tq_rows_avx512_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                              float* const* out, int r0, int r1, const TqScales& sc);
 // QuantLab (11/4): the AVX-VNNI copies of the AVX2 rows (tq_avx2.cpp) and their EVEX test copies (tq_avx512.cpp)
 bool tq_avxvnni_built();
 void tq_rows_avxvnni(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,

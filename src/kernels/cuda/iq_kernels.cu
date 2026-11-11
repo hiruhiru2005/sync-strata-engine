@@ -642,6 +642,11 @@ template<> struct TqInfo<174> { using block_t = block_tq_any<14>; static constex
 // instead of looked up (no codebook file): x_i = s * C_i (C = 0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35, 0x27D4EB2F), and
 // weight j = (byte j of each of T0 = [x0.b1 x0.b2 x0.b3 x1.b1], T1 = [x1.b2 x1.b3 x2.b1 x2.b2], T2 = [x2.b3 x3.b1 x3.b2
 // x3.b3], unsigned) summed - 384, / 128, times d.
+// 11/12: K 2..5 (182..185) for the Flash-Next bih3 packs (SB), the windows of 162 / 163 / 151 / 150
+template<> struct TqInfo<182> { using block_t = block_tq_any<2>; static constexpr int K = 2; };
+template<> struct TqInfo<183> { using block_t = block_tq_any<3>; static constexpr int K = 3; };
+template<> struct TqInfo<184> { using block_t = block_tq_any<4>; static constexpr int K = 4; };
+template<> struct TqInfo<185> { using block_t = block_tq_any<5>; static constexpr int K = 5; };
 template<> struct TqInfo<186> { using block_t = block_tq_any<6>; static constexpr int K = 6; };
 template<> struct TqInfo<187> { using block_t = block_tq_any<7>; static constexpr int K = 7; };
 template<> struct TqInfo<188> { using block_t = block_tq_any<8>; static constexpr int K = 8; };
@@ -651,7 +656,7 @@ template<> struct TqInfo<191> { using block_t = block_tq_any<11>; static constex
 template<> struct TqInfo<192> { using block_t = block_tq_any<12>; static constexpr int K = 12; };
 template<> struct TqInfo<193> { using block_t = block_tq_any<13>; static constexpr int K = 13; };
 template<> struct TqInfo<194> { using block_t = block_tq_any<14>; static constexpr int K = 14; };
-template<int TY> inline constexpr bool kTqBih3 = TY >= 186 && TY <= 194;
+template<int TY> inline constexpr bool kTqBih3 = TY >= 182 && TY <= 194;
 template<int TY> inline constexpr bool kTqBytes8 = TY == 144 || TY == 188;   // the TQ2_T byte states (K 8)
 // the three byte planes of a bih3 step (bytes unsigned; weight j = sum of byte j of the three - 384)
 __device__ __forceinline__ void tq_bih3p(uint32_t s, uint32_t& p0, uint32_t& p1, uint32_t& p2) {
@@ -922,6 +927,8 @@ STRATA_TQ_MIX_FMT(170) STRATA_TQ_MIX_FMT(171) STRATA_TQ_MIX_FMT(172) STRATA_TQ_M
 #undef STRATA_TQ_MIX_FMT
 // K -> its type id, for every K a mixed layer may hold (K 8 is TQ2_T's own layout)
 #define STRATA_TQ_MIX_KS(X) X(2, 162) X(3, 163) X(4, 151) X(5, 150) X(6, 145) X(7, 146) X(8, 144) X(9, 169) X(10, 170) X(11, 171) X(12, 172) X(13, 173) X(14, 174)
+// QuantLab (11/12): the same for a bih3 layer (NativeExpertLayout::tq_bih3: its experts' types are 180 + K)
+#define STRATA_TQ_MIX_KS_B(X) X(2, 182) X(3, 183) X(4, 184) X(5, 185) X(6, 186) X(7, 187) X(8, 188) X(9, 189) X(10, 190) X(11, 191) X(12, 192) X(13, 193) X(14, 194)
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
@@ -2553,6 +2560,45 @@ __device__ __forceinline__ void row_dot_multi_r1(const uint8_t* row, const uint1
     constexpr int CB = (int) sizeof(typename TqInfo<TY>::block_t) - 2;
 #pragma unroll
     for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    if constexpr (kTqBih3<TY>) {
+        // QuantLab (11/12): a bih3 row (types 182..194; s_lut unused) - the lane's 4 steps as 3 byte planes each made
+        // signed (u - 128 = (u ^ 0x80) as int8: the three sum to 128 * the weight), 12 dp4a per entry; the block's
+        // scale / 128.  The same lanes, order and warp_sum as the table rows.
+        for (int k = lane; k < nb * 8; k += 32) {
+            const int kbx = k >> 3, l = k & 7;
+            uint32_t st[4];
+            tq_states4<TY>(row + (size_t) kbx * CB, l, st);
+            int P[4][3];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                uint32_t p0, p1, p2b;
+                tq_bih3p(st[i] & 0x7FFFu, p0, p1, p2b);
+                P[i][0] = (int) (p0 ^ 0x80808080u);
+                P[i][1] = (int) (p1 ^ 0x80808080u);
+                P[i][2] = (int) (p2b ^ 0x80808080u);
+            }
+            const float dw = tq_h2f(colscale[kbx]) * p2[(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3] * (1.0f / 128.0f);
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c < n) {
+                    const block_q8_1* b8 = x + off[c] + kbx * 4 + (l >> 1);
+                    const int* q8 = (const int*) b8->qs + 4 * (l & 1);
+                    int sumi = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int a = q8[i];
+                        sumi = ggml_cuda_dp4a(P[i][0], a, sumi);
+                        sumi = ggml_cuda_dp4a(P[i][1], a, sumi);
+                        sumi = ggml_cuda_dp4a(P[i][2], a, sumi);
+                    }
+                    s[c] += dw * __low2float(b8->ds) * (float) sumi;
+                }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < n) s[c] = warp_sum(s[c]);
+        return;
+    }
     for (int k = lane; k < nb * 8; k += 32) {
         const int kbx = k >> 3, iqs = 4 * (k & 7);
         TqLane w = tq_load_codes<TY, STAGED>(row + (size_t) kbx * CB, iqs, s_lut);
@@ -2687,12 +2733,19 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
             const uint8_t* qrow = sc + (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) r * qge;
             const float* p2 = L.p2[is_up ? 1 : 0];
             const float rbase = tq_h2f(rb[r]);
-            switch (kg) {
 #define STRATA_TQ_MIX_GU_R1(K, T) case K: tqmix_gu_rows_r1<T, STAGED>(wr, cs, qrow, p2, rbase, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r, s_lut); break;
-                STRATA_TQ_MIX_KS(STRATA_TQ_MIX_GU_R1)
-#undef STRATA_TQ_MIX_GU_R1
-                default: break;
+            if (L.tq_bih3) {   // QuantLab (11/12): a bih3 layer (types 180 + K)
+                switch (kg) {
+                    STRATA_TQ_MIX_KS_B(STRATA_TQ_MIX_GU_R1)
+                    default: break;
+                }
+            } else {
+                switch (kg) {
+                    STRATA_TQ_MIX_KS(STRATA_TQ_MIX_GU_R1)
+                    default: break;
+                }
             }
+#undef STRATA_TQ_MIX_GU_R1
             continue;
         }
         const size_t gu_row = (size_t) nb * (size_t) (2 + 4 * kg);
@@ -2741,12 +2794,19 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
             const uint16_t* cs = (const uint16_t*) (sc + (size_t) L.n_embd * 2);
             const uint8_t* qrow = sc + (size_t) L.n_embd * 2 + (size_t) nb * 2 + (size_t) r * qdf;
             const float rbase = tq_h2f(rb[r]);
-            switch (kd) {
 #define STRATA_TQ_MIX_DOWN_R1(K, T) case K: tqmix_down_rows_r1<T, STAGED>(wr, cs, qrow, L.p2[2], rbase, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r, s_lut); break;
-                STRATA_TQ_MIX_KS(STRATA_TQ_MIX_DOWN_R1)
-#undef STRATA_TQ_MIX_DOWN_R1
-                default: break;
+            if (L.tq_bih3) {   // QuantLab (11/12): a bih3 layer (types 180 + K)
+                switch (kd) {
+                    STRATA_TQ_MIX_KS_B(STRATA_TQ_MIX_DOWN_R1)
+                    default: break;
+                }
+            } else {
+                switch (kd) {
+                    STRATA_TQ_MIX_KS(STRATA_TQ_MIX_DOWN_R1)
+                    default: break;
+                }
             }
+#undef STRATA_TQ_MIX_DOWN_R1
             continue;
         }
         const size_t gu_row = (size_t) nbg * (size_t) (2 + 4 * kg), d_row = (size_t) nb * (size_t) (2 + 4 * kd);
@@ -3665,6 +3725,10 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 173: dq_tq<173>(vx, ibs, y, tid); break;
         case 174: dq_tq<174>(vx, ibs, y, tid); break;
         // QuantLab (11/11): the bih3 types (computed points)
+        case 182: dq_tq<182>(vx, ibs, y, tid); break;   // 11/12: K 2..5
+        case 183: dq_tq<183>(vx, ibs, y, tid); break;
+        case 184: dq_tq<184>(vx, ibs, y, tid); break;
+        case 185: dq_tq<185>(vx, ibs, y, tid); break;
         case 186: dq_tq<186>(vx, ibs, y, tid); break;
         case 187: dq_tq<187>(vx, ibs, y, tid); break;
         case 188: dq_tq<188>(vx, ibs, y, tid); break;
@@ -3733,7 +3797,8 @@ __global__ void dequant_r1q2_kernel(R1Mat m0, R1Mat m1, int nb, int qb, int64_t 
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
         float2 a, c;
-        tq_step(s[2 * half + k], a, c);
+        if constexpr (kTqBih3<TY>) tq_step_bih3(s[2 * half + k], a, c);   // QuantLab (11/12)
+        else tq_step(s[2 * half + k], a, c);
         dst[4 * k + 0] = __float2half(d * a.x);
         dst[4 * k + 1] = __float2half(d * a.y);
         dst[4 * k + 2] = __float2half(d * c.x);
@@ -3746,7 +3811,7 @@ bool is_iq(int t) {
     // QuantLab: the per-expert K rates (dq_dispatch only; no grouped or MMVQ kernel lists them, so
     // native_expert_supported still refuses them as a layer's one format)
     if (t == 150 || t == 151 || t == 162 || t == 163 || (t >= 169 && t <= 174)) return true;
-    if (t >= 186 && t <= 194) return true;   // QuantLab (11/11): bih3
+    if (t >= 182 && t <= 194) return true;   // QuantLab (11/11): bih3 (11/12: K 2..5 too)
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149;
@@ -5276,6 +5341,10 @@ void launch_tq_bih3(int t, const uint8_t* W, size_t rb, const block_q8_1* X, flo
         return;
     }
     switch (t) {
+        case 182: launch_tq_bih3_ty<182>(W, rb, X, y, n_in, n_out, ncols, s); break;   // 11/12: K 2..5
+        case 183: launch_tq_bih3_ty<183>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 184: launch_tq_bih3_ty<184>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        case 185: launch_tq_bih3_ty<185>(W, rb, X, y, n_in, n_out, ncols, s); break;
         case 186: launch_tq_bih3_ty<186>(W, rb, X, y, n_in, n_out, ncols, s); break;
         case 187: launch_tq_bih3_ty<187>(W, rb, X, y, n_in, n_out, ncols, s); break;
         case 188: launch_tq_bih3_ty<188>(W, rb, X, y, n_in, n_out, ncols, s); break;
@@ -7280,6 +7349,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 162: return (size_t) (n / 128) * (2 + 4 * 2);
         case 163: return (size_t) (n / 128) * (2 + 4 * 3);
         case 169: case 170: case 171: case 172: case 173: case 174: return (size_t) (n / 128) * (2 + 4 * (t - 160));
+        case 182: case 183: case 184: case 185:   // bih3 K 2..5 (11/12)
         case 186: case 187: case 188: case 189: case 190: case 191: case 192: case 193: case 194:   // bih3 (11/11)
             return (size_t) (n / 128) * (2 + 4 * (t - 180));
         default: return 0;
@@ -7298,7 +7368,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     cudaStream_t s = (cudaStream_t) stream;
     const auto* W = (const uint8_t*) w;
     const auto* X = (const block_q8_1*) x_q8_1;
-    if (t >= 186 && t <= 194) {   // QuantLab (11/11): bih3
+    if (t >= 182 && t <= 194) {   // QuantLab (11/11): bih3 (11/12: K 2..5 too)
         launch_tq_bih3(t, W, rb, X, y, n_in, n_out, ncols, s);
         check("iq_mmvq");
         return;
@@ -7370,12 +7440,14 @@ void iq_dequant_expert_r1q2_f16(int gu_type, int d_type, const uint8_t* blob, in
     switch (gu_type) {
 #define STRATA_R1_GU(K, T) case T: dequant_r1q2_kernel<T><<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, s>>>(mg, mu, nbe, qge, per_row, (__half*) dst_gu); ok_g = true; break;
         STRATA_TQ_MIX_KS(STRATA_R1_GU)
+        STRATA_TQ_MIX_KS_B(STRATA_R1_GU)   // QuantLab (11/12): bih3
 #undef STRATA_R1_GU
         default: break;
     }
     switch (d_type) {
 #define STRATA_R1_D(K, T) case T: dequant_r1q2_kernel<T><<<dim3((unsigned) nsb_d, 1), 32, 0, s>>>(md, md, nbf, qdf, 0, (__half*) dst_d); ok_d = true; break;
         STRATA_TQ_MIX_KS(STRATA_R1_D)
+        STRATA_TQ_MIX_KS_B(STRATA_R1_D)   // QuantLab (11/12): bih3
 #undef STRATA_R1_D
         default: break;
     }

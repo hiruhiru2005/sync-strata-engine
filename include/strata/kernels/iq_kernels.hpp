@@ -66,6 +66,9 @@ struct NativeExpertLayout {
     // 2^(lo + q*step) of matrix m (0 gate, 1 up, 2 down).  Only the mixed-layer kernels (kTqMixedType) read them.
     bool r1q2 = false;
     float p2[3][4] = {};
+    // QuantLab (11/12): a mixed layer of bih3 experts (types 180 + K: the points computed from the state, no codebook);
+    // the mixed-layer R1Q2 kernels switch K to those types.  A layer is all bih3 or none (expert_layout refuses a mix).
+    bool tq_bih3 = false;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:
