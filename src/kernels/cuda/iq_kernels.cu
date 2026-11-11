@@ -3962,11 +3962,11 @@ __device__ __forceinline__ uint32_t tq_state1(const uint8_t* qs, int t) {   // s
         return ((((uint32_t) qs16[w0]) | ((uint32_t) qs16[w1] << 16)) >> (off & 15)) & 0xFFFFu;
     }
 }
-__device__ __forceinline__ uint32_t tq_lut_pair(uint32_t st, const uint32_t* __restrict__ my) {
+__device__ __forceinline__ uint32_t tq_lut_pair(uint32_t st, const char* __restrict__ myb) {   // one point a word (as tq_load_lanelut)
     const uint32_t x = (st & TQ_STATE_MASK) * 0x9e3779b1u;
-    const uint32_t i0 = (x >> 21) & 255u, i1 = (x >> 10) & 255u;
-    const uint32_t w0 = my[(i0 >> 1) << 5], w1 = my[(i1 >> 1) << 5];
-    return __byte_perm(w0, w1, 0x5410u + (i0 & 1u) * 0x0022u + (i1 & 1u) * 0x2200u);
+    const uint32_t w0 = *(const uint32_t*) (myb + ((x >> 14) & 0x7F80u));
+    const uint32_t w1 = *(const uint32_t*) (myb + ((x >> 3) & 0x7F80u));
+    return __byte_perm(w0, w1, 0x5410u);
 }
 static int ql_tq_mma_min() {
     static const int n = [] { const char* v = std::getenv("STRATA_QL_TQ_MMA"); return v ? std::atoi(v) : 2; }();
@@ -3984,14 +3984,14 @@ __global__ void __launch_bounds__(256) tq_mma_mmvq_kernel(const uint8_t* __restr
     constexpr int BU16 = 1 + 2 * K;            // a block in u16: d, then the 2K code words
     constexpr int RS = BU16 + 1;               // a row's stride in the staging copy (u16, even)
     constexpr int NPRE = (16 * BU16 + 31) / 32;   // the u16 a lane copies per block of the 16 rows
-    __shared__ uint32_t s_lut[128 * 32];
+    __shared__ uint32_t s_lut[256 * 32];
     __shared__ uint16_t s_w[kTqMmaWarps][16 * RS];
     __shared__ float s_red[kTqMmaWarps][32][4];
-    for (int i = threadIdx.x; i < 128 * 32; i += 32 * kTqMmaWarps) s_lut[i] = ((const uint32_t*) tq_lut_i8)[i >> 5];
+    for (int i = threadIdx.x; i < 256 * 32; i += 32 * kTqMmaWarps) s_lut[i] = (uint32_t) tq_lut_i8[i >> 5];
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
-    const uint32_t* my = s_lut + lane;
+    const char* my = (const char*) (s_lut + lane);
     uint16_t* sw = s_w[warp];
     const int nb = n_in / 128, ntiles = (n_out + 15) / 16;
     const int colB = g < ncols ? g : -1;                         // the B fragment's column
