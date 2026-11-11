@@ -1354,7 +1354,7 @@ int ql_tq_kbits(int t) {
         case 146: return 7;
         case 150: return 5;
         case 151: return 4;
-        default: return t - 160;
+        default: return t >= 182 && t <= 194 ? t - 180 : t - 160;   // QuantLab (11/12): bih3 180 + K
     }
 }
 // QuantLab (10/29): STRATA_QL_PREFILL_GATHER=1 (opt-in) - the streamed walk of a mixed MMQ layer gathers its experts in

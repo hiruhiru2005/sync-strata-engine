@@ -150,6 +150,7 @@ float r1q2_d(const cpu::NativeFmt& f, const uint8_t* blob, int m, int64_t r, int
 
 int main(int argc, char** argv) {
     bool had = false, r1q2 = false;
+    int time_n = 0;
     std::string lut, dump;   // QuantLab (11/9) --dump PREFIX: the grouped GPU output to PREFIX.<grid>.bin
     for (int i = 1; i < argc; ++i) {
         had = had || std::string(argv[i]) == "--hadamard";
@@ -157,6 +158,7 @@ int main(int argc, char** argv) {
         g_bih3 = g_bih3 || std::string(argv[i]) == "--bih3";
         if (std::string(argv[i]) == "--lut" && i + 1 < argc) lut = argv[++i];
         if (std::string(argv[i]) == "--dump" && i + 1 < argc) dump = argv[++i];
+        if (std::string(argv[i]) == "--time" && i + 1 < argc) time_n = std::atoi(argv[++i]);   // QuantLab (11/12)
     }
     if (!lut.empty()) {   // QuantLab (11/4): the codebook on both sides, as the engine sets it from a pack
         std::string err;
@@ -321,6 +323,23 @@ int main(int argc, char** argv) {
         }
     }
 
+    // QuantLab (11/12) --time N: the grouped launch (one block row per group) N times, microseconds a launch (CUDA events)
+    if (time_n > 0) {
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        for (int i = 0; i < 20; ++i)
+            k::native_expert_grouped(L, d_ptr, d_start, d_n, d_dst, d_tok, NE, cap_e, d_xq, d_scr, d_out, s, 0);
+        cudaEventRecord(e0, s);
+        for (int i = 0; i < time_n; ++i)
+            k::native_expert_grouped(L, d_ptr, d_start, d_n, d_dst, d_tok, NE, cap_e, d_xq, d_scr, d_out, s, 0);
+        cudaEventRecord(e1, s);
+        cudaEventSynchronize(e1);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        std::printf("  time: %d experts x %d tokens, one grouped launch %.2f us (mean of %d)\n", NE, NT,
+                    1000.0 * ms / time_n, time_n);
+    }
     // (c) the prompt path's dequantizers against the host decode
     uint16_t* d_h = nullptr;
     if (!ck(cudaMalloc((void**) &d_h, sizeof(uint16_t) * 2 * FF * H), "dq")) return 1;
