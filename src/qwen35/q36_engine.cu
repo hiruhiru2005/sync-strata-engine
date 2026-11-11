@@ -1148,11 +1148,25 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.embd_type = (int) t->type;
         m.embd_row = row_bytes(m.embd_type, (int64_t) t->shape[0]);
         const uint64_t nb = strata::tensor_payload_bytes(*t);
-        uint8_t* d = nullptr;
-        CK(cudaMalloc(&d, nb));
-        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
-        m.embd = d;
-        bytes += nb;
+        // QuantLab (11/12): STRATA_Q36_EMBD_HOST=1 keeps the table in pinned, mapped RAM; iq_embed_rows reads a token's
+        // row over PCIe (a few KB a token), which frees its VRAM (27B: 0.67 GiB of Q4_K) for the context
+        static const bool host = [] { const char* v = std::getenv("STRATA_Q36_EMBD_HOST"); return v && v[0] == '1'; }();
+        if (host) {
+            void* hp = nullptr;
+            void* dp = nullptr;
+            CK(cudaHostAlloc(&hp, nb, cudaHostAllocMapped | cudaHostAllocPortable));
+            std::memcpy(hp, gm.shard(s).tensor_data(*t), nb);
+            CK(cudaHostGetDevicePointer(&dp, hp, 0));
+            m.embd = (uint8_t*) dp;
+            std::fprintf(stderr, "strata-q36: token_embd (%.2f GiB) stays in pinned RAM (STRATA_Q36_EMBD_HOST=1)\n",
+                         (double) nb / (1 << 30));
+        } else {
+            uint8_t* d = nullptr;
+            CK(cudaMalloc(&d, nb));
+            CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+            m.embd = d;
+            bytes += nb;
+        }
     }
     std::fprintf(stderr, "strata-q36: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
