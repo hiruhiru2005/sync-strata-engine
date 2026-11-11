@@ -3878,6 +3878,8 @@ __device__ __forceinline__ TqLane tq_load_lanelut(const void* __restrict__ vbq, 
 constexpr int kTqxMaxIn = 65536, kTqxMaxCols = 8;
 __device__ __align__(16) int8_t g_tqx_i8[kTqxMaxCols * kTqxMaxIn];
 __device__ float g_tqx_d[kTqxMaxCols * (kTqxMaxIn / 32)];
+// QuantLab (11/11): -384 * (the sum of the block's 32 int8 values), the start of v6's U8 sums (bytes read as unsigned - 128)
+__device__ int g_tqx_s[kTqxMaxCols * (kTqxMaxIn / 32)];
 __global__ void tq_x_planar_kernel(const block_q8_1* __restrict__ x, int xb, int ncols) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;   // one q8_1 block
     if (i >= xb * ncols) return;
@@ -3888,6 +3890,10 @@ __global__ void tq_x_planar_kernel(const block_q8_1* __restrict__ x, int xb, int
     dst[0] = make_int4(q[0], q[1], q[2], q[3]);
     dst[1] = make_int4(q[4], q[5], q[6], q[7]);
     g_tqx_d[c * (kTqxMaxIn / 32) + b] = __low2float(src->ds) * TQ_LUT_I8_SCALE;
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) sum = ggml_cuda_dp4a(q[j], 0x01010101, sum);
+    g_tqx_s[c * (kTqxMaxIn / 32) + b] = -384 * sum;
 }
 // tq_apply on the re-laid activations: the same dp4a chain and the same float products in the same order
 __device__ __forceinline__ float tq_apply_planar(const TqLane& r, int c, int kbx, int iqs) {
@@ -4526,6 +4532,489 @@ void launch_tq_v5_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out,
     else launch_tq_v5_k8_r<1, CB, PF>(W, rb, y, n_in, n_out, ncols, s);
 }
 
+// ---- QuantLab (11/11, strata-desktop's proposal; SPEED PROBE, bih3 points, not the pack's codebook): bih3 on the tensor
+// cores.  The three byte planes T0, T1, T2 of each step are three A fragments against the same B (the activations), one
+// mma m16n8k32 each with C carried, so the work does not grow with the columns (up to 8).  The tile and the K split are
+// the old mma kernel's (8 warps share 16 rows, warp w takes blocks w, w + 8, ...; their sums meet in shared memory in
+// warp order).  The code bytes come straight from global memory, no staging and no table: lane (g, t) reads, for rows
+// g and g + 8 and each 32-weight part sb, the u16 at 8sb + 2t (the step pair's own bytes) and the u16 at
+// (8sb + 2t - 2) & 31 (whose high byte is the byte before); steps 8sb + 2t and 8sb + 2t + 1 go to a0 / a2 (row g) and
+// a1 / a3 (row g + 8), against the activations 32sb + 8t .. + 7, as the old mma kernel.
+//   U8 = false: the bytes are signed (as v5, so the outputs match v5 CB = 1 up to the order of the float sums).
+//   U8 = true: the bytes are unsigned - 128 (mma u8.s8, the sums start at -384 * the activations' sum, g_tqx_s).
+// STRATA_QL_TQ_V6=1 (signed) | 2 (unsigned - 128); K8 only, 1..8 columns.
+__device__ __forceinline__ void tq_bih3_planes(uint32_t s, uint32_t& p0, uint32_t& p1, uint32_t& p2) {
+    const uint32_t x0 = s * 0x9E3779B1u, x1 = s * 0x85EBCA6Bu, x2 = s * 0xC2B2AE35u, x3 = s * 0x27D4EB2Fu;
+    p0 = __byte_perm(x0, x1, 0x5321u);
+    p1 = __byte_perm(x1, x2, 0x6532u);
+    p2 = __byte_perm(x2, x3, 0x7653u);
+}
+template<bool U8>
+__device__ __forceinline__ void tq_mma16832(int& d0, int& d1, int& d2, int& d3, uint32_t a0, uint32_t a1, uint32_t a2,
+                                            uint32_t a3, int b0, int b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if constexpr (U8)
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    else
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+constexpr int kTqV6Warps = 8;
+template<bool U8>
+__global__ void __launch_bounds__(32 * kTqV6Warps) tq_v6_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                                   float* __restrict__ y, int n_in, int n_out, int ncols) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ float s_red[kTqV6Warps][32][4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int nb = n_in / 128, ntiles = (n_out + 15) / 16;
+    const int colB = g < ncols ? g : -1;          // the B fragment's column
+    const int c0 = 2 * t, c1 = 2 * t + 1;         // the C fragment's columns
+    for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        const int ra = tile * 16 + g, rb = ra + 8;
+        const bool oka = ra < n_out, okb = rb < n_out;
+        const uint8_t* wa = w + (size_t) (oka ? ra : 0) * row_bytes;
+        const uint8_t* wb = w + (size_t) (okb ? rb : 0) * row_bytes;
+        float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+        for (int kb = warp; kb < nb; kb += kTqV6Warps) {
+            const uint8_t* ba = wa + (size_t) kb * 34;
+            const uint8_t* bb = wb + (size_t) kb * 34;
+            const float dwa = tq_h2f(*(const uint16_t*) ba), dwb = tq_h2f(*(const uint16_t*) bb);
+            uint32_t ca[4], pa[4], cb[4], pb[4];
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const int oc = 2 + 8 * sb + 2 * t, op = 2 + ((8 * sb + 2 * t - 2) & 31);
+                ca[sb] = *(const uint16_t*) (ba + oc);
+                pa[sb] = *(const uint16_t*) (ba + op);
+                cb[sb] = *(const uint16_t*) (bb + oc);
+                pb[sb] = *(const uint16_t*) (bb + op);
+            }
+            float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;   // this block's sums before the weight scale
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const int kk = kb * 4 + sb;
+                int2 b = make_int2(0, 0);
+                if (colB >= 0) b = *(const int2*) (g_tqx_i8 + (size_t) colB * kTqxMaxIn + (size_t) kk * 32 + 8 * t);
+                // states (q[s-1] << 8 | q[s]) & 0x7FFF of steps s = 8sb + 2t (prev pair's high byte, own low byte) and s + 1
+                const uint32_t qa0 = __byte_perm(ca[sb], pa[sb], 0x6650u) & 0x7FFFu;
+                const uint32_t qa1 = __byte_perm(ca[sb], ca[sb], 0x2201u) & 0x7FFFu;
+                const uint32_t qb0 = __byte_perm(cb[sb], pb[sb], 0x6650u) & 0x7FFFu;
+                const uint32_t qb1 = __byte_perm(cb[sb], cb[sb], 0x2201u) & 0x7FFFu;
+                uint32_t A0[3], A1[3], A2[3], A3[3];
+                tq_bih3_planes(qa0, A0[0], A0[1], A0[2]);
+                tq_bih3_planes(qb0, A1[0], A1[1], A1[2]);
+                tq_bih3_planes(qa1, A2[0], A2[1], A2[2]);
+                tq_bih3_planes(qb1, A3[0], A3[1], A3[2]);
+                int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                if constexpr (U8) {
+                    d0 = d2 = c0 < ncols ? g_tqx_s[c0 * (kTqxMaxIn / 32) + kk] : 0;
+                    d1 = d3 = c1 < ncols ? g_tqx_s[c1 * (kTqxMaxIn / 32) + kk] : 0;
+                }
+#pragma unroll
+                for (int p = 0; p < 3; ++p) tq_mma16832<U8>(d0, d1, d2, d3, A0[p], A1[p], A2[p], A3[p], b.x, b.y);
+                const float dx0 = c0 < ncols ? g_tqx_d[c0 * (kTqxMaxIn / 32) + kk] : 0.f;
+                const float dx1 = c1 < ncols ? g_tqx_d[c1 * (kTqxMaxIn / 32) + kk] : 0.f;
+                sa0 += dx0 * (float) d0;
+                sa1 += dx1 * (float) d1;
+                sb0 += dx0 * (float) d2;
+                sb1 += dx1 * (float) d3;
+            }
+            acc0 += dwa * sa0;
+            acc1 += dwa * sa1;
+            acc2 += dwb * sb0;
+            acc3 += dwb * sb1;
+        }
+        s_red[warp][lane][0] = acc0;
+        s_red[warp][lane][1] = acc1;
+        s_red[warp][lane][2] = acc2;
+        s_red[warp][lane][3] = acc3;
+        __syncthreads();
+        if (warp == 0) {
+            float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+#pragma unroll
+            for (int q = 0; q < kTqV6Warps; ++q) {
+                v0 += s_red[q][lane][0];
+                v1 += s_red[q][lane][1];
+                v2 += s_red[q][lane][2];
+                v3 += s_red[q][lane][3];
+            }
+            if (oka) {
+                if (c0 < ncols) y[(size_t) c0 * n_out + ra] = v0;
+                if (c1 < ncols) y[(size_t) c1 * n_out + ra] = v1;
+            }
+            if (okb) {
+                if (c0 < ncols) y[(size_t) c0 * n_out + rb] = v2;
+                if (c1 < ncols) y[(size_t) c1 * n_out + rb] = v3;
+            }
+        }
+        __syncthreads();
+    }
+#else
+    (void) w; (void) row_bytes; (void) y; (void) n_in; (void) n_out; (void) ncols;
+#endif
+}
+template<bool U8>
+void launch_tq_v6_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    static const int blocks = [] {
+        int dev = 0, sms = 0, per = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v6_k8_kernel<U8>, 32 * kTqV6Warps, 0);
+        return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
+    }();
+    const int ntiles = (n_out + 15) / 16;
+    tq_v6_k8_kernel<U8><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV6Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+}
+
+// ---- QuantLab (11/11): v7 = v6 with (1) stream-K: the units (a 16-row tile x 8 consecutive blocks, one a warp) are
+// split evenly over a resident grid of at most as many blocks as tiles, so a tile's sum reaches y (zeroed first) with
+// atomicAdd from at most two blocks: two float adds onto 0 give the same result in either order, so the output stays
+// deterministic; and (2) the code bytes staged one unit ahead with cp.async into shared memory (two buffers), so the
+// loads' DRAM latency is off the arithmetic's path.  A unit's row is 8 x 34 = 272 bytes, 16-byte aligned when the row
+// is (n_in a multiple of 1024).  STRATA_QL_TQ_V7=1 (signed) | 2 (unsigned - 128); K8, 1..8 columns.
+constexpr int kTqV7Warps = 8, kTqV7Row = 272;
+template<bool U8>
+__global__ void __launch_bounds__(32 * kTqV7Warps) tq_v7_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                                   float* __restrict__ y, int n_in, int n_out, int ncols) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ __align__(16) uint8_t s_w[2][16 * kTqV7Row];
+    __shared__ float s_red[kTqV7Warps][32][4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int CH = n_in / 1024, ntiles = (n_out + 15) / 16;
+    const long long U = (long long) ntiles * CH;
+    const int u0 = (int) (U * blockIdx.x / gridDim.x), u1 = (int) (U * (blockIdx.x + 1) / gridDim.x);
+    const int colB = g < ncols ? g : -1;
+    const int c0 = 2 * t, c1 = 2 * t + 1;
+    auto stage = [&](int u, int buf) {
+        const int tile = u / CH, ch = u - tile * CH;
+        for (int i = threadIdx.x; i < 16 * 17; i += 32 * kTqV7Warps) {
+            const int r = i / 17, k = i - r * 17, row = tile * 16 + r;
+            if (row < n_out) {
+                const uint8_t* src = w + (size_t) row * row_bytes + (size_t) ch * kTqV7Row + 16 * k;
+                const unsigned dst = (unsigned) __cvta_generic_to_shared(&s_w[buf][r * kTqV7Row + 16 * k]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    if (u0 < u1) stage(u0, 0);
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    for (int u = u0, it = 0; u < u1; ++u, ++it) {
+        const int buf = it & 1;
+        if (u + 1 < u1) {
+            stage(u + 1, buf ^ 1);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncthreads();
+        const int tile = u / CH, kb = (u - tile * CH) * 8 + warp;
+        const uint8_t* ba = s_w[buf] + g * kTqV7Row + 34 * warp;
+        const uint8_t* bb = ba + 8 * kTqV7Row;
+        const float dwa = tq_h2f(*(const uint16_t*) ba), dwb = tq_h2f(*(const uint16_t*) bb);
+        float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;
+#pragma unroll
+        for (int sb = 0; sb < 4; ++sb) {
+            const int kk = kb * 4 + sb;
+            const int oc = 2 + 8 * sb + 2 * t, op = 2 + ((8 * sb + 2 * t - 2) & 31);
+            const uint32_t ca = *(const uint16_t*) (ba + oc), pa = *(const uint16_t*) (ba + op);
+            const uint32_t cb = *(const uint16_t*) (bb + oc), pb = *(const uint16_t*) (bb + op);
+            int2 b = make_int2(0, 0);
+            if (colB >= 0) b = *(const int2*) (g_tqx_i8 + (size_t) colB * kTqxMaxIn + (size_t) kk * 32 + 8 * t);
+            uint32_t A0[3], A1[3], A2[3], A3[3];
+            tq_bih3_planes(__byte_perm(ca, pa, 0x6650u) & 0x7FFFu, A0[0], A0[1], A0[2]);
+            tq_bih3_planes(__byte_perm(cb, pb, 0x6650u) & 0x7FFFu, A1[0], A1[1], A1[2]);
+            tq_bih3_planes(__byte_perm(ca, ca, 0x2201u) & 0x7FFFu, A2[0], A2[1], A2[2]);
+            tq_bih3_planes(__byte_perm(cb, cb, 0x2201u) & 0x7FFFu, A3[0], A3[1], A3[2]);
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            if constexpr (U8) {
+                d0 = d2 = c0 < ncols ? g_tqx_s[c0 * (kTqxMaxIn / 32) + kk] : 0;
+                d1 = d3 = c1 < ncols ? g_tqx_s[c1 * (kTqxMaxIn / 32) + kk] : 0;
+            }
+#pragma unroll
+            for (int p = 0; p < 3; ++p) tq_mma16832<U8>(d0, d1, d2, d3, A0[p], A1[p], A2[p], A3[p], b.x, b.y);
+            const float dx0 = c0 < ncols ? g_tqx_d[c0 * (kTqxMaxIn / 32) + kk] : 0.f;
+            const float dx1 = c1 < ncols ? g_tqx_d[c1 * (kTqxMaxIn / 32) + kk] : 0.f;
+            sa0 += dx0 * (float) d0;
+            sa1 += dx1 * (float) d1;
+            sb0 += dx0 * (float) d2;
+            sb1 += dx1 * (float) d3;
+        }
+        acc0 += dwa * sa0;
+        acc1 += dwa * sa1;
+        acc2 += dwb * sb0;
+        acc3 += dwb * sb1;
+        __syncthreads();   // all warps are done with this buffer before the next stage() refills it
+        if (u + 1 >= u1 || (u + 1) / CH != tile) {   // the tile's last unit in this block: add the warps, then into y
+            s_red[warp][lane][0] = acc0;
+            s_red[warp][lane][1] = acc1;
+            s_red[warp][lane][2] = acc2;
+            s_red[warp][lane][3] = acc3;
+            __syncthreads();
+            if (warp == 0) {
+                float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+#pragma unroll
+                for (int q = 0; q < kTqV7Warps; ++q) {
+                    v0 += s_red[q][lane][0];
+                    v1 += s_red[q][lane][1];
+                    v2 += s_red[q][lane][2];
+                    v3 += s_red[q][lane][3];
+                }
+                const int ra = tile * 16 + g, rb = ra + 8;
+                if (ra < n_out) {
+                    if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + ra, v0);
+                    if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + ra, v1);
+                }
+                if (rb < n_out) {
+                    if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + rb, v2);
+                    if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + rb, v3);
+                }
+            }
+            __syncthreads();
+            acc0 = acc1 = acc2 = acc3 = 0.f;
+        }
+    }
+#else
+    (void) w; (void) row_bytes; (void) y; (void) n_in; (void) n_out; (void) ncols;
+#endif
+}
+template<bool U8>
+void launch_tq_v7_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    static const int blocks = [] {
+        int dev = 0, sms = 0, per = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v7_k8_kernel<U8>, 32 * kTqV7Warps, 0);
+        return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
+    }();
+    const int ntiles = (n_out + 15) / 16;
+    cudaMemsetAsync(y, 0, sizeof(float) * (size_t) ncols * (size_t) n_out, s);
+    tq_v7_k8_kernel<U8><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+}
+
+// ---- QuantLab (11/11): v8 = v7's stream-K with v6's direct loads (v7's shared-memory staging cost more in barriers than
+// it hid: 5120x17408 T1 61.5 us against v6's 49.4).  MINB: __launch_bounds__'s blocks a SM (4: 64 registers, 6: 40).
+// STRATA_QL_TQ_V8=1 (signed) | 2 (unsigned - 128), STRATA_QL_TQ_V8_MINB=4|6 (default 4); K8, 1..8 columns.
+template<bool U8, int MINB>
+__global__ void __launch_bounds__(32 * kTqV7Warps, MINB) tq_v8_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                                         float* __restrict__ y, int n_in, int n_out, int ncols) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ float s_red[kTqV7Warps][32][4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int CH = n_in / 1024, ntiles = (n_out + 15) / 16;
+    const long long U = (long long) ntiles * CH;
+    const int u0 = (int) (U * blockIdx.x / gridDim.x), u1 = (int) (U * (blockIdx.x + 1) / gridDim.x);
+    const int colB = g < ncols ? g : -1;
+    const int c0 = 2 * t, c1 = 2 * t + 1;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    for (int u = u0; u < u1; ++u) {
+        const int tile = u / CH, kb = (u - tile * CH) * 8 + warp;
+        const int ra = tile * 16 + g, rb = ra + 8;
+        const uint8_t* ba = w + (size_t) (ra < n_out ? ra : 0) * row_bytes + (size_t) kb * 34;
+        const uint8_t* bb = w + (size_t) (rb < n_out ? rb : 0) * row_bytes + (size_t) kb * 34;
+        const float dwa = tq_h2f(*(const uint16_t*) ba), dwb = tq_h2f(*(const uint16_t*) bb);
+        uint32_t ca[4], pa[4], cb[4], pb[4];
+#pragma unroll
+        for (int sb = 0; sb < 4; ++sb) {
+            const int oc = 2 + 8 * sb + 2 * t, op = 2 + ((8 * sb + 2 * t - 2) & 31);
+            ca[sb] = *(const uint16_t*) (ba + oc);
+            pa[sb] = *(const uint16_t*) (ba + op);
+            cb[sb] = *(const uint16_t*) (bb + oc);
+            pb[sb] = *(const uint16_t*) (bb + op);
+        }
+        float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;
+#pragma unroll
+        for (int sb = 0; sb < 4; ++sb) {
+            const int kk = kb * 4 + sb;
+            int2 b = make_int2(0, 0);
+            if (colB >= 0) b = *(const int2*) (g_tqx_i8 + (size_t) colB * kTqxMaxIn + (size_t) kk * 32 + 8 * t);
+            uint32_t A0[3], A1[3], A2[3], A3[3];
+            tq_bih3_planes(__byte_perm(ca[sb], pa[sb], 0x6650u) & 0x7FFFu, A0[0], A0[1], A0[2]);
+            tq_bih3_planes(__byte_perm(cb[sb], pb[sb], 0x6650u) & 0x7FFFu, A1[0], A1[1], A1[2]);
+            tq_bih3_planes(__byte_perm(ca[sb], ca[sb], 0x2201u) & 0x7FFFu, A2[0], A2[1], A2[2]);
+            tq_bih3_planes(__byte_perm(cb[sb], cb[sb], 0x2201u) & 0x7FFFu, A3[0], A3[1], A3[2]);
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            if constexpr (U8) {
+                d0 = d2 = c0 < ncols ? g_tqx_s[c0 * (kTqxMaxIn / 32) + kk] : 0;
+                d1 = d3 = c1 < ncols ? g_tqx_s[c1 * (kTqxMaxIn / 32) + kk] : 0;
+            }
+#pragma unroll
+            for (int p = 0; p < 3; ++p) tq_mma16832<U8>(d0, d1, d2, d3, A0[p], A1[p], A2[p], A3[p], b.x, b.y);
+            const float dx0 = c0 < ncols ? g_tqx_d[c0 * (kTqxMaxIn / 32) + kk] : 0.f;
+            const float dx1 = c1 < ncols ? g_tqx_d[c1 * (kTqxMaxIn / 32) + kk] : 0.f;
+            sa0 += dx0 * (float) d0;
+            sa1 += dx1 * (float) d1;
+            sb0 += dx0 * (float) d2;
+            sb1 += dx1 * (float) d3;
+        }
+        acc0 += dwa * sa0;
+        acc1 += dwa * sa1;
+        acc2 += dwb * sb0;
+        acc3 += dwb * sb1;
+        if (u + 1 >= u1 || (u + 1) / CH != tile) {   // the tile's last unit in this block: add the warps, then into y
+            s_red[warp][lane][0] = acc0;
+            s_red[warp][lane][1] = acc1;
+            s_red[warp][lane][2] = acc2;
+            s_red[warp][lane][3] = acc3;
+            __syncthreads();
+            if (warp == 0) {
+                float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+#pragma unroll
+                for (int q = 0; q < kTqV7Warps; ++q) {
+                    v0 += s_red[q][lane][0];
+                    v1 += s_red[q][lane][1];
+                    v2 += s_red[q][lane][2];
+                    v3 += s_red[q][lane][3];
+                }
+                if (ra < n_out) {
+                    if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + ra, v0);
+                    if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + ra, v1);
+                }
+                if (rb < n_out) {
+                    if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + rb, v2);
+                    if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + rb, v3);
+                }
+            }
+            __syncthreads();
+            acc0 = acc1 = acc2 = acc3 = 0.f;
+        }
+    }
+#else
+    (void) w; (void) row_bytes; (void) y; (void) n_in; (void) n_out; (void) ncols;
+#endif
+}
+template<bool U8, int MINB>
+void launch_tq_v8_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    static const int blocks = [] {
+        int dev = 0, sms = 0, per = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v8_k8_kernel<U8, MINB>, 32 * kTqV7Warps, 0);
+        return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
+    }();
+    const int ntiles = (n_out + 15) / 16;
+    cudaMemsetAsync(y, 0, sizeof(float) * (size_t) ncols * (size_t) n_out, s);
+    tq_v8_k8_kernel<U8, MINB><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+}
+
+// ---- QuantLab (11/11): v9 = v8's even split by tile segments: a block's unit range is walked tile by tile, each tile's
+// chunk range [ch0, ch1) by v6's plain loop (no branch nor barrier inside, unrolled by 2 so two blocks' loads are in
+// flight), and the warps' sums meet and go to y (atomicAdd, at most two blocks a tile) once a segment.  v8 put the
+// tile-end test and its barriers inside the unit loop, which kept one block's loads in flight (5120x17408 T1 68 us
+// against v6's 49).  STRATA_QL_TQ_V9=1 (signed) | 2 (unsigned - 128); K8, 1..8 columns.
+template<bool U8>
+__device__ __forceinline__ void tq_v9_block(const uint8_t* __restrict__ ba, const uint8_t* __restrict__ bb, int kb, int t,
+                                            int colB, int c0, int c1, int ncols, float& acc0, float& acc1, float& acc2,
+                                            float& acc3) {
+    const float dwa = tq_h2f(*(const uint16_t*) ba), dwb = tq_h2f(*(const uint16_t*) bb);
+    uint32_t ca[4], pa[4], cb[4], pb[4];
+#pragma unroll
+    for (int sb = 0; sb < 4; ++sb) {
+        const int oc = 2 + 8 * sb + 2 * t, op = 2 + ((8 * sb + 2 * t - 2) & 31);
+        ca[sb] = *(const uint16_t*) (ba + oc);
+        pa[sb] = *(const uint16_t*) (ba + op);
+        cb[sb] = *(const uint16_t*) (bb + oc);
+        pb[sb] = *(const uint16_t*) (bb + op);
+    }
+    float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;
+#pragma unroll
+    for (int sb = 0; sb < 4; ++sb) {
+        const int kk = kb * 4 + sb;
+        int2 b = make_int2(0, 0);
+        if (colB >= 0) b = *(const int2*) (g_tqx_i8 + (size_t) colB * kTqxMaxIn + (size_t) kk * 32 + 8 * t);
+        uint32_t A0[3], A1[3], A2[3], A3[3];
+        tq_bih3_planes(__byte_perm(ca[sb], pa[sb], 0x6650u) & 0x7FFFu, A0[0], A0[1], A0[2]);
+        tq_bih3_planes(__byte_perm(cb[sb], pb[sb], 0x6650u) & 0x7FFFu, A1[0], A1[1], A1[2]);
+        tq_bih3_planes(__byte_perm(ca[sb], ca[sb], 0x2201u) & 0x7FFFu, A2[0], A2[1], A2[2]);
+        tq_bih3_planes(__byte_perm(cb[sb], cb[sb], 0x2201u) & 0x7FFFu, A3[0], A3[1], A3[2]);
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+        if constexpr (U8) {
+            d0 = d2 = c0 < ncols ? g_tqx_s[c0 * (kTqxMaxIn / 32) + kk] : 0;
+            d1 = d3 = c1 < ncols ? g_tqx_s[c1 * (kTqxMaxIn / 32) + kk] : 0;
+        }
+#pragma unroll
+        for (int p = 0; p < 3; ++p) tq_mma16832<U8>(d0, d1, d2, d3, A0[p], A1[p], A2[p], A3[p], b.x, b.y);
+        const float dx0 = c0 < ncols ? g_tqx_d[c0 * (kTqxMaxIn / 32) + kk] : 0.f;
+        const float dx1 = c1 < ncols ? g_tqx_d[c1 * (kTqxMaxIn / 32) + kk] : 0.f;
+        sa0 += dx0 * (float) d0;
+        sa1 += dx1 * (float) d1;
+        sb0 += dx0 * (float) d2;
+        sb1 += dx1 * (float) d3;
+    }
+    acc0 += dwa * sa0;
+    acc1 += dwa * sa1;
+    acc2 += dwb * sb0;
+    acc3 += dwb * sb1;
+}
+template<bool U8>
+__global__ void __launch_bounds__(32 * kTqV7Warps) tq_v9_k8_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                                   float* __restrict__ y, int n_in, int n_out, int ncols) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ float s_red[kTqV7Warps][32][4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int CH = n_in / 1024, ntiles = (n_out + 15) / 16;
+    const long long U = (long long) ntiles * CH;
+    const int u0 = (int) (U * blockIdx.x / gridDim.x), u1 = (int) (U * (blockIdx.x + 1) / gridDim.x);
+    const int colB = g < ncols ? g : -1;
+    const int c0 = 2 * t, c1 = 2 * t + 1;
+    for (int u = u0; u < u1;) {
+        const int tile = u / CH, ch0 = u - tile * CH, ch1 = min(CH, ch0 + (u1 - u));
+        const int ra = tile * 16 + g, rb = ra + 8;
+        const uint8_t* wa = w + (size_t) (ra < n_out ? ra : 0) * row_bytes;
+        const uint8_t* wb = w + (size_t) (rb < n_out ? rb : 0) * row_bytes;
+        float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+#pragma unroll 2
+        for (int kb = ch0 * 8 + warp; kb < ch1 * 8; kb += 8)
+            tq_v9_block<U8>(wa + (size_t) kb * 34, wb + (size_t) kb * 34, kb, t, colB, c0, c1, ncols, acc0, acc1, acc2, acc3);
+        s_red[warp][lane][0] = acc0;
+        s_red[warp][lane][1] = acc1;
+        s_red[warp][lane][2] = acc2;
+        s_red[warp][lane][3] = acc3;
+        __syncthreads();
+        if (warp == 0) {
+            float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+#pragma unroll
+            for (int q = 0; q < kTqV7Warps; ++q) {
+                v0 += s_red[q][lane][0];
+                v1 += s_red[q][lane][1];
+                v2 += s_red[q][lane][2];
+                v3 += s_red[q][lane][3];
+            }
+            if (ra < n_out) {
+                if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + ra, v0);
+                if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + ra, v1);
+            }
+            if (rb < n_out) {
+                if (c0 < ncols) atomicAdd(y + (size_t) c0 * n_out + rb, v2);
+                if (c1 < ncols) atomicAdd(y + (size_t) c1 * n_out + rb, v3);
+            }
+        }
+        __syncthreads();
+        u += ch1 - ch0;
+    }
+#else
+    (void) w; (void) row_bytes; (void) y; (void) n_in; (void) n_out; (void) ncols;
+#endif
+}
+template<bool U8>
+void launch_tq_v9_k8(const uint8_t* W, size_t rb, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    static const int blocks = [] {
+        int dev = 0, sms = 0, per = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_v9_k8_kernel<U8>, 32 * kTqV7Warps, 0);
+        return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
+    }();
+    const int ntiles = (n_out + 15) / 16;
+    cudaMemsetAsync(y, 0, sizeof(float) * (size_t) ncols * (size_t) n_out, s);
+    tq_v9_k8_kernel<U8><<<(unsigned) std::min(ntiles, blocks), 32 * kTqV7Warps, 0, s>>>(W, rb, y, n_in, n_out, ncols);
+}
+
 // False (nothing launched) outside the scratch's limits: the caller runs mmvq_multi_kernel then.
 template<int TY>
 bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
@@ -4534,6 +5023,36 @@ bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* 
     const int xb = n_in / 32;
     tq_x_planar_kernel<<<(unsigned) ((xb * ncols + 127) / 128), 128, 0, s>>>(X, xb, ncols);
     if constexpr (TY == 144) {   // QuantLab (11/11): strata-desktop's v3 (above), opt-in
+        static const int v9 = [] { const char* v = std::getenv("STRATA_QL_TQ_V9"); return v ? std::atoi(v) : 0; }();
+        if (v9 && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v9 (speed probe, above)
+            if (v9 == 2) launch_tq_v9_k8<true>(W, rb, y, n_in, n_out, ncols, s);
+            else launch_tq_v9_k8<false>(W, rb, y, n_in, n_out, ncols, s);
+            return true;
+        }
+        static const int v8 = [] { const char* v = std::getenv("STRATA_QL_TQ_V8"); return v ? std::atoi(v) : 0; }();
+        if (v8 && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v8 (speed probe, above)
+            static const int minb = [] { const char* v = std::getenv("STRATA_QL_TQ_V8_MINB"); return v && v[0] == '6' ? 6 : 4; }();
+            if (v8 == 2) {
+                if (minb == 6) launch_tq_v8_k8<true, 6>(W, rb, y, n_in, n_out, ncols, s);
+                else launch_tq_v8_k8<true, 4>(W, rb, y, n_in, n_out, ncols, s);
+            } else {
+                if (minb == 6) launch_tq_v8_k8<false, 6>(W, rb, y, n_in, n_out, ncols, s);
+                else launch_tq_v8_k8<false, 4>(W, rb, y, n_in, n_out, ncols, s);
+            }
+            return true;
+        }
+        static const int v7 = [] { const char* v = std::getenv("STRATA_QL_TQ_V7"); return v ? std::atoi(v) : 0; }();
+        if (v7 && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v7 (speed probe, above)
+            if (v7 == 2) launch_tq_v7_k8<true>(W, rb, y, n_in, n_out, ncols, s);
+            else launch_tq_v7_k8<false>(W, rb, y, n_in, n_out, ncols, s);
+            return true;
+        }
+        static const int v6 = [] { const char* v = std::getenv("STRATA_QL_TQ_V6"); return v ? std::atoi(v) : 0; }();
+        if (v6 && rb == (size_t) (n_in / 128) * 34u) {   // v6 (speed probe, above): 1 signed, 2 unsigned - 128
+            if (v6 == 2) launch_tq_v6_k8<true>(W, rb, y, n_in, n_out, ncols, s);
+            else launch_tq_v6_k8<false>(W, rb, y, n_in, n_out, ncols, s);
+            return true;
+        }
         static const int v5 = [] {   // STRATA_QL_TQ_V5=1: bit 0 on, bit 1 CB (default bih3), bit 2 PF
             const char* on = std::getenv("STRATA_QL_TQ_V5");
             if (!(on && on[0] == '1')) return 0;
