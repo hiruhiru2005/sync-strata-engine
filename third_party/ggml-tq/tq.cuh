@@ -215,7 +215,8 @@ static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int 
 #pragma unroll
         for (int i = 0; i < TQ_STEPS_LANE; ++i) {
             const uint32_t xh = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
-            q[i] = (int) ((uint32_t) lut[xh >> 21] | ((uint32_t) lut[(xh >> 10) & 2047u] << 16));
+            // QuantLab (11/11): tq_lut_mask (tq_lut_i8.cuh) is 255 for a 256-point codebook stored periodically: the same values
+            q[i] = (int) ((uint32_t) lut[(xh >> 21) & tq_lut_mask] | ((uint32_t) lut[(xh >> 10) & tq_lut_mask] << 16));
         }
     }
     // Strata's block structs hold the fp16 scale as uint16_t (the fork's as ggml_half): reinterpret, do not convert

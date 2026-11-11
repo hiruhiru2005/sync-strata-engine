@@ -3838,9 +3838,144 @@ void launch_mmvq_multi_nc(dim3 grid, dim3 block, cudaStream_t s, const uint8_t* 
     }
 }
 
+// ---------------------------------------------------------------- QuantLab (11/11): the 256-point codebook's mmvq
+// With a 256-point codebook stored periodically (tq_lut_mask == 255, tq_lut_i8.cuh) the dense trellis mmvq reads it from a
+// copy per lane in shared memory: word j of lane c's copy (entries 2j and 2j + 1) at s_lut[j * 32 + c], so a warp's 32
+// lookups fall in 32 different banks - one shared-memory wavefront per lookup instead of up to 4 L1 lines (ncu, RTX 3080,
+// dense K8 5120x17408: the global lookups held L1/TEX at 91% and LSU at 79% with issue at 57%).  16 KB a block: a fixed
+// grid of blocks walks the rows (the copy is made once per block, not once per 4 rows).  Each row is computed exactly as
+// mmvq_multi_kernel does (row_dot_multi's lane-strided k, the same tq_apply calls in the same order, the same warp_sum):
+// bitwise the same output.  STRATA_QL_TQ_LANELUT=0 keeps mmvq_multi_kernel.
+template<int TY> inline constexpr bool kTqLaneLut = TY == 144 || TY == 145 || TY == 146 || (TY >= 169 && TY <= 174);
+static bool ql_tq_lanelut() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_TQ_LANELUT"); return !(v && v[0] == '0'); }();
+    return on;
+}
+template<int TY>
+__device__ __forceinline__ TqLane tq_load_lanelut(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ my) {
+    const auto* b = (const typename TqInfo<TY>::block_t*) vbq + kbx;
+    uint32_t s[4];
+    tq_states4<TY>(b->qs, iqs / 4, s);
+    TqLane r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+        const uint32_t i0 = (x >> 21) & 255u, i1 = (x >> 10) & 255u;
+        const uint32_t w0 = my[(i0 >> 1) << 5], w1 = my[(i1 >> 1) << 5];
+        // entry i0 = the (i0 & 1) half of w0, entry i1 = the (i1 & 1) half of w1: (e0 | e1 << 16) in one byte permute
+        r.q[i] = (int) __byte_perm(w0, w1, 0x5410u + (i0 & 1u) * 0x0022u + (i1 & 1u) * 0x2200u);
+    }
+    r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
+    return r;
+}
+// The activations re-laid for 16-byte loads (tq_x_planar_kernel, run first by launch_tq_lanelut): column c's int8 values at
+// g_tqx_i8[c * kTqxMaxIn + k], its q8_1 blocks' (d * TQ_LUT_I8_SCALE) at g_tqx_d[c * (kTqxMaxIn / 32) + k / 32].  The block_q8_1
+// layout (36 bytes) let a lane read its 16 values only as four 4-byte loads.  One scratch for the process: the callers
+// of this path (Strata's qwen35 path, one stream) never run two of these products at once.
+constexpr int kTqxMaxIn = 65536, kTqxMaxCols = 8;
+__device__ __align__(16) int8_t g_tqx_i8[kTqxMaxCols * kTqxMaxIn];
+__device__ float g_tqx_d[kTqxMaxCols * (kTqxMaxIn / 32)];
+__global__ void tq_x_planar_kernel(const block_q8_1* __restrict__ x, int xb, int ncols) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // one q8_1 block
+    if (i >= xb * ncols) return;
+    const int c = i / xb, b = i - c * xb;
+    const block_q8_1* src = x + i;   // the columns' blocks are contiguous (column c at x + c * xb)
+    const int* q = (const int*) src->qs;
+    int4* dst = (int4*) (g_tqx_i8 + (size_t) c * kTqxMaxIn + (size_t) b * 32);
+    dst[0] = make_int4(q[0], q[1], q[2], q[3]);
+    dst[1] = make_int4(q[4], q[5], q[6], q[7]);
+    g_tqx_d[c * (kTqxMaxIn / 32) + b] = __low2float(src->ds) * TQ_LUT_I8_SCALE;
+}
+// tq_apply on the re-laid activations: the same dp4a chain and the same float products in the same order
+__device__ __forceinline__ float tq_apply_planar(const TqLane& r, int c, int kbx, int iqs) {
+    const int l = iqs / 4;
+    const int4 v = *(const int4*) (g_tqx_i8 + (size_t) c * kTqxMaxIn + (size_t) kbx * 128 + l * 16);
+    int sumi = 0;
+    sumi = ggml_cuda_dp4a(r.q[0], v.x, sumi);
+    sumi = ggml_cuda_dp4a(r.q[1], v.y, sumi);
+    sumi = ggml_cuda_dp4a(r.q[2], v.z, sumi);
+    sumi = ggml_cuda_dp4a(r.q[3], v.w, sumi);
+    return r.d * g_tqx_d[c * (kTqxMaxIn / 32) + kbx * 4 + (l >> 1)] * (float) sumi;
+}
+template<int TY, int NC, bool EXACT_N>
+__global__ void __launch_bounds__(256) tq_lanelut_mmvq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                              const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                              int n_in, int n_out, int ncols) {
+    (void) x;   // read through g_tqx_* (tq_x_planar_kernel)
+    __shared__ uint32_t s_lut[128 * 32];
+    for (int i = threadIdx.x; i < 128 * 32; i += 256) s_lut[i] = ((const uint32_t*) tq_lut_i8)[i >> 5];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const uint32_t* my = s_lut + lane;
+    using F = Fmt<TY>;
+    const int nb = n_in / F::qk;
+    for (int row = blockIdx.x * 8 + warp; row < n_out; row += gridDim.x * 8) {
+        const uint8_t* wr = w + (size_t) row * row_bytes;
+        for (int c0 = 0; c0 < ncols; c0 += NC) {
+            const int n = EXACT_N ? NC : min(NC, ncols - c0);
+            int cc[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) cc[c] = c0 + (EXACT_N ? c : min(c, n - 1));
+            float s[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+            for (int k = lane; k < nb * F::ipb; k += 32) {
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                const TqLane wl = tq_load_lanelut<TY>(wr, kbx, iqs, my);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (EXACT_N || c < n) s[c] += tq_apply_planar(wl, cc[c], kbx, iqs);
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (EXACT_N || c < n) s[c] = warp_sum(s[c]);
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c < n && lane == c) y[(size_t) (c0 + c) * n_out + row] = s[c];
+            if (EXACT_N) break;
+        }
+    }
+}
+template<int TY, int NC, bool EXACT_N>
+void launch_tq_lanelut_nc(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
+                          cudaStream_t s) {
+    // a grid that is resident at once (the rows are walked, so a second wave would only add a tail)
+    static const int blocks = [] {
+        int dev = 0, sms = 0, per = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, tq_lanelut_mmvq_kernel<TY, NC, EXACT_N>, 256, 0);
+        return std::max(1, (sms > 0 ? sms : 68) * std::max(1, per));
+    }();
+    const dim3 grid((unsigned) std::min((n_out + 7) / 8, blocks)), block(256);
+    tq_lanelut_mmvq_kernel<TY, NC, EXACT_N><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+}
+// False (nothing launched) outside the scratch's limits: the caller runs mmvq_multi_kernel then.
+template<int TY>
+bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
+                       cudaStream_t s) {
+    if (ncols < 1 || ncols > kTqxMaxCols || n_in > kTqxMaxIn || n_in % 128 != 0) return false;
+    const int xb = n_in / 32;
+    tq_x_planar_kernel<<<(unsigned) ((xb * ncols + 127) / 128), 128, 0, s>>>(X, xb, ncols);
+    switch (ncols) {
+        case 1: launch_tq_lanelut_nc<TY, 1, true>(W, rb, X, y, n_in, n_out, 1, s); break;
+        case 2: launch_tq_lanelut_nc<TY, 2, true>(W, rb, X, y, n_in, n_out, 2, s); break;
+        case 3: launch_tq_lanelut_nc<TY, 3, true>(W, rb, X, y, n_in, n_out, 3, s); break;
+        case 4: launch_tq_lanelut_nc<TY, 4, true>(W, rb, X, y, n_in, n_out, 4, s); break;
+        case 5: launch_tq_lanelut_nc<TY, 5, true>(W, rb, X, y, n_in, n_out, 5, s); break;
+        case 6: launch_tq_lanelut_nc<TY, 6, true>(W, rb, X, y, n_in, n_out, 6, s); break;
+        default: launch_tq_lanelut_nc<TY, 8, false>(W, rb, X, y, n_in, n_out, ncols, s); break;
+    }
+    return true;
+}
+
 template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                  cudaStream_t s) {
+    if constexpr (kTqLaneLut<TY>) {   // QuantLab (11/11): the 256-point codebook's mmvq (see above)
+        if (tq_lut_small_host && ql_tq_lanelut() && !g_old_kernels && launch_tq_lanelut<TY>(W, rb, X, y, n_in, n_out, ncols, s))
+            return;
+    }
     const dim3 grid((unsigned) ((n_out + 3) / 4)), block(32, 4);
     if constexpr (!kSplit<TY>) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
     else if (g_old_kernels || split_off<TY>()) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);

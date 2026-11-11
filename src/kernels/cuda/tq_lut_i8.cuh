@@ -146,6 +146,8 @@ alignas(16) static const __device__ uint16_t tq_lut_i8[2048] = {
 #if defined(__CUDACC__) || defined(__HIPCC__) || defined(__HIP__)   // (src/kernels/tq_lut.cpp reads the table on the host)
 static __constant__ uint32_t tq_lut_mask = 2047u;
 #endif
+// the host's copy of the choice (this translation unit's launches read it: iq_kernels.cu's 256-point mmvq)
+static bool tq_lut_small_host = false;
 #if defined(__CUDACC__) && !defined(__HIPCC__) && !defined(__HIP__)
 #include "tq_lut_registry.h"
 #include <cstdlib>
@@ -154,6 +156,7 @@ static const ::strata_tq_lut::Register strata_tq_lut_i8_register([](const uint16
     for (int i = 256; i < 2048 && periodic; ++i) periodic = i8[i] == i8[i & 255];
     const char* off = std::getenv("STRATA_QL_TQ_SMALL_LUT");
     const uint32_t mask = periodic && !(off && off[0] == '0') ? 255u : 2047u;
+    tq_lut_small_host = mask == 255u;
     const int rc = (int) cudaMemcpyToSymbol(tq_lut_i8, i8, sizeof(tq_lut_i8));
     return rc != 0 ? rc : (int) cudaMemcpyToSymbol(tq_lut_mask, &mask, sizeof(mask));
 });
