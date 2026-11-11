@@ -18001,6 +18001,27 @@ int main(int argc, char** argv) {
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);
+                if (!drive.d.ql_lrun.empty()) {   // QuantLab (11/12) STRATA_QL_LAYER_CPU=1 (expert_source.cpp)
+                    auto& dd = drive.d;
+                    std::string s = "strata ql layer cpu (layer: pool ms / jobs per dispatch):";
+                    char b[64];
+                    for (size_t l = 0; l < dd.ql_lrun.size(); ++l) {
+                        if (dd.ql_lwin[l] == 0) continue;
+                        std::snprintf(b, sizeof b, " L%zu %.4f/%.2f", l, dd.ql_lrun[l] / (double) dd.ql_lwin[l],
+                                      (double) dd.ql_ljobs[l] / (double) dd.ql_lwin[l]);
+                        s += b;
+                    }
+                    s += "; jobs by tokens (1..7, 8+):";
+                    for (int t = 1; t <= 8; ++t) {
+                        std::snprintf(b, sizeof b, " %lld", (long long) dd.ql_nt[t]);
+                        s += b;
+                    }
+                    std::fprintf(stderr, "%s\n", s.c_str());
+                    std::fill(dd.ql_lrun.begin(), dd.ql_lrun.end(), 0.0);
+                    std::fill(dd.ql_ljobs.begin(), dd.ql_ljobs.end(), 0);
+                    std::fill(dd.ql_lwin.begin(), dd.ql_lwin.end(), 0);
+                    std::fill(std::begin(dd.ql_nt), std::end(dd.ql_nt), 0);
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;

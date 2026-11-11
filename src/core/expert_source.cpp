@@ -6301,6 +6301,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    // QuantLab (11/12) STRATA_QL_LAYER_CPU=1: the pool's time and jobs per layer, the jobs' token counts (ExpertDispatch)
+    static const bool layer_cpu = [] { const char* v = std::getenv("STRATA_QL_LAYER_CPU"); return v && v[0] == '1'; }();
+    if (layer_cpu && d.layers >= 0) {
+        const size_t li = (size_t) d.layers;
+        if (d.ql_lrun.size() <= li) {
+            d.ql_lrun.resize(li + 1, 0.0);
+            d.ql_ljobs.resize(li + 1, 0);
+            d.ql_lwin.resize(li + 1, 0);
+        }
+        d.ql_lrun[li] += ms(c3, c4) + (npend > 0 ? run_ms_extra : 0.0);
+        d.ql_ljobs[li] += njobs;
+        d.ql_lwin[li] += 1;
+        if (npend == 0)
+            for (int jx = 0; jx < njobs; ++jx) ++d.ql_nt[std::min(std::max((int) d.jobs_multi[(size_t) jx].nt, 0), 8)];
+    }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

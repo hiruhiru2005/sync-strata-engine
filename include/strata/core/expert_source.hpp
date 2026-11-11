@@ -625,6 +625,12 @@ struct ExpertDispatch {
     int64_t tail_skipped = 0;
     int64_t tail_experts = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+    /// QuantLab (11/12) STRATA_QL_LAYER_CPU=1: per layer the pool's wall time (ms, the cold batches included), the jobs
+    /// (distinct CPU experts) and the dispatches; over all layers the jobs by token count (1..7, 8 = 8 or more; the
+    /// cold batches' jobs are not in it).  Printed and reset with the decode timing line.
+    std::vector<double> ql_lrun;
+    std::vector<int64_t> ql_ljobs, ql_lwin;
+    int64_t ql_nt[9] = {};
     /// 149-cold STRATA_COLD_OVERLAP: 0 off (the CPU starts once every blob of the layer is read), 1 the blobs that
     /// must be read are read in the background while the pool computes the ready experts, each landed one computed
     /// as it lands; 2 measure only (read everything first, then the ready experts, then the read ones, timed apart).
