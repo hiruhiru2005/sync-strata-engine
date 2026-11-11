@@ -104,6 +104,15 @@ static bool ql_gpu_ahead_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_GPU_AHEAD"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab 11/11 STRATA_QL_ROUTE_KEEP=k (1..9; unset or 0 = off; changes the output): in a decode window every token keeps
+// only its k highest-ranked experts.  The weights of ranks k..9 are set to 0 right after the router (every router path,
+// before the plan and the doorbell read ids_/w_), without renormalisation - tail skip's rule, but for every expert, the
+// GPU-resident ones too (the "uniform k" baseline of the dynamic-skip papers).  The experts are still in ids_: with
+// STRATA_ROUTE_TAIL_SKIP <= k the missed ones of rank >= k are not computed either.  The prompt path is not touched.
+static int ql_route_keep() {
+    static const int k = [] { const char* v = std::getenv("STRATA_QL_ROUTE_KEEP"); return v != nullptr ? std::atoi(v) : 0; }();
+    return k;
+}
 
 namespace {
 
@@ -2203,6 +2212,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+        }
+        if (const int keep = ql_route_keep(); keep > 0 && keep < (int) K) {   // QuantLab 11/11 STRATA_QL_ROUTE_KEEP
+            if (cudaMemset2DAsync(w_ + tb * K + keep, K * sizeof(float), 0, ((size_t) K - (size_t) keep) * sizeof(float),
+                                  (size_t) n, cs) != cudaSuccess) {
+                err = "verify ql route keep: the memset failed";
+                return false;
+            }
         }
         if (rs_on_ && G == 1 && n <= 8 && T <= 8)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 8, cs);
