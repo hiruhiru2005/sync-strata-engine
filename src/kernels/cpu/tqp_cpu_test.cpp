@@ -465,8 +465,8 @@ int main(int argc, char** argv) {
     check_predicates();
     for (int type : {147, 148, 149}) check_type(type, true);
     for (int type : {144, 145, 146}) check_type(type, false);
-    // QuantLab (10/31): R1Q2 blocks (K 6, 7, 8, 12, 14); (11/12) the bih3 types K 2, 3, 5, 8, 10, 13, 14
-    for (int type : {145, 146, 144, 172, 174, 182, 183, 185, 188, 190, 193, 194})
+    // QuantLab (10/31): R1Q2 blocks (K 6, 7, 8, 12, 14); (11/12) every bih3 type, K 2..14 (each K has its own windows)
+    for (int type : {145, 146, 144, 172, 174, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194})
         for (int n : {2560, 640}) check_r1q2(type, n);
     std::printf("tqp_cpu_test: %d failures\n", g_fail);
     return g_fail ? 1 : 0;
