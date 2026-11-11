@@ -189,6 +189,23 @@ static __device__ __forceinline__ void tqp_states8(const uint8_t * qs, const int
     }
 }
 
+// QuantLab (11/12): the bih3 packs' prompt path.  The prefill gathers a bih3 expert's R1Q2 blob into the table type's
+// blocks of the same K (fp16 d + the same codes) and runs the table type's MMQ; with this flag set (once, before the
+// first prompt: strata::kernels::tq_mmq_bih3_upload, only for a pack whose every trellis matrix is bih3) the tile loader
+// computes a step's 4 points from its 15-bit state instead of looking them up: x_i = s * C_i, the byte planes
+// T0 = prmt(x0, x1, 0x5321), T1 = prmt(x1, x2, 0x6532), T2 = prmt(x2, x3, 0x7653), weight j = (T0.bj + T1.bj + T2.bj -
+// 384) / 128, to int8 as q = round_half_even(sum / 4) - 96 (-96..95) with the scale d / 32 (strata-desktop's rounding: the
+// weights to 1/32, about the int8 codebook's own error).  The decode kernels read the points exactly; only the prompt
+// path rounds.
+#if defined(__CUDACC__) && !defined(__HIPCC__) && !defined(__HIP__)
+static __constant__ uint32_t tq_mmq_bih3 = 0u;
+#include "tq_lut_registry.h"
+static const ::strata_tq_lut::RegisterBih3 strata_tq_mmq_bih3_register([](uint32_t on) -> int {
+    return (int) cudaMemcpyToSymbol(tq_mmq_bih3, &on, sizeof(on));
+});
+#define STRATA_TQ_MMQ_BIH3 1
+#endif
+
 // MMQ (batched) path: lane l of block x as 16 int8 values (4 packed ints, weight order) with one float scale per
 // lane, i.e. weights ~= scale * q.  The int8 codebook (one global scale) is already int8: no decode to float.
 // QuantLab (11/11): `lut` is the int8 codebook to read: the global tq_lut_i8 (default) or its copy in shared memory
@@ -212,6 +229,24 @@ static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int 
     } else {
         uint32_t s[TQ_STEPS_LANE];
         tq_states4<type>(b->qs, l, s);
+#if defined(STRATA_TQ_MMQ_BIH3)
+        if (tq_mmq_bih3) {   // QuantLab (11/12): the bih3 points, see tq_mmq_bih3 above
+#pragma unroll
+            for (int i = 0; i < TQ_STEPS_LANE; ++i) {
+                const uint32_t st = s[i] & 0x7FFFu;
+                const uint32_t x0 = st * 0x9E3779B1u, x1 = st * 0x85EBCA6Bu, x2 = st * 0xC2B2AE35u, x3 = st * 0x27D4EB2Fu;
+                const uint32_t p0 = __byte_perm(x0, x1, 0x5321u), p1 = __byte_perm(x1, x2, 0x6532u), p2 = __byte_perm(x2, x3, 0x7653u);
+                // bytes 0, 2 and bytes 1, 3 summed in 16-bit lanes (each <= 765), / 4 rounded half to even (<= 191: the
+                // errors average 0 - half up would bias every weight by +1/256, which adds up along a row), repacked, - 96
+                uint32_t e = (p0 & 0x00FF00FFu) + (p1 & 0x00FF00FFu) + (p2 & 0x00FF00FFu);
+                uint32_t o = ((p0 >> 8) & 0x00FF00FFu) + ((p1 >> 8) & 0x00FF00FFu) + ((p2 >> 8) & 0x00FF00FFu);
+                e = ((e + 0x00010001u + ((e >> 2) & 0x00010001u)) >> 2) & 0x00FF00FFu;
+                o = ((o + 0x00010001u + ((o >> 2) & 0x00010001u)) >> 2) & 0x00FF00FFu;
+                q[i] = (int) __vsub4(e | (o << 8), 0x60606060u);
+            }
+            return __half2float(__ushort_as_half(b->d)) * (1.0f / 32.0f);
+        }
+#endif
 #pragma unroll
         for (int i = 0; i < TQ_STEPS_LANE; ++i) {
             const uint32_t xh = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;

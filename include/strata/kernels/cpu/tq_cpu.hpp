@@ -112,6 +112,9 @@ struct TqAct {
     // sub-block 384 * its sum (the planes' -128 three times)
     alignas(64) int8_t q8[kTqMaxN];
     alignas(64) int32_t bsum[kTqMaxN / 32];
+    // STRATA_TQ_BIH3_LANES=1 (the lane-wise rows): per 4 values -384 * their sum, and their sub-block's scale
+    alignas(64) int32_t c4[kTqMaxN / 4];
+    alignas(64) float d4[kTqMaxN / 4];
 };
 void unpack_act(const void* q8_0, int n, TqAct& a);
 /// QuantLab (10/31): one matrix's R1Q2 scales.  With them a block is its 4K code bytes only (no fp16 d): the block's
@@ -134,6 +137,10 @@ void tq_rows_avx512_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t ro
 /// exact S[k] (/ 64), so bitwise equal to it.  STRATA_TQ_BIH3_TABLE=1 keeps the table rows instead (A/B).
 void tq_rows_avx512_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                               float* const* out, int r0, int r1, const TqScales& sc);
+/// QuantLab (11/12): STRATA_TQ_BIH3_LANES=1 - the same, the 16 lanes kept apart in floats until the row's end (another
+/// summation order: equal to the scalar kernel to the float rounding, not bitwise).
+void tq_rows_avx512_r1q2_bih3_lanes(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                                    float* const* out, int r0, int r1, const TqScales& sc);
 // QuantLab (11/4): the AVX-VNNI copies of the AVX2 rows (tq_avx2.cpp) and their EVEX test copies (tq_avx512.cpp)
 bool tq_avxvnni_built();
 void tq_rows_avxvnni(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,

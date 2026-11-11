@@ -219,6 +219,65 @@ void rows_r1_bih3_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* cons
     }
 }
 
+// QuantLab (11/12, strata-desktop's lane-wise form, bench_decode's SM 7; STRATA_TQ_BIH3_LANES=1): the same points and
+// VPDPBUSD, but the 16 int32 lanes (a state's 4 weights each) are not folded per block: each lane starts at -384 * its 4
+// activations' sum (TqAct::c4), goes to float times its sub-block's activation scale (TqAct::d4), and the block's
+// d / 128 accumulates into a ZMM of floats folded once per row.  Another float summation order: not bitwise the
+// scalar kernel's (the float rounding only).
+template <int KB>
+void rows_r1_bih3_lanes_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out,
+                          int r0, int r1, const TqScales& sc) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 4 * KB;
+    static const Bih3States<KB> S;
+    const __m512i ix0 = _mm512_load_si512(S.idx[0]), ix1 = _mm512_load_si512(S.idx[1]);
+    const __m512i sh0 = _mm512_load_si512(S.sh[0]), sh1 = _mm512_load_si512(S.sh[1]);
+    const __m512i m15 = _mm512_set1_epi32(0x7FFF);
+    const __mmask64 lm = (__mmask64) (bsz >= 64 ? ~0ull : (1ull << bsz) - 1);
+    const __m512i c0 = _mm512_set1_epi32((int) 0x9E3779B1u), c1 = _mm512_set1_epi32((int) 0x85EBCA6Bu);
+    const __m512i c2 = _mm512_set1_epi32((int) 0xC2B2AE35u), c3 = _mm512_set1_epi32((int) 0x27D4EB2Fu);
+    const __m512i m24 = _mm512_set1_epi32((int) 0xFF000000u), m16 = _mm512_set1_epi32((int) 0xFFFF0000u);
+    const __m512i m8 = _mm512_set1_epi32((int) 0xFFFFFF00u);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        const uint8_t* qr = sc.q + (size_t) r * sc.qbytes;
+        __m512 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm512_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const __m512i blk = _mm512_maskz_loadu_epi8(lm, x + (size_t) i * bsz);
+            __m512i u[6];
+            for (int g = 0; g < 2; ++g) {
+                const __m512i s = _mm512_and_si512(
+                    _mm512_srlv_epi32(_mm512_permutexvar_epi8(g ? ix1 : ix0, blk), g ? sh1 : sh0), m15);
+                const __m512i x0 = _mm512_mullo_epi32(s, c0), x1 = _mm512_mullo_epi32(s, c1);
+                const __m512i x2 = _mm512_mullo_epi32(s, c2), x3 = _mm512_mullo_epi32(s, c3);
+                u[3 * g] = _mm512_ternarylogic_epi32(m24, _mm512_slli_epi32(x1, 16), _mm512_srli_epi32(x0, 8), 0xEA);
+                u[3 * g + 1] = _mm512_ternarylogic_epi32(m16, _mm512_slli_epi32(x2, 8), _mm512_srli_epi32(x1, 16), 0xEA);
+                u[3 * g + 2] = _mm512_ternarylogic_epi32(m8, x3, _mm512_srli_epi32(x2, 24), 0xEA);
+            }
+            const __m512 dw = _mm512_set1_ps(tq_half_to_float(sc.colscale[i]) * sc.p2[(qr[i >> 2] >> (2 * (i & 3))) & 3] *
+                                             (1.0f / 128.0f));
+            for (int t = 0; t < nt; ++t) {
+                const int8_t* a8 = a[t]->q8 + 128 * i;
+                const int32_t* cz = a[t]->c4 + 32 * i;
+                const float* dz = a[t]->d4 + 32 * i;
+                const __m512i qa = _mm512_load_si512(a8), qb = _mm512_load_si512(a8 + 64);
+                __m512i A = _mm512_dpbusd_epi32(_mm512_load_si512(cz), u[0], qa);
+                A = _mm512_dpbusd_epi32(A, u[1], qa);
+                A = _mm512_dpbusd_epi32(A, u[2], qa);
+                __m512i B = _mm512_dpbusd_epi32(_mm512_load_si512(cz + 16), u[3], qb);
+                B = _mm512_dpbusd_epi32(B, u[4], qb);
+                B = _mm512_dpbusd_epi32(B, u[5], qb);
+                __m512 f = _mm512_mul_ps(_mm512_cvtepi32_ps(A), _mm512_load_ps(dz));
+                f = _mm512_fmadd_ps(_mm512_cvtepi32_ps(B), _mm512_load_ps(dz + 16), f);
+                acc[t] = _mm512_fmadd_ps(f, dw, acc[t]);
+            }
+        }
+        const float rb = tq_half_to_float(sc.rowbase[r]);
+        for (int t = 0; t < nt; ++t) out[t][r] = _mm512_reduce_add_ps(acc[t]) * rb;
+    }
+}
+
 // QuantLab (11/4): the AVX2 rows' VNNI copy with the EVEX VPDPWSSD ymm (AVX512-VL/VNNI), so this CPU class tests
 // the AVX-VNNI code of tq_avx2_rows.inl (STRATA_TQ_ISA=avx2e; never chosen by default)
 namespace evex {
@@ -240,6 +299,10 @@ void tq_rows_avx512_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t 
 void tq_rows_avx512_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                               float* const* out, int r0, int r1, const TqScales& sc) {
     STRATA_TQ_DISPATCH_K(kb, rows_r1_bih3_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
+}
+void tq_rows_avx512_r1q2_bih3_lanes(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                                    float* const* out, int r0, int r1, const TqScales& sc) {
+    STRATA_TQ_DISPATCH_K(kb, rows_r1_bih3_lanes_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
 
 void tq_rows_avx2e(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,

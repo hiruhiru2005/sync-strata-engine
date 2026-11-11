@@ -25,4 +25,15 @@ struct Register {
     explicit Register(Upload u) { uploads().push_back(u); }
 };
 
+/// QuantLab (11/12): the MMQ tile loaders' bih3 switch (third_party/ggml-tq/tq.cuh, tq_mmq_bih3): sets this translation
+/// unit's flag; returns a cudaError_t as int.  strata::kernels::tq_mmq_bih3_upload calls them all.
+using FlagSet = int (*)(uint32_t on);
+inline std::vector<FlagSet>& bih3_sets() {
+    static std::vector<FlagSet> v;
+    return v;
+}
+struct RegisterBih3 {
+    explicit RegisterBih3(FlagSet f) { bih3_sets().push_back(f); }
+};
+
 }  // namespace strata_tq_lut

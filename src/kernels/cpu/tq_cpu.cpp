@@ -285,6 +285,10 @@ void unpack_act(const void* q8_0, int n, TqAct& a) {
             sum += q[j];
         }
         a.bsum[b] = 384 * sum;
+        for (int g = 0; g < 8; ++g) {
+            a.c4[8 * b + g] = -384 * ((int32_t) q[4 * g] + q[4 * g + 1] + q[4 * g + 2] + q[4 * g + 3]);
+            a.d4[8 * b + g] = a.d[b];
+        }
     }
 }
 
@@ -378,7 +382,9 @@ void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t 
                 bool bih3 = false) {
 #if defined(STRATA_TQ_X86)
     if (isa == TqIsa::avx512 && bih3 && !bih3_table_only()) {   // QuantLab (11/12): computed, no table
-        tq_detail::tq_rows_avx512_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        static const bool lanes = [] { const char* v = std::getenv("STRATA_TQ_BIH3_LANES"); return v && v[0] == '1'; }();
+        if (lanes) tq_detail::tq_rows_avx512_r1q2_bih3_lanes(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        else tq_detail::tq_rows_avx512_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
     }
     if (isa == TqIsa::avx512) {

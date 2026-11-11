@@ -81,6 +81,7 @@ namespace strata::prefill::mmq {
 bool built() { return false; }
 bool supported(int) { return false; }
 bool fits(int, int64_t) { return false; }
+bool set_bih3(bool, std::string& err) { err = "built without MMQ"; return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*, float*) {}
@@ -1407,6 +1408,35 @@ const MmqPlan& mmq_plan() {
         p.wmma_only.assign(p.layer.size(), 0);
         p.fallback = !on || layers <= 0;
         p.mixed.assign(p.layer.size(), 0);
+        // QuantLab (11/12): a pack of bih3 experts (types 180 + K) takes MMQ as the table types of their K, the tiles
+        // computing the points (mmq::set_bih3) - one switch for the whole process, so only when no expert or dense
+        // trellis matrix uses a table type.  STRATA_QL_MMQ_BIH3=0: the FP16 path for them, as before.
+        if (on && lay.native) {
+            auto bih3 = [](int t) { return t >= 182 && t <= 194; };
+            auto table_tq = [](int t) { return (t >= 144 && t <= 151) || (t >= 160 && t <= 174) || (t >= 224 && t <= 227); };
+            bool any_b = false, any_t = false;
+            for (int64_t l = 0; l < layers; ++l) {
+                if (lay.layer_mixed(l)) {
+                    for (const auto& c : lay.cls_fmt[(size_t) l]) {
+                        any_b = any_b || bih3(c.gu_type) || bih3(c.d_type);
+                        any_t = any_t || table_tq(c.gu_type) || table_tq(c.d_type);
+                    }
+                } else {
+                    const auto& f = lay.fmt[(size_t) l];
+                    any_b = any_b || bih3(f.gu_type) || bih3(f.d_type);
+                    any_t = any_t || table_tq(f.gu_type) || table_tq(f.d_type);
+                }
+            }
+            if (any_b) {
+                const char* be = std::getenv("STRATA_QL_MMQ_BIH3");
+                std::string why, err;
+                if (be != nullptr && be[0] == '0') why = "STRATA_QL_MMQ_BIH3=0";
+                else if (any_t) why = "the pack mixes them with the table types";
+                else if (std::getenv("STRATA_QL_DENSE_TQ") != nullptr) why = "STRATA_QL_DENSE_TQ's table-type dense matrices";
+                else if (!mmq::set_bih3(true, err)) why = err;
+                if (!why.empty()) std::fprintf(stderr, "prefill: the bih3 experts take the FP16 path (%s)\n", why.c_str());
+            }
+        }
         for (int64_t l = 0; on && l < layers; ++l) {
             // QuantLab v6: a per-expert K layer's MMQ group would take one type for experts of several - the FP16
             // path, which dequantizes each expert by its own format.  STRATA_QL_MMQ_MIXED=1: MMQ in groups of one class

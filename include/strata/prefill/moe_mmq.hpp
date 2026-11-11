@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace strata::prefill::mmq {
 
@@ -20,6 +21,9 @@ bool supported(int ggml_type);
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process
 /// ("J_best=0") when nothing fits.  false (said once per type) keeps that product on the non-MMQ path.
 bool fits(int ggml_type, int64_t w_rows);
+/// QuantLab (11/12): on, a bih3 type (180 + K) is its K's table type at every entry point here and the trellis tiles
+/// compute the bih3 points (tq_mmq_bih3); only for a pack whose every trellis matrix is bih3.  false: not this build.
+bool set_bih3(bool on, std::string& err);
 /// NVFP4 prompt precision, STRATA_PREFILL_NVFP4: w4a8 (default) - int8 tensor cores, Q8_1 activations, what decode
 /// runs at; w4a4 - Blackwell's FP4 x FP4 MMA, activations rounded to NVFP4 (faster, first-token KL up to 0.03 vs
 /// fp16); fp16 - the dequantize + FP16 GEMM path (the reference).

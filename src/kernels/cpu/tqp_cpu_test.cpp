@@ -314,6 +314,22 @@ void check_r1q2(int type, int n) {
         std::printf("type %d n %d R1Q2 %-6s vs the scalar R1Q2 kernel: %s\n", type, n, tq_isa_name(isa), ok ? "bitwise equal" : "DIFFERENT");
         if (!ok) fail("R1Q2 ISA differs from scalar", type, n);
     }
+    // QuantLab (11/12): the bih3 lane-wise rows (STRATA_TQ_BIH3_LANES): the scalar kernel's sums to the float rounding
+    if (tq_bih3_type(type) && tq_isa_ok(TqIsa::avx512)) {
+        std::vector<tq_detail::TqAct> acts(NT);
+        const tq_detail::TqAct* aptr[NT];
+        for (int t = 0; t < NT; ++t) { tq_detail::unpack_act(ap[t], n, acts[t]); aptr[t] = &acts[t]; }
+        double rms2 = 0;
+        for (size_t i = 0; i < (size_t) NT * rows; ++i) rms2 += (double) o_new[i] * o_new[i];
+        const double orms = std::sqrt(rms2 / (NT * rows)) + 1e-12;
+        tq_detail::tq_rows_avx512_r1q2_bih3_lanes(K, wn.data(), rb_new, n, aptr, NT, pi, 0, rows, sc);
+        double lw = 0;
+        for (size_t i = 0; i < (size_t) NT * rows; ++i)
+            lw = std::fmax(lw, std::fabs((double) o_isa[i] - o_new[i]) / (std::fabs((double) o_new[i]) + orms));
+        std::printf("type %d n %d R1Q2 avx512 lane-wise vs the scalar R1Q2 kernel: worst %.2e of |want| + RMS  %s\n", type, n,
+                    lw, lw < 1e-5 ? "ok" : "FAIL");
+        if (!(lw < 1e-5)) fail("R1Q2 bih3 lane-wise rows differ", type, n);
+    }
     // fused gate/up: the same rows as gate and up (own scales each: up uses rowbase reversed)
     std::vector<uint8_t> blob = wn;
     blob.insert(blob.end(), wn.begin(), wn.end());
@@ -387,6 +403,18 @@ void bench(int type, int n, int rows) {
             const double t_new = time_ns([&] { tq_rows_r1q2(isa, type, wn.data(), rb_new, n, ap, nt, po, 0, rows, sc); });
             std::printf("bench type %d n %4d %-6s nt %d: old %6.1f ns/block, R1Q2 %6.1f ns/block (%+.0f%%)\n", type, n,
                         tq_isa_name(isa), nt, t_old, t_new, 100.0 * (t_new / t_old - 1.0));
+        }
+    }
+    if (tq_bih3_type(type) && tq_isa_ok(TqIsa::avx512)) {   // QuantLab (11/12): the lane-wise bih3 rows
+        std::vector<tq_detail::TqAct> acts(NT);
+        const tq_detail::TqAct* aptr[NT];
+        for (int t = 0; t < NT; ++t) { tq_detail::unpack_act(ap[t], n, acts[t]); aptr[t] = &acts[t]; }
+        for (int nt : {1, 2, 3}) {
+            if (nt > NT) continue;
+            const double t_e = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
+            const double t_l = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3_lanes(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
+            std::printf("bench type %d n %4d avx512 bih3 rows alone nt %d: exact %6.1f, lane-wise %6.1f ns/block (%+.0f%%)\n",
+                        type, n, nt, t_e, t_l, 100.0 * (t_l / t_e - 1.0));
         }
     }
 }

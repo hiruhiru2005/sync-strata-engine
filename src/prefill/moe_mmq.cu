@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "tq_lut_registry.h"   // QuantLab (11/12): the tile loaders' bih3 switches (tq.cuh)
+
 namespace strata::prefill::mmq {
 namespace {
 // The Gyro trellis types (ids 144-146) are outside the type table of an upstream ggml (indexed by the id): their block
@@ -46,6 +48,15 @@ inline const char* type_label(int t) {
     if (qlk_k(t) > 0) return qlk[qlk_k(t)];
     return t == 144 ? "tq2_t" : t == 145 ? "tqk6" : t == 146 ? "tqk7"
          : t == 147 ? "tqp5" : t == 148 ? "tqp6" : t == 149 ? "tqp7" : ggml_type_name((ggml_type) t);
+}
+// QuantLab (11/12): with set_bih3(true), a bih3 type (180 + K) is the table type of its K at every entry point below:
+// the prefill gathers its R1Q2 blobs into that type's blocks, and the tile loader computes the points (tq.cuh's
+// tq_mmq_bih3).  Off (the default), a bih3 type is no MMQ type (supported() refuses it: the FP16 path).
+bool g_bih3 = false;
+inline int alias(int t) {
+    const int k = bih3_k(t);
+    if (!g_bih3 || k == 0) return t;
+    return k == 8 ? 144 : k == 6 ? 145 : k == 7 ? 146 : k == 5 ? 150 : k == 4 ? 151 : 160 + k;
 }
 }  // namespace
 #if defined(STRATA_KQ_DSO)
@@ -296,6 +307,7 @@ bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab*
 }
 // whether run_tab has an instance for type t (no launch)
 bool tab_has_type(int t) {
+    t = alias(t);   // QuantLab (11/12)
     mmq_args a{};
     a.type_x = (ggml_type) t;
     return run_tab(nullptr, &a, nullptr, nullptr);
@@ -333,6 +345,7 @@ Nvfp4Mode nvfp4_mode() {
 }
 
 bool supported(int t) {
+    t = alias(t);   // QuantLab (11/12)
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0:
 #ifdef STRATA_ORCA_Q4KS_MMQ
@@ -367,6 +380,7 @@ bool supported(int t) {
 }
 
 bool fits(int t, int64_t w_rows) {
+    t = alias(t);   // QuantLab (11/12)
     if (!supported(t)) return false;
     // mul_mat_q_case's choice: the "fallback" configs when the rows are not a multiple of 128; then
     // mul_mat_q_switch_J's loop - a tile size whose config exists for this card and fits its shared memory
@@ -395,7 +409,38 @@ bool fits(int t, int64_t w_rows) {
 }
 
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
+    t = alias(t);   // QuantLab (11/12)
     return (size_t) rows * (size_t) (cols / type_blck((int) t)) * type_bytes((int) t);
+}
+
+bool set_bih3(bool on, std::string& err) {
+    int copies = 0;
+#if defined(GGML_USE_HIP)
+    (void) copies;
+    err = "the bih3 MMQ tiles are CUDA only";
+    return false;
+#else
+    for (::strata_tq_lut::FlagSet f : ::strata_tq_lut::bih3_sets()) {
+        const int rc = f(on ? 1u : 0u);
+        if (rc != 0) {
+            err = std::string("bih3 MMQ switch: ") + cudaGetErrorString((cudaError_t) rc);
+            return false;
+        }
+        ++copies;
+    }
+    if (copies == 0) {
+        err = "bih3 MMQ switch: no trellis tile loader registered (the overlay is off?)";
+        return false;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = "bih3 MMQ switch: cudaDeviceSynchronize failed";
+        return false;
+    }
+#endif
+    g_bih3 = on;
+    std::fprintf(stderr, "prefill mmq: bih3 experts %s (the trellis tiles compute the points; %d tile loaders)\n",
+                 on ? "on the table types' MMQ" : "off MMQ", copies);
+    return true;
 }
 
 size_t q8_bytes(int64_t rows, int64_t cols) {
@@ -424,6 +469,7 @@ __global__ void scale_down_rows_kernel(float* __restrict__ d, int64_t ld, const 
 }  // namespace
 
 bool fp4_activations(int t) {
+    t = alias(t);   // QuantLab (11/12)
 #if defined(GGML_USE_HIP)   // no NVFP4 MMQ on HIP (and no W4A4 unit)
     (void) t;
     return false;
@@ -453,6 +499,7 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
               float* yscale) {
+    t = alias(t);   // QuantLab (11/12)
     if (rows <= 0) return;
 #if !defined(GGML_USE_HIP)
     if (fp4_activations(t)) {
@@ -471,6 +518,7 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
 
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols, int64_t ld,
                       int64_t tokens, int k_used, void* stream) {
+    t = alias(t);   // QuantLab (11/12)
     if (tokens <= 0 || k_used <= 0) return;
     static const bool gather = [] { const char* e = std::getenv("STRATA_QUANT_GATHER"); return e != nullptr && std::atoi(e) != 0; }();
     if (gather) {
@@ -491,7 +539,7 @@ Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
-    const ggml_type t = (ggml_type) p.type;
+    const ggml_type t = (ggml_type) alias(p.type);   // QuantLab (11/12): a bih3 type runs as its K's table type
     const int64_t qk = type_blck((int) t), bpr = p.w_cols / qk;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
@@ -592,10 +640,12 @@ bool tab_built() {
 }
 
 bool tab_fits(int t, int64_t w_rows) {
+    t = alias(t);   // QuantLab (11/12)
     return tab_built() && w_rows % 128 == 0 && tab_has_type(t) && fits(t, w_rows);
 }
 
 size_t overread_bytes(int t, int64_t cols) {
+    t = alias(t);   // QuantLab (11/12)
     if (!supported(t)) return 0;
     // the K tile's over-read for each (fallback=false) config on any visible GPU, the largest of them: the over-read
     // is not monotonic in the tile length (20 blocks: 12 more with a 16-block tile, 4 with a 24-block one), so each
@@ -616,6 +666,7 @@ size_t overread_bytes(int t, int64_t cols) {
 }
 
 bool whole_tiles(int t, int64_t w_rows, int n_experts) {
+    t = alias(t);   // QuantLab (11/12)
     if (!supported(t) || w_rows % 128 != 0 || n_experts <= 0) return false;
     // launch_mul_mat_q's grid: without stream-k one block per tile; with it one block per tile when the tiles fill
     // their waves to >= 90 % (NVIDIA), else nsm blocks that split tiles along K at boundaries set by the tile count.
@@ -901,6 +952,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 }
 
 bool swiglu_quant_ok(int t) {
+    t = alias(t);   // QuantLab (11/12)
 #if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
     // the q8_1 D4 rows quantize() writes for a down product's H (K 640)
     return supported(t) && !fp4_activations(t) && mmq_get_q8_1_ds_layout((ggml_type) t) == MMQ_Q8_1_DS_LAYOUT_D4;
