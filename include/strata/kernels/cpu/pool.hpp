@@ -252,6 +252,10 @@ public:
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
+    /// QuantLab (11/12) STRATA_QL_LAYER_CPU=1: the time every thread (workers and host) spent inside a native phase's
+    /// tasks, gate/up (mode 5) and down (mode 6), summed - against ms_multi_gu / ms_multi_down (the phases' wall time)
+    /// it says how many threads were busy on average; the rest of the wall is the phase's start, tail and end.
+    std::atomic<long long> ql_busy_gu_ns{0}, ql_busy_down_ns{0};
     int64_t multi_bytes = 0;
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the

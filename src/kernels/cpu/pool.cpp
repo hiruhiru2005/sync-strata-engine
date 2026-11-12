@@ -1183,6 +1183,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         if (!sliced) ci = claim(epoch);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
+        static const bool ql_busy_on = [] { const char* v = std::getenv("STRATA_QL_LAYER_CPU"); return v && v[0] == '1'; }();
+        const int64_t ql_t0 = ql_busy_on ? now_ns() : 0;   // QuantLab (11/12): the task's busy time (pool.hpp)
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ == 0) {
@@ -1273,6 +1275,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 r += r1 - r0;
             }
         }
+        if (ql_busy_on && mode_ >= 5)
+            (mode_ == 5 ? ql_busy_gu_ns : ql_busy_down_ns).fetch_add((long long) (now_ns() - ql_t0), std::memory_order_relaxed);
         if (sliced) {
             NodeSync& ns = nsync_[(size_t) s];
             const uint32_t t = (uint32_t) ns.tasks;

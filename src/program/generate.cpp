@@ -18017,6 +18017,19 @@ int main(int argc, char** argv) {
                         s += b;
                     }
                     std::fprintf(stderr, "%s\n", s.c_str());
+                    if (dd.pool != nullptr) {   // QuantLab (11/12): the native phases' wall time and busy threads since the last line
+                        static double p_gu = 0, p_q = 0, p_dn = 0;
+                        static long long p_bg = 0, p_bd = 0;
+                        auto& pl = *dd.pool;
+                        const double gu = pl.ms_multi_gu - p_gu, q = pl.ms_multi_q - p_q, dn = pl.ms_multi_down - p_dn;
+                        const long long bg = pl.ql_busy_gu_ns.load() - p_bg, bd = pl.ql_busy_down_ns.load() - p_bd;
+                        p_gu = pl.ms_multi_gu; p_q = pl.ms_multi_q; p_dn = pl.ms_multi_down;
+                        p_bg = pl.ql_busy_gu_ns.load(); p_bd = pl.ql_busy_down_ns.load();
+                        const double ww = (double) std::max<int64_t>(1, dd.ql_lwin.empty() ? 1 : *std::max_element(dd.ql_lwin.begin(), dd.ql_lwin.end()));
+                        std::fprintf(stderr, "strata ql pool phases (ms/window over %.0f windows): gate/up wall %.3f busy %.3f (%.2f threads), "
+                                     "quant %.3f, down wall %.3f busy %.3f (%.2f threads)\n", ww, gu / ww, bg / 1e6 / ww,
+                                     gu > 0 ? bg / 1e6 / gu : 0.0, q / ww, dn / ww, bd / 1e6 / ww, dn > 0 ? bd / 1e6 / dn : 0.0);
+                    }
                     std::fill(dd.ql_lrun.begin(), dd.ql_lrun.end(), 0.0);
                     std::fill(dd.ql_ljobs.begin(), dd.ql_ljobs.end(), 0);
                     std::fill(dd.ql_lwin.begin(), dd.ql_lwin.end(), 0);

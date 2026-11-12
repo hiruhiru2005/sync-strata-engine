@@ -2757,6 +2757,7 @@ __device__ __forceinline__ const uint8_t* r1q2_scales_at(const uint8_t* blob, in
 // QuantLab (11/9): STAGED (STRATA_QL_TQMIX_SMEM=1) - the R1Q2 rows read the int8 codebook from shared memory, staged
 // once per block before any warp leaves (a warp's 32 lookups land in ~27 different 32-byte sectors of the 4 KB global
 // table; in shared memory they cost the bank conflicts only).  The same entries, so bitwise the same sums.
+__device__ float g_ql_perturb_gu = 1.0f;   // QuantLab (11/12) STRATA_QL_PERTURB_GATE=n: the old gate rows times 1 + n 2^-23 (test only)
 template<bool STAGED, int PROBE = 0>
 __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
@@ -2794,7 +2795,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
             const uint16_t* cs = (const uint16_t*) (sc + (size_t) L.n_ff * 2);
             const uint8_t* qrow = sc + (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) r * qge;
             const float* p2 = L.p2[is_up ? 1 : 0];
-            const float rbase = tq_h2f(rb[r]);
+            const float rbase = tq_h2f(rb[r]) * (is_up ? 1.0f : g_ql_perturb_gu);   // QuantLab (11/12): 1 unless STRATA_QL_PERTURB_GATE
 #define STRATA_TQ_MIX_GU_R1(K, T) case K: tqmix_gu_rows_r1<T, STAGED, PROBE>(wr, cs, qrow, p2, rbase, xq, ent_tok, e0, e1, xb, nb, lane, dst, L.n_ff, r, s_lut); break;
             if (L.tq_bih3) {   // QuantLab (11/12): a bih3 layer (types 180 + K)
                 switch (kg) {
@@ -2822,6 +2823,7 @@ __global__ void __launch_bounds__(256) native_gu_tqmix_kernel(const unsigned lon
     }   // the row chunks
 }
 
+__device__ float g_ql_perturb_down = 1.0f;   // QuantLab (11/12) STRATA_QL_PERTURB_DOWN=n: 1 + n 2^-23 (test only)
 template<bool STAGED, int PROBE = 0>
 __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
@@ -2855,7 +2857,7 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
             const uint16_t* rb = (const uint16_t*) sc;
             const uint16_t* cs = (const uint16_t*) (sc + (size_t) L.n_embd * 2);
             const uint8_t* qrow = sc + (size_t) L.n_embd * 2 + (size_t) nb * 2 + (size_t) r * qdf;
-            const float rbase = tq_h2f(rb[r]);
+            const float rbase = tq_h2f(rb[r]) * g_ql_perturb_down;   // QuantLab (11/12): 1 + 1 ulp under STRATA_QL_PERTURB_DOWN=1 (the yardstick's sensitivity)
 #define STRATA_TQ_MIX_DOWN_R1(K, T) case K: tqmix_down_rows_r1<T, STAGED, PROBE>(wr, cs, qrow, L.p2[2], rbase, hq, ent_dst, e0, e1, hb, nb, lane, out, L.n_embd, r, s_lut); break;
             if (L.tq_bih3) {   // QuantLab (11/12): a bih3 layer (types 180 + K)
                 switch (kd) {
@@ -8813,6 +8815,24 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
         check("native_expert_grouped/swiglu (per-expert K)");
         const dim3 gdq((unsigned) ((L.n_embd + 8 * rch - 1) / (8 * rch)), (unsigned) gyq);
+        // QuantLab (11/12): the yardstick's sensitivity - STRATA_QL_PERTURB_DOWN=n / STRATA_QL_PERTURB_GATE=n (n a small
+        // non-zero integer, the seed): the old down rows' / gate rows' rowbase times 1 + n 2^-23 (n ulp; the old kernels only)
+        static const bool ql_perturb = [] {
+            bool any = false;
+            for (int w = 0; w < 2; ++w) {
+                const char* v = std::getenv(w == 0 ? "STRATA_QL_PERTURB_DOWN" : "STRATA_QL_PERTURB_GATE");
+                const int n = v ? std::atoi(v) : 0;
+                if (n == 0) continue;
+                const float f = 1.0f + (float) n / 8388608.0f;
+                if (w == 0) cudaMemcpyToSymbol(g_ql_perturb_down, &f, sizeof f);
+                else cudaMemcpyToSymbol(g_ql_perturb_gu, &f, sizeof f);
+                std::fprintf(stderr, "strata: QuantLab %s=%d: the old %s rows times 1 %+d 2^-23 (a test)\n",
+                             w == 0 ? "STRATA_QL_PERTURB_DOWN" : "STRATA_QL_PERTURB_GATE", n, w == 0 ? "down" : "gate", n);
+                any = true;
+            }
+            return any;
+        }();
+        (void) ql_perturb;
         // QuantLab (11/12) STRATA_QL_TQMIX_GDN=1: the down rows by native_gdn_tqmix_kernel (one thread a block)
         static const bool tq_gdn = [] { const char* v = std::getenv("STRATA_QL_TQMIX_GDN"); return v && v[0] == '1'; }();
         if (tq_gdn && L.r1q2 && !tq_smem && L.n_ff % 128 == 0 && L.n_ff / 128 <= 256) {
