@@ -2883,6 +2883,218 @@ __global__ void __launch_bounds__(256) native_down_tqmix_kernel(const unsigned l
     }   // the row chunks
 }
 
+// ---------------------------------------------------------------- QuantLab (11/12): GUT, task 4 reopened
+// STRATA_QL_TQMIX_GUT=1 (R1Q2 mixed layers): gate/up with one thread per 128-weight block.  The task-4 cut-outs showed
+// the one-row-a-warp kernel spends most of its time on how it reads (16-weight lane units, every unit fetching its block's
+// scale, state windows found at run time), not on the points or the dp4a.  Here a thread takes block kbx of gate row r
+// and of up row r (the same activations) and walks the block a quarter (8 steps, 32 weights, one q8_1 block) at a time:
+// the quarter's window of 7K + 16 code bits from bit (24 - 8q) K is read as 32-bit words (circular over the block's K
+// words) and shifted to bit 0 once, so each step's state sits at a compile-time offset (K 8: the TQ2_T byte pairs); a
+// step's points (bih3: the 3 byte planes; else the int8 codebook pair) are dotted with the step's activation word, two
+// entries at a time; the block's scale once.  The quarters are a loop, not unrolled: the first GUT unrolled all 32 steps
+// and 4 entries (about 2,000 instructions per K, 411 KiB for the 13 K) and 40% of its stalls waited for instructions.
+// The nb threads of a row add their partial sums through shared memory in a fixed order and the SwiGLU is taken there:
+// it writes h (no gate / up arrays, no SwiGLU launch).  Not bitwise the one-row kernel (another summation order); the
+// same integer dot products.  PROBE 3: states only (task 4's cut-out, wrong sums).
+template<int K> struct GutWin {
+    static constexpr int NV = K == 8 ? 3 : (7 * K + 15 + 31) / 32;   // words of the shifted window
+};
+// the quarter's window: v[0] holds bit (24 - 8q) K of the block's stream (K 8: the words of bytes 8q - 4.., 8q.., 8q + 4..)
+template<int K>
+__device__ __forceinline__ void gut_window(const uint32_t* __restrict__ wp, int q, uint32_t (&v)[GutWin<K>::NV]) {
+    if constexpr (K == 8) {
+        v[0] = __ldg(wp + ((2 * q + 7) & 7));
+        v[1] = __ldg(wp + 2 * q);
+        v[2] = __ldg(wp + 2 * q + 1);
+    } else {
+        constexpr int NV = GutWin<K>::NV;
+        const int b = (24 - 8 * q) * K, wb = b >> 5, r = b & 31;
+        uint32_t raw[NV + 1];
+#pragma unroll
+        for (int j = 0; j <= NV; ++j) raw[j] = __ldg(wp + (wb + j) % K);
+#pragma unroll
+        for (int j = 0; j < NV; ++j) v[j] = __funnelshift_r(raw[j], raw[j + 1], r);
+    }
+}
+// step 8q + I's state from the quarter's window (the 15 bits from (7 - I) K; K 8: byte I | byte I - 1 << 8)
+template<int K, int I>
+__device__ __forceinline__ uint32_t gut_state(const uint32_t (&v)[GutWin<K>::NV]) {
+    if constexpr (K == 8) {
+        constexpr int i = I & 3;
+        const uint32_t X = I < 4 ? v[1] : v[2];
+        if constexpr (i == 0) return __byte_perm(X, I < 4 ? v[0] : v[1], 0x70u) & 0x7FFFu;
+        else return __byte_perm(X, X, (uint32_t) i | ((uint32_t) (i - 1) << 4)) & 0x7FFFu;
+    } else {
+        constexpr int o = (7 - I) * K, j = o >> 5, s = o & 31;
+        if constexpr (s + 15 <= 32) return (v[j] >> s) & 0x7FFFu;
+        else return __funnelshift_r(v[j], v[j + 1], s) & 0x7FFFu;
+    }
+}
+// entries C0 and C0 + 1 (if n > C0 + 1) of block kbx of gate row r and of up row r: ag / au += the block's terms
+// (scales applied).  lut: the int8 codebook (the kernel's shared copy or tq_lut_i8; unused for bih3)
+template<int K, bool BIH3, int PROBE, int C0>
+__device__ __forceinline__ void gut_pair(const uint32_t* __restrict__ gw, const uint32_t* __restrict__ uw, float dwg, float dwu,
+                                         const block_q8_1* __restrict__ x, const int (&off)[GRP_NC], int n, int kbx,
+                                         float (&ag)[GRP_NC], float (&au)[GRP_NC], const uint16_t* __restrict__ lut) {
+    constexpr int NV = GutWin<K>::NV;
+    {
+        constexpr int c0 = C0;
+        const bool two = c0 + 1 < n;
+        float fg0 = 0.0f, fu0 = 0.0f, fg1 = 0.0f, fu1 = 0.0f;
+#pragma unroll 1
+        for (int q = 0; q < 4; ++q) {
+            uint32_t vg[NV], vu[NV];
+            gut_window<K>(gw, q, vg);
+            gut_window<K>(uw, q, vu);
+            const block_q8_1* b0 = x + off[c0] + kbx * 4 + q;
+            const block_q8_1* b1 = x + off[c0 + 1] + kbx * 4 + q;
+            int sg0 = 0, su0 = 0, sg1 = 0, su1 = 0;
+#define STRATA_GUT_STEP(I)                                                                                                    \
+            {                                                                                                               \
+                const uint32_t tg = gut_state<K, I>(vg), tu = gut_state<K, I>(vu);                                          \
+                if constexpr (PROBE == 3) {                                                                                 \
+                    sg0 ^= (int) tg; su0 ^= (int) tu;                                                                       \
+                } else if constexpr (BIH3) {                                                                                \
+                    uint32_t g0, g1, g2, u0, u1, u2;                                                                        \
+                    tq_bih3p(tg, g0, g1, g2);                                                                               \
+                    tq_bih3p(tu, u0, u1, u2);                                                                               \
+                    g0 ^= 0x80808080u; g1 ^= 0x80808080u; g2 ^= 0x80808080u;                                                \
+                    u0 ^= 0x80808080u; u1 ^= 0x80808080u; u2 ^= 0x80808080u;                                                \
+                    const int a0 = ((const int*) b0->qs)[I];                                                                \
+                    sg0 = ggml_cuda_dp4a((int) g0, a0, sg0); sg0 = ggml_cuda_dp4a((int) g1, a0, sg0);                       \
+                    sg0 = ggml_cuda_dp4a((int) g2, a0, sg0);                                                                \
+                    su0 = ggml_cuda_dp4a((int) u0, a0, su0); su0 = ggml_cuda_dp4a((int) u1, a0, su0);                       \
+                    su0 = ggml_cuda_dp4a((int) u2, a0, su0);                                                                \
+                    if (two) {                                                                                              \
+                        const int a1 = ((const int*) b1->qs)[I];                                                            \
+                        sg1 = ggml_cuda_dp4a((int) g0, a1, sg1); sg1 = ggml_cuda_dp4a((int) g1, a1, sg1);                   \
+                        sg1 = ggml_cuda_dp4a((int) g2, a1, sg1);                                                            \
+                        su1 = ggml_cuda_dp4a((int) u0, a1, su1); su1 = ggml_cuda_dp4a((int) u1, a1, su1);                   \
+                        su1 = ggml_cuda_dp4a((int) u2, a1, su1);                                                            \
+                    }                                                                                                       \
+                } else {                                                                                                    \
+                    const uint32_t xg = tg * 0x9e3779b1u, xu = tu * 0x9e3779b1u;                                            \
+                    const int pg = (int) ((uint32_t) lut[xg >> 21] | ((uint32_t) lut[(xg >> 10) & 2047u] << 16));       \
+                    const int pu = (int) ((uint32_t) lut[xu >> 21] | ((uint32_t) lut[(xu >> 10) & 2047u] << 16));       \
+                    const int a0 = ((const int*) b0->qs)[I];                                                                \
+                    sg0 = ggml_cuda_dp4a(pg, a0, sg0);                                                                      \
+                    su0 = ggml_cuda_dp4a(pu, a0, su0);                                                                      \
+                    if (two) {                                                                                              \
+                        const int a1 = ((const int*) b1->qs)[I];                                                            \
+                        sg1 = ggml_cuda_dp4a(pg, a1, sg1);                                                                  \
+                        su1 = ggml_cuda_dp4a(pu, a1, su1);                                                                  \
+                    }                                                                                                       \
+                }                                                                                                           \
+            }
+            STRATA_GUT_STEP(0) STRATA_GUT_STEP(1) STRATA_GUT_STEP(2) STRATA_GUT_STEP(3)
+            STRATA_GUT_STEP(4) STRATA_GUT_STEP(5) STRATA_GUT_STEP(6) STRATA_GUT_STEP(7)
+#undef STRATA_GUT_STEP
+            const float d0 = __low2float(b0->ds);
+            fg0 += d0 * (float) sg0;
+            fu0 += d0 * (float) su0;
+            if (two) {
+                const float d1 = __low2float(b1->ds);
+                fg1 += d1 * (float) sg1;
+                fu1 += d1 * (float) su1;
+            }
+        }
+        ag[c0] += dwg * fg0;
+        au[c0] += dwu * fu0;
+        if (two) {
+            ag[c0 + 1] += dwg * fg1;
+            au[c0 + 1] += dwu * fu1;
+        }
+    }
+}
+template<int K, bool BIH3, int PROBE>
+__device__ __forceinline__ void gut_block(const uint8_t* __restrict__ gb, const uint8_t* __restrict__ ub, float dwg, float dwu,
+                                          const block_q8_1* __restrict__ x, const int (&off)[GRP_NC], int n, int kbx,
+                                          float (&ag)[GRP_NC], float (&au)[GRP_NC], const uint16_t* __restrict__ lut) {
+    static_assert(GRP_NC == 4, "gut_block takes the entries as two pairs");
+    gut_pair<K, BIH3, PROBE, 0>((const uint32_t*) gb, (const uint32_t*) ub, dwg, dwu, x, off, n, kbx, ag, au, lut);
+    if (n > 2) gut_pair<K, BIH3, PROBE, 2>((const uint32_t*) gb, (const uint32_t*) ub, dwg, dwu, x, off, n, kbx, ag, au, lut);
+}
+template<bool BIH3, int PROBE, bool SL = false>
+__global__ void __launch_bounds__(256) native_gut_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+                                                               const int32_t* __restrict__ ent_tok,
+                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                               float* __restrict__ h) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ float red[256][2 * GRP_NC];
+    __shared__ __align__(16) uint16_t s_lut[SL ? 2048 : 8];
+    if constexpr (SL) {   // the int8 codebook (4 KB) once per block: a step's two lookups land in shared memory
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) ((uint32_t*) s_lut)[i] = ((const uint32_t*) tq_lut_i8)[i];
+        __syncthreads();
+    }
+    const uint16_t* lut = SL ? (const uint16_t*) s_lut : (const uint16_t*) tq_lut_i8;
+    const int nb = (int) (L.n_embd / 128), xb = (int) (L.n_embd / 32), rpb = 256 / nb;
+    const int tid = threadIdx.x, rl = tid / nb, kbx = tid - rl * nb;
+    const int r = blockIdx.x * rpb + rl;
+    const bool live = rl < rpb && r < L.n_ff;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const unsigned long long p = grp_ptr[g];
+        const int kg = (int) (p >> kTqTagShift) & 15, kd = (int) (p >> (kTqTagShift + 4)) & 15;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        const uint8_t* blob = (const uint8_t*) (p & kTqAddrMask);
+        const size_t row_c = (size_t) nb * (size_t) (4 * kg), qge = (size_t) (nb + 3) / 4;
+        const uint8_t* scg = r1q2_scales_at(blob, kg, kd, L.n_embd, L.n_ff);
+        const uint8_t* scu = scg + (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) L.n_ff * qge;
+        float dwg = 0.0f, dwu = 0.0f;
+        const uint8_t *gb = nullptr, *ub = nullptr;
+        if (live) {
+            const float k = BIH3 ? 1.0f / 128.0f : TQ_LUT_I8_SCALE;
+            const uint8_t* qg = scg + (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) r * qge;
+            const uint8_t* qu = scu + (size_t) L.n_ff * 2 + (size_t) nb * 2 + (size_t) r * qge;
+            dwg = tq_h2f(((const uint16_t*) (scg + (size_t) L.n_ff * 2))[kbx]) * L.p2[0][(qg[kbx >> 2] >> (2 * (kbx & 3))) & 3] * k;
+            dwu = tq_h2f(((const uint16_t*) (scu + (size_t) L.n_ff * 2))[kbx]) * L.p2[1][(qu[kbx >> 2] >> (2 * (kbx & 3))) & 3] * k;
+            gb = blob + (size_t) r * row_c + (size_t) kbx * (size_t) (4 * kg);
+            ub = gb + row_c * (size_t) L.n_ff;
+        }
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            int off[GRP_NC];
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
+            float ag[GRP_NC], au[GRP_NC];
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) ag[c] = au[c] = 0.0f;
+            if (live) {
+                switch (kg) {
+#define STRATA_GUT_K(KK) case KK: gut_block<KK, BIH3, PROBE>(gb, ub, dwg, dwu, xq, off, n, kbx, ag, au, lut); break;
+                    STRATA_GUT_K(2) STRATA_GUT_K(3) STRATA_GUT_K(4) STRATA_GUT_K(5) STRATA_GUT_K(6) STRATA_GUT_K(7)
+                    STRATA_GUT_K(8) STRATA_GUT_K(9) STRATA_GUT_K(10) STRATA_GUT_K(11) STRATA_GUT_K(12) STRATA_GUT_K(13)
+                    STRATA_GUT_K(14)
+#undef STRATA_GUT_K
+                    default: break;
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) {
+                red[tid][c] = ag[c];
+                red[tid][GRP_NC + c] = au[c];
+            }
+            __syncthreads();
+            if (tid < rpb * GRP_NC) {
+                const int rr = tid / GRP_NC, c = tid - rr * GRP_NC, row = blockIdx.x * rpb + rr;
+                if (c < n && row < L.n_ff) {
+                    float sg = 0.0f, su = 0.0f;
+                    for (int k = 0; k < nb; ++k) {
+                        sg += red[rr * nb + k][c];
+                        su += red[rr * nb + k][GRP_NC + c];
+                    }
+                    const float gv = sg * tq_h2f(((const uint16_t*) scg)[row]);
+                    const float uv = su * tq_h2f(((const uint16_t*) scu)[row]);
+                    h[(size_t) (e + c) * L.n_ff + row] = (gv / (1.0f + __expf(-gv))) * uv;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // ---------------------------------------------------------------- EXPDEC (STRATA_EXPDEC=1): the group's activations
 // in shared memory, R rows per lane
 //
@@ -8440,6 +8652,22 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const dim3 gq((unsigned) ((2 * L.n_ff + GU_ROWS * rch - 1) / (GU_ROWS * rch)), (unsigned) gyq);
         // QuantLab (11/12) STRATA_QL_TQMIX_PROBE=1..3: task 4's cut-outs (SPEED ONLY: wrong sums), R1Q2 layers, unstaged
         static const int tq_probe = [] { const char* v = std::getenv("STRATA_QL_TQMIX_PROBE"); return v ? std::atoi(v) : 0; }();
+        // QuantLab (11/12) STRATA_QL_TQMIX_GUT=1: gate/up and the SwiGLU by native_gut_tqmix_kernel (one thread a block)
+        static const bool tq_gut = [] { const char* v = std::getenv("STRATA_QL_TQMIX_GUT"); return v && v[0] == '1'; }();
+        const bool gut = tq_gut && L.r1q2 && !tq_smem && L.n_embd % 128 == 0 && L.n_embd / 128 <= 256;
+        if (gut) {
+            const int rpb = 256 / (int) (L.n_embd / 128);
+            const dim3 gg((unsigned) ((L.n_ff + rpb - 1) / rpb), (unsigned) gyq);
+            if (L.tq_bih3) {
+                if (tq_probe == 3) native_gut_tqmix_kernel<true, 3><<<gg, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, h);
+                else native_gut_tqmix_kernel<true, 0><<<gg, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, h);
+            } else {
+                static const bool gut_sl = [] { const char* v = std::getenv("STRATA_QL_GUT_SMEM"); return !(v && v[0] == '0'); }();
+                if (tq_probe == 3) native_gut_tqmix_kernel<false, 3><<<gg, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, h);
+                else if (gut_sl) native_gut_tqmix_kernel<false, 0, true><<<gg, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, h);
+                else native_gut_tqmix_kernel<false, 0><<<gg, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, h);
+            }
+        } else
         if (tq_probe == 1 && !tq_smem) native_gu_tqmix_kernel<false, 1><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
         else if (tq_probe == 2 && !tq_smem) native_gu_tqmix_kernel<false, 2><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
         else if (tq_probe == 3 && !tq_smem) native_gu_tqmix_kernel<false, 3><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
@@ -8447,7 +8675,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         else native_gu_tqmix_kernel<false><<<gq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, 1);
         check("native_expert_grouped/gu (per-expert K)");
         const long long nhq = (long long) cap_entries * L.n_ff;
-        swiglu_entries_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(gate, up, h, nhq);
+        if (!gut) swiglu_entries_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(gate, up, h, nhq);
         if (L.had_block > 0) hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
         quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
         check("native_expert_grouped/swiglu (per-expert K)");
