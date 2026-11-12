@@ -2900,22 +2900,27 @@ __device__ __forceinline__ bool i8h_down(const GrMulti& m, float* __restrict__ p
         }
     };
     if constexpr (PF == 1 || PF == 2) pf_up();
-    // every token's inputs before any arithmetic or LDS store; s_gw's expression per thread (no barrier)
+    // every token's inputs before any arithmetic or LDS store; s_gw as gr_down_i8_kernel computes it (thread k, through
+    // LDS: 256 threads each taking T sigmoids cost more issue slots than the barrier)
+    __shared__ float s_gw[T];
     float2 rr[T], bb[T];
     float gw[T];
     const bool act_on = !(PRB && (prb & 2));
 #pragma unroll
     for (int k = 0; k < T; ++k) {
         const FusedGrArgs& a = m.a[k];
-        if (!act_on) { rr[k] = make_float2(0.0f, 0.0f); bb[k] = rr[k]; gw[k] = 0.0f; continue; }
+        if (!act_on) { rr[k] = make_float2(0.0f, 0.0f); bb[k] = rr[k]; continue; }
         rr[k] = *reinterpret_cast<const float2*>(a.R + col);
         bb[k] = make_float2(0.0f, 0.0f);
-        gw[k] = 0.0f;
-        if (a.apply) {
-            bb[k] = *reinterpret_cast<const float2*>(a.bo_prev + (col - c * N));
-            gw[k] = 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC);
-        }
+        if (a.apply) bb[k] = *reinterpret_cast<const float2*>(a.bo_prev + (col - c * N));
     }
+    if (t < T) {
+        const FusedGrArgs& a = m.a[t];
+        s_gw[t] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < T; ++k) gw[k] = s_gw[k];
     const float2 g2 = *reinterpret_cast<const float2*>(m.a[0].w_norm + col);
     float ss[PS], iv[PI];
 #pragma unroll
@@ -2992,9 +2997,9 @@ __device__ __forceinline__ bool i8h_down(const GrMulti& m, float* __restrict__ p
     }
     if constexpr (PF == 3 || PF == 4) pf_up();
     if (PRB && (prb & 8)) return false;
-    __threadfence();
-    __syncthreads();
+    __syncthreads();   // then one fence (thread 0's, cumulative over the block's writes before the barrier: as grid.sync)
     if (t == 0) {
+        __threadfence();
         const unsigned prev = atomicAdd(&cnt[rg], 1u);
         s_last = prev == (unsigned) (I8_NKC - 1);
         if (s_last) atomicExch(&cnt[rg], 0u);
@@ -3052,8 +3057,9 @@ __global__ void __launch_bounds__(THREADS) gr_down_i8h_kernel(GrMulti m, float* 
                                                              uint32_t* __restrict__ qlo, float* __restrict__ dlo) {
     i8h_down<T>(m, part, ssg, qlo, dlo, g_i8_cnt, (int) blockIdx.x, (int) blockIdx.y);
 }
+// (4 blocks a SM: 220 blocks in one wave on 68 SMs; at T >= 6 the uncapped kernel took 77-86 registers, 2-3 blocks)
 template <int T, int PF>
-__global__ void __launch_bounds__(THREADS) gr_down_i8pf_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg,
+__global__ void __launch_bounds__(THREADS, 4) gr_down_i8pf_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg,
                                                               uint32_t* __restrict__ qlo, float* __restrict__ dlo) {
     i8h_down<T, false, PF>(m, part, ssg, qlo, dlo, g_i8_cnt, (int) blockIdx.x, (int) blockIdx.y);
 }
@@ -3310,6 +3316,7 @@ template <int T> void launch_i8_t(const GrMulti& m, float* scratch, cudaStream_t
             pr("down_i8", (const void*) gr_down_i8_kernel<T>, THREADS);
             pr("up_i8", (const void*) gr_up_i8_kernel<T>, 32);
             pr("down_i8h", (const void*) gr_down_i8h_kernel<T>, THREADS);
+            pr("down_i8pf4", (const void*) gr_down_i8pf_kernel<T, 4>, THREADS);
             pr("up_i8h W4", (const void*) gr_up_i8h_kernel<T, 4>, 128);
             pr("i8_fused", (const void*) gr_i8_fused_kernel<T>, THREADS);
             pr("i8_fusedU", (const void*) gr_i8_fused_kernel<T, true>, THREADS);
@@ -3338,7 +3345,7 @@ template <int T> void launch_i8_t(const GrMulti& m, float* scratch, cudaStream_t
             return;
         }
     }
-    if (bw == 4 || bw == 5 || bw == 6) {
+    if (((bw == 4 || bw == 5) && T < 8) || bw == 6) {   // (T 8: the capped down kernel spills; the old read is faster)
         // =4: the hoisted down kernel prefetching the up weights into L2 (STRATA_QL_HC_BW_PF=1..4, default 4: after its dot
         // products, evict_last), then the old up kernel; =5: the same down, then gr_up_i8ts_kernel (STRATA_QL_HC_BW_UPS=2|4);
         // =6: the old down kernel, then gr_up_i8ts_kernel
