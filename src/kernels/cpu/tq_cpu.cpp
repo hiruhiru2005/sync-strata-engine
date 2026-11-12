@@ -450,12 +450,6 @@ static bool bih3_lanes() {
     static const bool on = [] { const char* v = std::getenv("STRATA_TQ_BIH3_LANES"); return v && v[0] == '1'; }();
     return on;
 }
-// QuantLab (11/13) STRATA_QL_TQ_PRE=1: the AVX-512 bih3 exact rows with their per-block scalar work hoisted
-// (tq_rows_avx512_r1q2_bih3_pre; the same bits)
-static bool tq_pre_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_QL_TQ_PRE"); return v && v[0] == '1'; }();
-    return on;
-}
 // QuantLab (11/13) STRATA_QL_UNPACK_ONCE: the rows rows_r1_on runs read only q8, d and bsum (the AVX-512 bih3 exact rows)
 static bool lean_act(TqIsa isa, int ggml_type) {
     return unpack_once_on() && isa == TqIsa::avx512 && tq_bih3_type(ggml_type) && !bih3_table_only() && !bih3_lanes();
@@ -467,7 +461,6 @@ void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t 
 #if defined(STRATA_TQ_X86)
     if (isa == TqIsa::avx512 && bih3 && !bih3_table_only()) {   // QuantLab (11/12): computed, no table
         if (bih3_lanes()) tq_detail::tq_rows_avx512_r1q2_bih3_lanes(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
-        else if (tq_pre_on()) tq_detail::tq_rows_avx512_r1q2_bih3_pre(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         else tq_detail::tq_rows_avx512_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
     }

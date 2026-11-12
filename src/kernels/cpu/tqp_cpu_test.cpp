@@ -349,17 +349,6 @@ void check_r1q2(int type, int n) {
         std::printf("type %d n %d R1Q2 avx512 lane-wise vs the scalar R1Q2 kernel: worst %.2e of |want| + RMS  %s\n", type, n,
                     lw, lw < 1e-5 ? "ok" : "FAIL");
         if (!(lw < 1e-5)) fail("R1Q2 bih3 lane-wise rows differ", type, n);
-        // QuantLab (11/13) STRATA_QL_TQ_PRE: the hoisted exact rows, every group size and a row range in two calls
-        bool okp = true;
-        for (int nt = 1; nt <= NT; ++nt) {
-            std::fill(o_isa.begin(), o_isa.end(), 0.f);
-            tq_detail::tq_rows_avx512_r1q2_bih3_pre(K, wn.data(), rb_new, n, aptr, nt, pi, 0, rows / 3, sc);
-            tq_detail::tq_rows_avx512_r1q2_bih3_pre(K, wn.data(), rb_new, n, aptr, nt, pi, rows / 3, rows, sc);
-            okp = okp && same_bits(o_isa.data(), o_new.data(), (size_t) nt * rows);
-        }
-        std::printf("type %d n %d R1Q2 avx512 bih3 hoisted rows (STRATA_QL_TQ_PRE) vs the scalar R1Q2 kernel: %s\n", type, n,
-                    okp ? "bitwise equal" : "DIFFERENT");
-        if (!okp) fail("R1Q2 bih3 hoisted rows differ", type, n);
         // QuantLab (11/13) STRATA_QL_UNPACK_ONCE: under a generation the second call reuses the first's unpacking
         // (with the variable unset this is the plain path twice)
         bool oku = true;
@@ -484,9 +473,8 @@ void bench(int type, int n, int rows) {
             if (nt > NT) continue;
             const double t_e = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
             const double t_l = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3_lanes(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
-            const double t_p = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3_pre(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
-            std::printf("bench type %d n %4d avx512 bih3 rows alone nt %d: exact %6.1f, lane-wise %6.1f ns/block (%+.0f%%), "
-                        "hoisted %6.1f (%+.0f%%)\n", type, n, nt, t_e, t_l, 100.0 * (t_l / t_e - 1.0), t_p, 100.0 * (t_p / t_e - 1.0));
+            std::printf("bench type %d n %4d avx512 bih3 rows alone nt %d: exact %6.1f, lane-wise %6.1f ns/block (%+.0f%%)\n",
+                        type, n, nt, t_e, t_l, 100.0 * (t_l / t_e - 1.0));
         }
     }
 }
