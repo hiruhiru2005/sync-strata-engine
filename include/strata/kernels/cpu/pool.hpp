@@ -355,6 +355,8 @@ private:
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
+    // QuantLab (11/13) STRATA_QL_UNPACK_ONCE: this batch's activation generation (process-wide, never reused; tq_cpu.hpp)
+    uint64_t act_gen_ = 0;
     int parts_a_ = 1, parts_b_ = 1;
     struct SplitBuf {
         alignas(64) float ff[FF];
