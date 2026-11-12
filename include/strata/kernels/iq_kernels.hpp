@@ -121,6 +121,12 @@ void native_expert_set_mode(int mode, int phase);
 /// hadamard_rotate.  The f16 form rotates in place, computing in float.
 void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int block, const float* signs, void* stream);
 void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, const float* signs, void* stream);
+/// QuantLab (11/13) STRATA_QL_FUSE_HADQ=1: hadamard_rows(x, y, ...) and quantize_q8_1_rows(y, rows, width, yq) in one
+/// launch, bit for bit the two (y and yq both written; x == y allowed).  `block` < 32 falls back to the two launches.
+/// `ql_fuse_hadq_on` reads the switch once (the first call, before any graph capture records the launch).
+void hadamard_q8_1_rows(const float* x, float* y, void* yq, int64_t rows, int64_t width, int block, const float* signs,
+                        void* stream);
+bool ql_fuse_hadq_on();
 /// A device copy (on the current device) of the host sign vector `host` of `width` signs, made on first use and
 /// kept for the process.  Call it at setup, not inside a CUDA graph capture.  nullptr for a nullptr `host`.
 const float* hadamard_device_signs(const float* host, int width);
