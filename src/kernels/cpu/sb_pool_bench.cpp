@@ -118,9 +118,10 @@ int main(int argc, char** argv) {
     std::vector<float> outbuf((size_t) jmax * ntmax * cpu::H);
     std::vector<cpu::ExpertJobMulti> jobs((size_t) jmax);
 
+    // the pool first (it reads the CPUs this thread may use), then the host pinned - the engine's order
     const int host = cpu::planned_host_core(cpu::PoolAffinity::All);
-    const cpu::ThreadAffinity prev = cpu::pin_current_thread(host);
     cpu::ExpertPool pool(workers, /*pin=*/true, /*host_works=*/true, cpu::PoolAffinity::All, 0);
+    const cpu::ThreadAffinity prev = cpu::pin_current_thread(host);
     std::printf("sb_pool_bench: K %d (type %d), %zu experts of %.3f MB (%.0f MB, %s pages), %d workers + the host on CPU %d, "
                 "trellis rows on %s; STRATA_QL_TQ_PRE=%s STRATA_QL_UNPACK_ONCE=%s STRATA_QL_FUSED_QUANT=%s\n",
                 K, type, E, f.bytes / 1e6, bytes / 1e6, thp ? "2 MiB (MADV_HUGEPAGE)" : "4 KiB", pool.workers(), host,
@@ -169,14 +170,14 @@ int main(int argc, char** argv) {
             std::printf("  nt %d J %d: median %7.1f us, mean %7.1f us per layer (p10 %.1f, p90 %.1f)\n", nt, J,
                         s[s.size() / 2], mean, s[s.size() / 10], s[s.size() * 9 / 10]);
             xs.push_back(J);
-            ys.push_back(mean);
+            ys.push_back(s[s.size() / 2]);
         }
-        if (xs.size() >= 2) {   // least squares: mean = a + b J
+        if (xs.size() >= 2) {   // least squares: median = a + b J
             double sx = 0, sy = 0, sxx = 0, sxy = 0;
             const double m = (double) xs.size();
             for (size_t i = 0; i < xs.size(); ++i) { sx += xs[i]; sy += ys[i]; sxx += xs[i] * xs[i]; sxy += xs[i] * ys[i]; }
             const double b = (m * sxy - sx * sy) / (m * sxx - sx * sx), a = (sy - b * sx) / m;
-            std::printf("  nt %d: %.1f us per expert + %.1f us per layer (mean, least squares over J)\n", nt, b, a);
+            std::printf("  nt %d: %.1f us per expert + %.1f us per layer (median, least squares of the medians over J)\n", nt, b, a);
         }
     }
     std::printf("output hash %016llx (the same seed and arguments: the same hash when the rows' bits are the same)\n",
