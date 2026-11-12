@@ -219,106 +219,6 @@ void rows_r1_bih3_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* cons
     }
 }
 
-// QuantLab (11/13) STRATA_QL_TQ_PRE=1: rows_r1_bih3_t with its per-block scalar work out of the loops and two tokens
-// folded together.  The block scales colscale[i] * p2[q] are one float product, made once per call (4 per block) instead
-// of once per block and row (a software fp16 conversion each); the tokens' pointers are read once; a token pair's two
-// reduce_halves share their last fold (VPERM2I128 + one add for both) and their float steps run in one YMM, lane for lane
-// the same operations as the XMM ones.  Integer sums and the float order unchanged: bitwise equal to rows_r1_bih3_t.
-inline __m256i halves8(__m512i A, __m512i B) {   // reduce_halves before its last fold: S[k] = lane k + lane k + 4
-    const __m256i x = _mm256_hadd_epi32(_mm512_castsi512_si256(A), _mm512_extracti64x4_epi64(A, 1));
-    const __m256i y = _mm256_hadd_epi32(_mm512_castsi512_si256(B), _mm512_extracti64x4_epi64(B, 1));
-    return _mm256_hadd_epi32(x, y);
-}
-template <int KB>
-void rows_r1_bih3_pre_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out,
-                        int r0, int r1, const TqScales& sc) {
-    const int nb = n / 128;
-    constexpr size_t bsz = 4 * KB;
-    static const Bih3States<KB> S;
-    const __m512i ix0 = _mm512_load_si512(S.idx[0]), ix1 = _mm512_load_si512(S.idx[1]);
-    const __m512i sh0 = _mm512_load_si512(S.sh[0]), sh1 = _mm512_load_si512(S.sh[1]);
-    const __m512i m15 = _mm512_set1_epi32(0x7FFF);
-    const __mmask64 lm = (__mmask64) (bsz >= 64 ? ~0ull : (1ull << bsz) - 1);
-    const __m512i c0 = _mm512_set1_epi32((int) 0x9E3779B1u), c1 = _mm512_set1_epi32((int) 0x85EBCA6Bu);
-    const __m512i c2 = _mm512_set1_epi32((int) 0xC2B2AE35u), c3 = _mm512_set1_epi32((int) 0x27D4EB2Fu);
-    const __m512i m24 = _mm512_set1_epi32((int) 0xFF000000u), m16 = _mm512_set1_epi32((int) 0xFFFF0000u);
-    const __m512i m8 = _mm512_set1_epi32((int) 0xFFFFFF00u);
-    alignas(64) float dxt[(kTqMaxN / 128) * 4];   // block i, code q: colscale[i] * p2[q] (rows_r1_bih3_t's product)
-    for (int i = 0; i < nb; ++i) {
-        const float cs = tq_half_to_float(sc.colscale[i]);
-        for (int q = 0; q < 4; ++q) dxt[4 * i + q] = cs * sc.p2[q];
-    }
-    const int8_t* q8[kTqMaxTokens];
-    const int32_t* bs[kTqMaxTokens];
-    const float* dd[kTqMaxTokens];
-    for (int t = 0; t < nt; ++t) { q8[t] = a[t]->q8; bs[t] = a[t]->bsum; dd[t] = a[t]->d; }
-    const int np = nt / 2;   // token pairs; an odd last token on the XMM steps
-    for (int r = r0; r < r1; ++r) {
-        const uint8_t* x = w + (size_t) r * row_bytes;
-        const uint8_t* qr = sc.q + (size_t) r * sc.qbytes;
-        __m256 acc2[kTqMaxTokens / 2];
-        for (int p = 0; p < np; ++p) acc2[p] = _mm256_setzero_ps();
-        __m128 acc1 = _mm_setzero_ps();
-        for (int i = 0; i < nb; ++i) {
-            const __m512i blk = _mm512_maskz_loadu_epi8(lm, x + (size_t) i * bsz);
-            __m512i u[6];
-            for (int g = 0; g < 2; ++g) {
-                const __m512i s = _mm512_and_si512(
-                    _mm512_srlv_epi32(_mm512_permutexvar_epi8(g ? ix1 : ix0, blk), g ? sh1 : sh0), m15);
-                const __m512i x0 = _mm512_mullo_epi32(s, c0), x1 = _mm512_mullo_epi32(s, c1);
-                const __m512i x2 = _mm512_mullo_epi32(s, c2), x3 = _mm512_mullo_epi32(s, c3);
-                u[3 * g] = _mm512_ternarylogic_epi32(m24, _mm512_slli_epi32(x1, 16), _mm512_srli_epi32(x0, 8), 0xEA);
-                u[3 * g + 1] = _mm512_ternarylogic_epi32(m16, _mm512_slli_epi32(x2, 8), _mm512_srli_epi32(x1, 16), 0xEA);
-                u[3 * g + 2] = _mm512_ternarylogic_epi32(m8, x3, _mm512_srli_epi32(x2, 24), 0xEA);
-            }
-            const float dxs = dxt[4 * i + ((qr[i >> 2] >> (2 * (i & 3))) & 3)];
-            const __m512i z = _mm512_setzero_si512();
-            auto sums = [&](int t) {
-                const int8_t* a8 = q8[t] + 128 * i;
-                const __m512i qa = _mm512_load_si512(a8), qb = _mm512_load_si512(a8 + 64);
-                __m512i A = _mm512_dpbusd_epi32(z, u[0], qa);
-                A = _mm512_dpbusd_epi32(A, u[1], qa);
-                A = _mm512_dpbusd_epi32(A, u[2], qa);
-                __m512i B = _mm512_dpbusd_epi32(z, u[3], qb);
-                B = _mm512_dpbusd_epi32(B, u[4], qb);
-                B = _mm512_dpbusd_epi32(B, u[5], qb);
-                return halves8(A, B);
-            };
-            for (int p = 0; p < np; ++p) {
-                const int t = 2 * p;
-                const __m256i z0 = sums(t), z1 = sums(t + 1);
-                const __m256i s2 = _mm256_add_epi32(_mm256_permute2x128_si256(z0, z1, 0x20), _mm256_permute2x128_si256(z0, z1, 0x31));
-                const __m256i b2 = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_load_si128((const __m128i*) (bs[t] + 4 * i))),
-                                                           _mm_load_si128((const __m128i*) (bs[t + 1] + 4 * i)), 1);
-                const __m256i s = _mm256_slli_epi32(_mm256_sub_epi32(s2, b2), 6);
-                const __m256 d2 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(dd[t] + 4 * i)), _mm_loadu_ps(dd[t + 1] + 4 * i), 1);
-                const __m256 scl = _mm256_mul_ps(_mm256_set1_ps(dxs), d2);
-                acc2[p] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scl, acc2[p]);
-            }
-            if (nt & 1) {
-                const int t = nt - 1;
-                const __m256i zz = sums(t);
-                const __m128i s1 = _mm_sub_epi32(_mm_add_epi32(_mm256_castsi256_si128(zz), _mm256_extracti128_si256(zz, 1)),
-                                                 _mm_load_si128((const __m128i*) (bs[t] + 4 * i)));
-                const __m128 scl = _mm_mul_ps(_mm_set1_ps(dxs), _mm_loadu_ps(dd[t] + 4 * i));
-                acc1 = _mm_fmadd_ps(_mm_cvtepi32_ps(_mm_slli_epi32(s1, 6)), scl, acc1);
-            }
-        }
-        const float rb = tq_half_to_float(sc.rowbase[r]);
-        for (int p = 0; p < np; ++p) {
-            alignas(32) float v[8];
-            _mm256_store_ps(v, acc2[p]);
-            out[2 * p][r] = (((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f)) * rb;
-            out[2 * p + 1][r] = (((v[4] + v[5]) + (v[6] + v[7])) * (1.0f / 8192.0f)) * rb;
-        }
-        if (nt & 1) {
-            alignas(16) float v[4];
-            _mm_store_ps(v, acc1);
-            out[nt - 1][r] = (((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f)) * rb;
-        }
-    }
-}
-
 // QuantLab (11/12, strata-desktop's lane-wise form, bench_decode's SM 7; STRATA_TQ_BIH3_LANES=1): the same points and
 // VPDPBUSD, but the 16 int32 lanes (a state's 4 weights each) are not folded per block: each lane starts at -384 * its 4
 // activations' sum (TqAct::c4), goes to float times its sub-block's activation scale (TqAct::d4), and the block's
@@ -399,10 +299,6 @@ void tq_rows_avx512_r1q2(int kb, const int16_t* table, const uint8_t* w, size_t 
 void tq_rows_avx512_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                               float* const* out, int r0, int r1, const TqScales& sc) {
     STRATA_TQ_DISPATCH_K(kb, rows_r1_bih3_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
-}
-void tq_rows_avx512_r1q2_bih3_pre(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
-                                  float* const* out, int r0, int r1, const TqScales& sc) {
-    STRATA_TQ_DISPATCH_K(kb, rows_r1_bih3_pre_t, w, row_bytes, n, a, nt, out, r0, r1, sc)
 }
 void tq_rows_avx512_r1q2_bih3_lanes(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                                     float* const* out, int r0, int r1, const TqScales& sc) {
