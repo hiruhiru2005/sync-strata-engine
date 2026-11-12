@@ -2895,8 +2895,12 @@ __device__ __forceinline__ bool i8h_down(const GrMulti& m, float* __restrict__ p
         const int g = ((int) (blockIdx.y * gridDim.x + blockIdx.x)) * THREADS + t, G = (int) (gridDim.x * gridDim.y) * THREADS;
         const char* up = reinterpret_cast<const char*>(m.a[0].q8_up);
         for (int l = g; l < LINES; l += G) {
+#if __CUDA_ARCH__ >= 800   // (the eviction-priority form is sm_80+; older cards take the plain prefetch)
             if constexpr (PF == 2 || PF == 4) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(up + (size_t) l * 128));
             else asm volatile("prefetch.global.L2 [%0];" ::"l"(up + (size_t) l * 128));
+#else
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(up + (size_t) l * 128));
+#endif
         }
     };
     if constexpr (PF == 1 || PF == 2) pf_up();
