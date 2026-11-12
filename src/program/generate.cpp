@@ -128,6 +128,15 @@
 #endif
 
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+extern "C" cudaError_t CUDARTAPI cudaProfilerStart(void);   // QuantLab (11/12) STRATA_QL_PROFILE_WIN (cudart; the portable
+extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);    // toolkit has no cuda_profiler_api.h)
+#define STRATA_QL_PROFILER_START() cudaProfilerStart()
+#define STRATA_QL_PROFILER_STOP() cudaProfilerStop()
+#else
+#define STRATA_QL_PROFILER_START() ((void) 0)
+#define STRATA_QL_PROFILER_STOP() ((void) 0)
+#endif
 #if defined(STRATA_GPU_METAL)
 namespace strata::metal_engine { void set_model_shard(const char* shard1); }   // metal/src/engine/window.cpp
 #endif
@@ -17814,9 +17823,31 @@ int main(int argc, char** argv) {
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                // QuantLab (11/12) STRATA_QL_PROFILE_WIN=A:B: cudaProfilerStart before decode window A and cudaProfilerStop
+                // after window B (served decode windows since the engine started, first windows of a request not
+                // counted), for ncu --profile-from-start off.  Unset: nothing.
+                static int ql_pw_a = -1, ql_pw_b = -1;
+                static long long ql_pw_n = 0;
+                static const bool ql_pw = [] {
+                    const char* v = std::getenv("STRATA_QL_PROFILE_WIN");
+                    return v != nullptr && std::sscanf(v, "%d:%d", &ql_pw_a, &ql_pw_b) == 2 && ql_pw_a >= 0 && ql_pw_b >= ql_pw_a;
+                }();
+                if (ql_pw && !first_window && ql_pw_n == ql_pw_a) {
+                    cudaDeviceSynchronize();
+                    STRATA_QL_PROFILER_START();
+                    std::fprintf(stderr, "strata: QuantLab profiler range on at decode window %lld\n", ql_pw_n);
+                }
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
+                }
+                if (ql_pw && !first_window) {
+                    if (ql_pw_n == ql_pw_b) {
+                        cudaDeviceSynchronize();
+                        STRATA_QL_PROFILER_STOP();
+                        std::fprintf(stderr, "strata: QuantLab profiler range off after decode window %lld (T %d)\n", ql_pw_n, T);
+                    }
+                    ++ql_pw_n;
                 }
                 if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
