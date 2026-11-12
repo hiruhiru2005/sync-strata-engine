@@ -90,7 +90,7 @@ __attribute__((target("avx512f,avx512bw,avx512vnni"))) void vec_work() {
 int main(int argc, char** argv) {
     int K = 8, layers = 1500, workers = 0;
     size_t mb = 1024;
-    bool thp = false, mix = false;
+    bool thp = false, mix = false, host_work = true;
     int gap_us = 0;
     std::string sib = "spin";
     std::vector<int> sib_cpus, bw_cpus;
@@ -106,12 +106,13 @@ int main(int argc, char** argv) {
         else if (a == "--workers" && more) workers = std::atoi(argv[++i]);
         else if (a == "--thp") thp = true;
         else if (a == "--mix") mix = true;
+        else if (a == "--no-host-work") host_work = false;   // the engine's --no-host-worker
         else if (a == "--gap-us" && more) gap_us = std::atoi(argv[++i]);
         else if (a == "--sib" && more) sib = argv[++i];
         else if (a == "--sib-cpus" && more) sib_cpus = cpus_of(argv[++i]);
         else if (a == "--bw-cpus" && more) bw_cpus = cpus_of(argv[++i]);
         else {
-            std::fprintf(stderr, "usage: sb_pool_bench [--k 8] [--mb 1024] [--layers 1500] [--j 1,2,3,4] [--nt 1,2] [--workers 0] [--thp] [--mix] [--gap-us G]\n"
+            std::fprintf(stderr, "usage: sb_pool_bench [--k 8] [--mb 1024] [--layers 1500] [--j 1,2,3,4] [--nt 1,2] [--workers 0] [--thp] [--mix] [--gap-us G] [--no-host-work]\n"
                                  "       [--sib spin|alu|vec|copy --sib-cpus 9-15] [--bw-cpus 8]\n");
             return 2;
         }
@@ -163,7 +164,7 @@ int main(int argc, char** argv) {
 
     // the pool first (it reads the CPUs this thread may use), then the host pinned - the engine's order
     const int host = cpu::planned_host_core(cpu::PoolAffinity::All);
-    cpu::ExpertPool pool(workers, /*pin=*/true, /*host_works=*/true, cpu::PoolAffinity::All, 0);
+    cpu::ExpertPool pool(workers, /*pin=*/true, host_work, cpu::PoolAffinity::All, 0);
     const cpu::ThreadAffinity prev = cpu::pin_current_thread(host);
     std::printf("sb_pool_bench: K %d (type %d), %zu experts of %.3f MB (%.0f MB, %s pages), %d workers + the host on CPU %d, "
                 "trellis rows on %s; STRATA_QL_UNPACK_ONCE=%s STRATA_QL_FUSED_QUANT=%s\n",
@@ -243,7 +244,7 @@ int main(int argc, char** argv) {
         b0 = b; w0 = w; q0 = q;
         return d;
     };
-    const int threads = pool.workers() + 1;
+    const int threads = pool.workers() + (host_work ? 1 : 0);
     if (mix) {
         // QuantLab (11/13): linux_int1_b26_pf0.6_lcpuA1.log - experts per CPU dispatch (mean ~2.7, 1 to ~10) and tokens
         // per expert ("jobs by tokens": 1 64%, 2 25%, 3 8%, 4 3%)
