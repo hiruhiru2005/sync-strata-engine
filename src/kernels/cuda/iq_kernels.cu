@@ -2911,7 +2911,7 @@ __device__ __forceinline__ void gut_window(const uint32_t* __restrict__ wp, int 
         const int b = (24 - 8 * q) * K, wb = b >> 5, r = b & 31;
         uint32_t raw[NV + 1];
 #pragma unroll
-        for (int j = 0; j <= NV; ++j) raw[j] = __ldg(wp + (wb + j) % K);
+        for (int j = 0; j <= NV; ++j) raw[j] = __ldg(wp + (wb + j >= K ? wb + j - K : wb + j));   // wb + j < 2K
 #pragma unroll
         for (int j = 0; j < NV; ++j) v[j] = __funnelshift_r(raw[j], raw[j + 1], r);
     }
@@ -3088,6 +3088,139 @@ __global__ void __launch_bounds__(256) native_gut_tqmix_kernel(const unsigned lo
                     const float gv = sg * tq_h2f(((const uint16_t*) scg)[row]);
                     const float uv = su * tq_h2f(((const uint16_t*) scu)[row]);
                     h[(size_t) (e + c) * L.n_ff + row] = (gv / (1.0f + __expf(-gv))) * uv;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- QuantLab (11/12): GDN, task 4 reopened
+// STRATA_QL_TQMIX_GDN=1 (R1Q2 mixed layers): the down rows as GUT reads gate / up - one thread per 128-weight block (a
+// down row of n_ff 640 is 5 blocks: 51 rows per 256 threads), a quarter (8 steps) at a time with the window shifted once,
+// two entries at a time, the block's scale once; the row's 5 partial sums through shared memory in a fixed order, times
+// the row's rowbase, written to out (as native_down_tqmix_kernel: one row per entry, no atomics).  Not bitwise the
+// one-row-a-warp kernel (another summation order); the same integer dot products.  PROBE 3: states only.
+template<int K, bool BIH3, int PROBE, int C0>
+__device__ __forceinline__ void gdn_pair(const uint32_t* __restrict__ dw_, float dwd, const block_q8_1* __restrict__ x,
+                                         const int (&off)[GRP_NC], int n, int kbx, float (&ad)[GRP_NC],
+                                         const uint16_t* __restrict__ lut) {
+    constexpr int NV = GutWin<K>::NV;
+    constexpr int c0 = C0;
+    const bool two = c0 + 1 < n;
+    float f0 = 0.0f, f1 = 0.0f;
+#pragma unroll 1
+    for (int q = 0; q < 4; ++q) {
+        uint32_t v[NV];
+        gut_window<K>(dw_, q, v);
+        const block_q8_1* b0 = x + off[c0] + kbx * 4 + q;
+        const block_q8_1* b1 = x + off[c0 + 1] + kbx * 4 + q;
+        int s0 = 0, s1 = 0;
+#define STRATA_GDN_STEP(I)                                                                                                    \
+        {                                                                                                                   \
+            const uint32_t t = gut_state<K, I>(v);                                                                          \
+            if constexpr (PROBE == 3) {                                                                                     \
+                s0 ^= (int) t;                                                                                              \
+            } else if constexpr (BIH3) {                                                                                    \
+                uint32_t w0, w1, w2;                                                                                        \
+                tq_bih3p(t, w0, w1, w2);                                                                                    \
+                w0 ^= 0x80808080u; w1 ^= 0x80808080u; w2 ^= 0x80808080u;                                                    \
+                const int a0 = ((const int*) b0->qs)[I];                                                                    \
+                s0 = ggml_cuda_dp4a((int) w0, a0, s0); s0 = ggml_cuda_dp4a((int) w1, a0, s0);                               \
+                s0 = ggml_cuda_dp4a((int) w2, a0, s0);                                                                      \
+                if (two) {                                                                                                  \
+                    const int a1 = ((const int*) b1->qs)[I];                                                                \
+                    s1 = ggml_cuda_dp4a((int) w0, a1, s1); s1 = ggml_cuda_dp4a((int) w1, a1, s1);                           \
+                    s1 = ggml_cuda_dp4a((int) w2, a1, s1);                                                                  \
+                }                                                                                                           \
+            } else {                                                                                                        \
+                const uint32_t xh = t * 0x9e3779b1u;                                                                        \
+                const int pw = (int) ((uint32_t) lut[xh >> 21] | ((uint32_t) lut[(xh >> 10) & 2047u] << 16));               \
+                s0 = ggml_cuda_dp4a(pw, ((const int*) b0->qs)[I], s0);                                                      \
+                if (two) s1 = ggml_cuda_dp4a(pw, ((const int*) b1->qs)[I], s1);                                             \
+            }                                                                                                               \
+        }
+        STRATA_GDN_STEP(0) STRATA_GDN_STEP(1) STRATA_GDN_STEP(2) STRATA_GDN_STEP(3)
+        STRATA_GDN_STEP(4) STRATA_GDN_STEP(5) STRATA_GDN_STEP(6) STRATA_GDN_STEP(7)
+#undef STRATA_GDN_STEP
+        f0 += __low2float(b0->ds) * (float) s0;
+        if (two) f1 += __low2float(b1->ds) * (float) s1;
+    }
+    ad[c0] += dwd * f0;
+    if (two) ad[c0 + 1] += dwd * f1;
+}
+template<int K, bool BIH3, int PROBE>
+__device__ __forceinline__ void gdn_block(const uint8_t* __restrict__ db, float dwd, const block_q8_1* __restrict__ x,
+                                          const int (&off)[GRP_NC], int n, int kbx, float (&ad)[GRP_NC],
+                                          const uint16_t* __restrict__ lut) {
+    static_assert(GRP_NC == 4, "gdn_block takes the entries as two pairs");
+    gdn_pair<K, BIH3, PROBE, 0>((const uint32_t*) db, dwd, x, off, n, kbx, ad, lut);
+    if (n > 2) gdn_pair<K, BIH3, PROBE, 2>((const uint32_t*) db, dwd, x, off, n, kbx, ad, lut);
+}
+template<bool BIH3, int PROBE, bool SL = false>
+__global__ void __launch_bounds__(256) native_gdn_tqmix_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+                                                               const int32_t* __restrict__ ent_dst,
+                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                               float* __restrict__ out) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ float red[256][GRP_NC];
+    __shared__ __align__(16) uint16_t s_lut[SL ? 2048 : 8];
+    if constexpr (SL) {
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) ((uint32_t*) s_lut)[i] = ((const uint32_t*) tq_lut_i8)[i];
+        __syncthreads();
+    }
+    const uint16_t* lut = SL ? (const uint16_t*) s_lut : (const uint16_t*) tq_lut_i8;
+    const int nb = (int) (L.n_ff / 128), hb = (int) (L.n_ff / 32), nbg = (int) (L.n_embd / 128), rpb = 256 / nb;
+    const int tid = threadIdx.x, rl = tid / nb, kbx = tid - rl * nb;
+    const int r = blockIdx.x * rpb + rl;
+    const bool live = rl < rpb && r < L.n_embd;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const unsigned long long p = grp_ptr[g];
+        const int kg = (int) (p >> kTqTagShift) & 15, kd = (int) (p >> (kTqTagShift + 4)) & 15;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        const uint8_t* blob = (const uint8_t*) (p & kTqAddrMask);
+        const size_t gu_c = (size_t) nbg * (size_t) (4 * kg), d_c = (size_t) nb * (size_t) (4 * kd);
+        const size_t qge = (size_t) (nbg + 3) / 4, qdf = (size_t) (nb + 3) / 4;
+        const uint8_t* sc = r1q2_scales_at(blob, kg, kd, L.n_embd, L.n_ff) +
+                            2 * ((size_t) L.n_ff * 2 + (size_t) nbg * 2 + (size_t) L.n_ff * qge);
+        float dwd = 0.0f;
+        const uint8_t* db = nullptr;
+        if (live) {
+            const float k = BIH3 ? 1.0f / 128.0f : TQ_LUT_I8_SCALE;
+            const uint8_t* qrow = sc + (size_t) L.n_embd * 2 + (size_t) nb * 2 + (size_t) r * qdf;
+            dwd = tq_h2f(((const uint16_t*) (sc + (size_t) L.n_embd * 2))[kbx]) * L.p2[2][(qrow[kbx >> 2] >> (2 * (kbx & 3))) & 3] * k;
+            db = blob + 2 * gu_c * (size_t) L.n_ff + (size_t) r * d_c + (size_t) kbx * (size_t) (4 * kd);
+        }
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            int off[GRP_NC];
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
+            float ad[GRP_NC];
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) ad[c] = 0.0f;
+            if (live) {
+                switch (kd) {
+#define STRATA_GDN_K(KK) case KK: gdn_block<KK, BIH3, PROBE>(db, dwd, hq, off, n, kbx, ad, lut); break;
+                    STRATA_GDN_K(2) STRATA_GDN_K(3) STRATA_GDN_K(4) STRATA_GDN_K(5) STRATA_GDN_K(6) STRATA_GDN_K(7)
+                    STRATA_GDN_K(8) STRATA_GDN_K(9) STRATA_GDN_K(10) STRATA_GDN_K(11) STRATA_GDN_K(12) STRATA_GDN_K(13)
+                    STRATA_GDN_K(14)
+#undef STRATA_GDN_K
+                    default: break;
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) red[tid][c] = ad[c];
+            __syncthreads();
+            if (tid < rpb * GRP_NC) {
+                const int rr = tid / GRP_NC, c = tid - rr * GRP_NC, row = blockIdx.x * rpb + rr;
+                if (c < n && row < L.n_embd) {
+                    float sd = 0.0f;
+                    for (int k = 0; k < nb; ++k) sd += red[rr * nb + k][c];
+                    out[(size_t) ent_dst[e + c] * L.n_embd + row] = sd * tq_h2f(((const uint16_t*) sc)[row]);
                 }
             }
             __syncthreads();
@@ -8680,6 +8813,21 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
         check("native_expert_grouped/swiglu (per-expert K)");
         const dim3 gdq((unsigned) ((L.n_embd + 8 * rch - 1) / (8 * rch)), (unsigned) gyq);
+        // QuantLab (11/12) STRATA_QL_TQMIX_GDN=1: the down rows by native_gdn_tqmix_kernel (one thread a block)
+        static const bool tq_gdn = [] { const char* v = std::getenv("STRATA_QL_TQMIX_GDN"); return v && v[0] == '1'; }();
+        if (tq_gdn && L.r1q2 && !tq_smem && L.n_ff % 128 == 0 && L.n_ff / 128 <= 256) {
+            const int rpd = 256 / (int) (L.n_ff / 128);
+            const dim3 gd2((unsigned) ((L.n_embd + rpd - 1) / rpd), (unsigned) gdq.y);
+            static const bool gdn_sl = [] { const char* v = std::getenv("STRATA_QL_GUT_SMEM"); return !(v && v[0] == '0'); }();
+            if (L.tq_bih3) {
+                if (tq_probe == 3) native_gdn_tqmix_kernel<true, 3><<<gd2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else native_gdn_tqmix_kernel<true, 0><<<gd2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else {
+                if (tq_probe == 3) native_gdn_tqmix_kernel<false, 3><<<gd2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else if (gdn_sl) native_gdn_tqmix_kernel<false, 0, true><<<gd2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else native_gdn_tqmix_kernel<false, 0><<<gd2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            }
+        } else
         if (tq_probe == 1 && !tq_smem) native_down_tqmix_kernel<false, 1><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
         else if (tq_probe == 2 && !tq_smem) native_down_tqmix_kernel<false, 2><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
         else if (tq_probe == 3 && !tq_smem) native_down_tqmix_kernel<false, 3><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, 1);
