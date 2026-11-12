@@ -535,7 +535,12 @@ bool fuse_hits_on() {
     }
     return per_dev[dev] == 2;
 #else
-    return false;
+    // QuantLab (11/13) STRATA_QL_FUSE_HITS=1: the same fold in a CUDA build (combine_k10_vec4_hits is compiled for both;
+    // the CUDA build was off only because 143-amdk measured gfx12 alone).  part + hit is the add add_hits_kernel made
+    // in place, then combine_k10_vec4's products and FMAs in the same order: the same output bits.  Read once (the
+    // first window's recording), so it holds for every captured graph.
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_FUSE_HITS"); return v != nullptr && v[0] == '1'; }();
+    return on;
 #endif
 }
 
@@ -2298,7 +2303,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // STRATA_QFUSE / STRATA_VERIFY_QDEDUP may already have written is of the unrotated input, so a folded layer
             // always rewrites it from the rotated rows (same stream, after the shared expert has read it).
             const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
-            if (f.had_gu) {   // nat_xr_ exists: init carved it because this layer is folded (had_gu_any)
+            if (f.had_gu && strata::kernels::ql_fuse_hadq_on()) {
+                // QuantLab (11/13) STRATA_QL_FUSE_HADQ=1: the two launches below in one (the same nat_xr_, the same nat_xq_)
+                strata::kernels::hadamard_q8_1_rows(xm, nat_xr_ + (size_t) tb * N, nat_xq_ + (size_t) tb * (N / 32) * 36, n, N,
+                                                    f.had_block, had_sx_, cs);
+            } else if (f.had_gu) {   // nat_xr_ exists: init carved it because this layer is folded (had_gu_any)
                 hadamard_rows(xm, nat_xr_ + (size_t) tb * N, n, N, f.had_block, had_sx_, cs);
                 quantize_q8_1_rows(nat_xr_ + (size_t) tb * N, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             } else if (!qdedup && !q8_ffn) {

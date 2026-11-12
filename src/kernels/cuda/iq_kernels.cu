@@ -3622,6 +3622,41 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     q8_1_store(x[i], y, i);
 }
 
+// QuantLab (11/13) STRATA_QL_FUSE_HADQ=1: hadamard_rows_kernel<float> and quantize_q8_1_kernel in one launch.  The
+// block is the Hadamard block (a power of two >= 32, so a warp is 32 consecutive columns = one q8_1 block, and the flat
+// index row * width + col is the quantize kernel's i).  The rotation is hadamard_rows_kernel's, line for line; the
+// rotated value is stored to y as before and then q8_1_store'd from the register.  The scale's product is rounded on
+// its own (CUDA __fmul_rn; HIP contract off) - it must not contract into the first add of q8_1_store's block sum, as it
+// could not when it went through memory (the same care as swiglu_q8_1_entries_kernel): the same y, the same blocks.
+__global__ void hadamard_q8_1_rows_kernel(const float* __restrict__ x, float* __restrict__ y, block_q8_1* __restrict__ yq,
+                                          int64_t width, const float* __restrict__ signs, float scale) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+    extern __shared__ float hbuf[];
+    const int n = blockDim.x, i = threadIdx.x;
+    const int64_t col = (int64_t) blockIdx.x * n + i, at = (int64_t) blockIdx.y * width + col;
+    float v = x[at];
+    if (signs) v *= signs[col];
+    hbuf[i] = v;
+    for (int len = 1; len < n; len <<= 1) {
+        __syncthreads();
+        if ((i & len) == 0) {
+            const float a = hbuf[i], c = hbuf[i + len];
+            hbuf[i] = a + c;
+            hbuf[i + len] = a - c;
+        }
+    }
+    __syncthreads();
+#if defined(__HIPCC__)
+    const float o = hbuf[i] * scale;
+#else
+    const float o = __fmul_rn(hbuf[i], scale);
+#endif
+    y[at] = o;
+    q8_1_store(o, yq, at);
+}
+
 // swiglu_entries_kernel and quantize_q8_1_kernel in one pass, over the call's own entries only:
 // [grp_start[0], grp_start[*n_groups]) (a call's entries are contiguous; the verify window's PCIe call starts after
 // its VRAM call) instead of all cap_entries twice - nothing reads the others: the down kernel reads its groups'.
@@ -7904,6 +7939,30 @@ void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int bl
     check("hadamard_rows");
 }
 
+bool ql_fuse_hadq_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_FUSE_HADQ"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+void hadamard_q8_1_rows(const float* x, float* y, void* yq, int64_t rows, int64_t width, int block, const float* signs,
+                        void* stream) {
+    if (rows <= 0) return;
+    if (!hadamard_block_ok(block, width)) hadamard_bad_block("hadamard_q8_1_rows", block, width);
+    if (block < 32) {   // a warp would span two Hadamard blocks: the two launches
+        hadamard_rows(x, y, rows, width, block, signs, stream);
+        quantize_q8_1_rows(y, rows, width, yq, stream);
+        return;
+    }
+    for (int64_t r0 = 0; r0 < rows; r0 += kHadamardMaxRows) {   // as hadamard_rows; width % 32 == 0, so a slice starts a q8_1 block
+        const int64_t n = std::min<int64_t>(kHadamardMaxRows, rows - r0);
+        hadamard_q8_1_rows_kernel<<<dim3((unsigned) (width / block), (unsigned) n), block, block * sizeof(float),
+                                    (cudaStream_t) stream>>>(x + r0 * width, y + r0 * width,
+                                                             (block_q8_1*) yq + r0 * (width / 32), width, signs,
+                                                             1.0f / std::sqrt((float) block));
+    }
+    check("hadamard_q8_1_rows");
+}
+
 void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, const float* signs, void* stream) {
     if (rows <= 0) return;
     if (!hadamard_block_ok(block, width)) hadamard_bad_block("hadamard_rows_f16", block, width);
@@ -8811,8 +8870,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         check("native_expert_grouped/gu (per-expert K)");
         const long long nhq = (long long) cap_entries * L.n_ff;
         if (!gut) swiglu_entries_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(gate, up, h, nhq);
-        if (L.had_block > 0) hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
-        quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
+        // QuantLab (11/13) STRATA_QL_FUSE_HADQ=1: the rotation and the q8_1 blocks in one launch (the same h, the same hq)
+        if (L.had_block > 0 && ql_fuse_hadq_on())
+            hadamard_q8_1_rows(h, h, hq, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
+        else {
+            if (L.had_block > 0) hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
+            quantize_q8_1_kernel<<<(unsigned) ((nhq + 255) / 256), 256, 0, s>>>(h, hq, nhq);
+        }
         check("native_expert_grouped/swiglu (per-expert K)");
         const dim3 gdq((unsigned) ((L.n_embd + 8 * rch - 1) / (8 * rch)), (unsigned) gyq);
         // QuantLab (11/12): the yardstick's sensitivity - STRATA_QL_PERTURB_DOWN=n / STRATA_QL_PERTURB_GATE=n (n a small

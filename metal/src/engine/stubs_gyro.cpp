@@ -18,6 +18,10 @@ void hadamard_rows(const float*, float*, int64_t, int64_t, int, const float*, vo
 void hadamard_rows_f16(uint16_t*, int64_t, int64_t, int, const float*, void*) {
     strata::metal_engine::missing("strata::kernels::hadamard_rows_f16");
 }
+void hadamard_q8_1_rows(const float*, float*, void*, int64_t, int64_t, int, const float*, void*) {   // QuantLab (11/13)
+    strata::metal_engine::missing("strata::kernels::hadamard_q8_1_rows");
+}
+bool ql_fuse_hadq_on() { return false; }
 const float* hadamard_device_signs(const float*, int) {
     strata::metal_engine::missing("strata::kernels::hadamard_device_signs");
     return nullptr;
