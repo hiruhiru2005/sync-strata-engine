@@ -6,8 +6,9 @@
 // weights are cold in the engine): us a read (events, the mean of --iters, the best of 3 rounds), GB/s of the 7.0 MB
 // read, and the GPU stamps' median split (down / up, a stamp kernel each; =2 puts all of it under "down").
 //
-//     build/hc_i8_bench [--t A B] [--iters n] [--cold n] [--mode m] [--upw w] [--no-stamps]
-// --mode m: only the old read and form m (1 or 2); --upw w: =1 with w warps an up block only.  Exit 1 when any form
+//     build/hc_i8_bench [--t A B] [--iters n] [--cold n] [--mode m] [--upw w] [--no-stamps] [--seed s] [--probe]
+// --probe: only the read-only yardstick (ql_bw_probe) on the same bytes; --seed: the random weights' and inputs' seed.
+// --mode m: only the old read and form m (1 .. 6, see fused_gr.cu's STRATA_QL_HC_BW); --upw w: =1 with w warps an up block only.  Exit 1 when any form
 // differs; a form that does not finish in 5 s (=2 waits on a counter) ends the process (exit 2).
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -26,6 +27,10 @@
 #include <vector>
 
 namespace K = strata::kernels;
+namespace strata::kernels {   // QuantLab (11/12) iq_kernels.cu: the bandwidth yardstick (tq_mix_parity --bw)
+void ql_bw_probe(const unsigned long long* d_ptrs, const unsigned long long* d_sizes, int n, int blocks_x, int unroll,
+                 unsigned* d_out, cudaStream_t s);
+}
 
 namespace {
 uint16_t bf16(float x) {
@@ -83,8 +88,8 @@ struct Form { int mode, upw; };
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    int t_lo = 1, t_hi = 4, iters = 300, cold = 8, only_mode = -1, only_upw = 0;
-    bool stamps = true;
+    int t_lo = 1, t_hi = 4, iters = 300, cold = 8, only_mode = -1, only_upw = 0, seed = 7;
+    bool stamps = true, probe = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--t" && i + 2 < argc) { t_lo = std::atoi(argv[++i]); t_hi = std::atoi(argv[++i]); }
@@ -93,6 +98,8 @@ int main(int argc, char** argv) {
         else if (a == "--mode" && i + 1 < argc) only_mode = std::atoi(argv[++i]);
         else if (a == "--upw" && i + 1 < argc) only_upw = std::atoi(argv[++i]);
         else if (a == "--no-stamps") stamps = false;
+        else if (a == "--probe") probe = true;
+        else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
         else { std::printf("hc_i8_bench: unknown argument %s\n", a.c_str()); return 3; }
     }
     t_lo = std::max(1, std::min(K::kFusedGrMaxT, t_lo));
@@ -106,9 +113,12 @@ int main(int argc, char** argv) {
     for (int w : {1, 2, 4, 8})
         if ((only_mode < 0 || only_mode == 1) && (only_upw == 0 || only_upw == w)) forms.push_back({1, w});
     if (only_mode < 0 || only_mode == 2) forms.push_back({2, 0});
+    if (only_mode < 0 || only_mode == 3) forms.push_back({3, 0});
+    for (int md : {4, 5, 6})
+        if (only_mode < 0 || only_mode == md) forms.push_back({md, 0});
 
     const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = K::kFusedGrMaxT;
-    std::mt19937 rng(7);
+    std::mt19937 rng((unsigned) seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     auto fill = [&](std::vector<float>& v, float sc) { for (auto& x : v) x = sc * nd(rng); };
     std::vector<float> R((size_t) TM * D), bo((size_t) TM * N), inj((size_t) TM * HC), wn(D);
@@ -153,6 +163,55 @@ int main(int argc, char** argv) {
     }
     ck(cudaStreamSynchronize(s), "split");
     K::fused_gr_set_q8_i8(1);
+    if (probe) {   // --probe: only reading the same bytes (down's 3.48 MB codes + scales, up's), rotating over the copies
+        unsigned long long *dp, *dsz;
+        unsigned* dout;
+        ck(cudaMalloc((void**) &dp, (size_t) 2 * cold * 8), "malloc");
+        ck(cudaMalloc((void**) &dsz, (size_t) 2 * cold * 8), "malloc");
+        ck(cudaMalloc((void**) &dout, 4), "malloc");
+        std::vector<unsigned long long> hp(2 * cold), hs(2 * cold);
+        for (int c = 0; c < cold; ++c) {
+            hp[2 * c] = (unsigned long long) cqd[c]; hs[2 * c] = qd.size();
+            hp[2 * c + 1] = (unsigned long long) cqu[c]; hs[2 * c + 1] = qu.size();
+        }
+        cudaMemcpy(dp, hp.data(), hp.size() * 8, cudaMemcpyHostToDevice);
+        cudaMemcpy(dsz, hs.data(), hs.size() * 8, cudaMemcpyHostToDevice);
+        cudaEvent_t p0, p1;
+        cudaEventCreate(&p0);
+        cudaEventCreate(&p1);
+        for (int unroll : {1, 4})
+            for (int bx : {68, 136, 220, 272, 544, 850, 1088}) {
+                double best = 1e30;
+                for (int round = 0; round < 3; ++round) {
+                    cudaEventRecord(p0, s);
+                    for (int i = 0; i < iters; ++i) K::ql_bw_probe(dp + (i % (2 * cold)), dsz + (i % (2 * cold)), 1, bx, unroll, dout, s);
+                    cudaEventRecord(p1, s);
+                    sync_or_die(s, "probe");
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, p0, p1);
+                    best = std::min(best, 1e3 * ms / iters);
+                }
+                const double mb = (qd.size() + qu.size()) / 2.0;
+                std::printf("PROBE read-only %.2f MB, %4d blocks of 256, unroll %d | %6.2f us a launch (%4.0f GB/s)\n", mb / 1e6, bx, unroll,
+                            best, mb / (best * 1e3));
+            }
+        for (int bx : {136, 220, 300, 544}) {   // down + up of one copy in ONE launch (gridDim.y 2): one 7 MB read
+            double best = 1e30;
+            for (int round = 0; round < 3; ++round) {
+                cudaEventRecord(p0, s);
+                for (int i = 0; i < iters; ++i) K::ql_bw_probe(dp + 2 * (i % cold), dsz + 2 * (i % cold), 2, bx, 4, dout, s);
+                cudaEventRecord(p1, s);
+                sync_or_die(s, "probe");
+                float ms = 0;
+                cudaEventElapsedTime(&ms, p0, p1);
+                best = std::min(best, 1e3 * ms / iters);
+            }
+            const double mb = (double) (qd.size() + qu.size());
+            std::printf("PROBE read-only %.2f MB in one launch, %4d x 2 blocks of 256 | %6.2f us a launch (%4.0f GB/s)\n", mb / 1e6, bx, best,
+                        mb / (best * 1e3));
+        }
+        return 0;
+    }
     auto args = [&](std::vector<K::FusedGrArgs>& as, int T, int apply, int inject) {
         as.assign((size_t) cold * TM, K::FusedGrArgs());
         for (int c = 0; c < cold; ++c)
@@ -202,6 +261,21 @@ int main(int argc, char** argv) {
                     const bool same = std::memcmp(out[0].data(), out[f].data(), out[0].size() * 4) == 0;
                     if (!same) ++failures;
                     std::printf(" bw%d/w%d %s", forms[f].mode, forms[f].upw, same ? "equal" : "DIFFERS");
+                    if (!same) {   // which outputs: R, rs, inject, mixed (mismatching floats)
+                        const size_t nb[4] = {(size_t) T * D, (size_t) T * HC, (size_t) T * HC, (size_t) T * N};
+                        size_t o0 = 0;
+                        std::printf("(");
+                        for (int r = 0; r < 4; ++r) {
+                            size_t bad = 0;
+                            size_t first = 0;
+                            for (size_t q = o0; q < o0 + nb[r]; ++q)
+                                if (std::memcmp(&out[0][q], &out[f][q], 4) != 0 && bad++ == 0) first = q;
+                            if (bad) std::printf("[%zu: %.9g vs %.9g] ", first - o0, out[0][first], out[f][first]);
+                            std::printf("%s%zu", r ? "/" : "R/rs/inj/mix ", bad);
+                            o0 += nb[r];
+                        }
+                        std::printf(")");
+                    }
                 }
                 std::printf("\n");
             }
