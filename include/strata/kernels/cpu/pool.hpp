@@ -367,6 +367,11 @@ private:
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
+    // QuantLab (11/13) STRATA_QL_POOL_ONEPHASE=1 (mode 7): the gate/up tasks (0 .. t5_ - 1, over mrows5_ rows) and the
+    // down tasks (t5_ .. t5_ + t6_ - 1, over mrows6_) in ONE batch; a down task waits for its expert's intermediate
+    // (fq_rows_[e] > n_ff: rows done and quantized by fq_tail)
+    int64_t mrows5_ = 0, mrows6_ = 0;
+    int t5_ = 0, t6_ = 0;
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];
@@ -381,6 +386,7 @@ private:
     bool fq_on_ = false;
     std::unique_ptr<std::atomic<int32_t>[]> fq_rows_{new std::atomic<int32_t>[kMaxSplitMulti]};
     void fq_tail(int e, int rows);
+    void wait_intermediate(int e);   // QuantLab (11/13) mode 7
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own

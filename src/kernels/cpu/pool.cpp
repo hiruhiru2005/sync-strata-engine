@@ -1212,8 +1212,14 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             // Task j of T over R rows of `h` per expert from matrix row `row0`: the whole phase (R = mrows_, h = per,
             // row0 = 0) or, under the NUMA split, this thread's slice (slice-local row g -> expert g / h, matrix row
             // row0 + g % h)
-            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
+            // QuantLab (11/13) mode 7 (STRATA_QL_POOL_ONEPHASE): both phases in one batch, `m` the task's own phase
+            int m = mode_;
             int64_t R = mrows_, T = mtasks_, j = i;
+            if (mode_ == 7) {
+                if ((int) i < t5_) { m = 5; R = mrows5_; T = t5_; }
+                else { m = 6; R = mrows6_; T = t6_; j = (int64_t) i - t5_; }
+            }
+            const int per = m == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
             int h = per, row0 = 0;
             if (sliced) {
                 const NodeSync& ns = nsync_[(size_t) s];
@@ -1226,7 +1232,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int r0 = row0 + l0, r1 = row0 + l1;
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;   // 149-cold: same types and rows
-                if (mode_ == 5 && q2_native_kernels(nfmt->gu_type)) {
+                if (mode_ == 7 && m == 6) wait_intermediate(e);   // QuantLab (11/13): its intermediate first
+                if (m == 5 && q2_native_kernels(nfmt->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
                     float* gp[MAXT];
@@ -1239,7 +1246,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
                     if (fq_on_) fq_tail(e, r1 - r0);
-                } else if (mode_ == 5) {
+                } else if (m == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
                     if (narithmetic_ == NativeArithmetic::WindowInvariant)
@@ -1284,7 +1291,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             }
         }
         if (ql_busy_on && mode_ >= 5)
-            (mode_ == 5 ? ql_busy_gu_ns : ql_busy_down_ns).fetch_add((long long) (now_ns() - ql_t0), std::memory_order_relaxed);
+            (mode_ == 5 || (mode_ == 7 && (int) i < t5_) ? ql_busy_gu_ns : ql_busy_down_ns).fetch_add((long long) (now_ns() - ql_t0), std::memory_order_relaxed);
         if (sliced) {
             NodeSync& ns = nsync_[(size_t) s];
             const uint32_t t = (uint32_t) ns.tasks;
@@ -1306,6 +1313,29 @@ void ExpertPool::fq_tail(int e, int rows) {
     for (int t = 0; t < mjobs_[e].nt; ++t)
         if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
         else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+    // QuantLab (11/13) mode 7: the intermediate is there - n_ff + 1 releases the expert's down tasks
+    fq_rows_[(size_t) e].store(n_ff + 1, std::memory_order_release);
+}
+
+// QuantLab (11/13) mode 7: a down task's expert still being computed (its gate/up tasks were all claimed before this
+// task - the claims go in index order - so they are running and finish): spin until fq_tail has released it
+void ExpertPool::wait_intermediate(int e) {
+    const int32_t n_ff = (int32_t) nfmt_->n_ff;
+    uint32_t spins = 0;
+    std::chrono::steady_clock::time_point t0{};
+    while (fq_rows_[(size_t) e].load(std::memory_order_acquire) <= n_ff) {
+        strata_cpu_pause();
+        if ((++spins & 1023u) != 0) continue;
+        const auto now = std::chrono::steady_clock::now();
+        if (spins == 1024u) t0 = now;
+        else if (now - t0 > kStall) {
+            std::fprintf(stderr, "strata: the CPU expert pool stalled: a down task waited for expert %d's intermediate - "
+                                 "stopping the engine (issue #29)\n", e);
+            strata::core::release_gpu_waits(stderr);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
@@ -1391,11 +1421,30 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     if (n <= 0) return;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
+    // QuantLab (11/13) STRATA_QL_POOL_ONEPHASE=1: gate/up and down in one batch (mode 7) - no barrier and no serial
+    // quantization between them: each expert's intermediate is quantized by the task that completes its gate/up rows (the
+    // same native_quant_h call as the host's, STRATA_QL_FUSED_QUANT), and its down tasks start as soon as that is done.
+    // The same rows from the same inputs: the same bits.  Not under the NUMA split (its slices keep their phases).
+    static const bool one_phase = [] { const char* v = std::getenv("STRATA_QL_POOL_ONEPHASE"); return v != nullptr && std::atoi(v) != 0; }();
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         narithmetic_ = arithmetic;
+        if (one_phase && numa_n_ == 0) {
+            for (int e = 0; e < nb; ++e) fq_rows_[(size_t) e].store(0, std::memory_order_relaxed);
+            fq_on_ = true;
+            mrows5_ = (int64_t) nb * f.n_ff;
+            mrows6_ = (int64_t) nb * f.n_embd;
+            t5_ = phase_tasks(mrows5_);
+            t6_ = phase_tasks(mrows6_);
+            const auto a = std::chrono::steady_clock::now();
+            run_phase(7, t5_ + t6_);
+            const auto d = std::chrono::steady_clock::now();
+            fq_on_ = false;
+            ms_multi_gu += std::chrono::duration<double, std::milli>(d - a).count();   // both phases: the down wall stays 0
+            continue;
+        }
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
         static const bool fused_env = [] { const char* v = std::getenv("STRATA_QL_FUSED_QUANT"); return v != nullptr && std::atoi(v) != 0; }();
