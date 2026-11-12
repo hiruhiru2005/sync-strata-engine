@@ -99,6 +99,11 @@ void tq_gu_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_ro
                      const void* const* act, int nt, float* const* ff, int r0, int r1, const tq_detail::TqScales& g,
                      const tq_detail::TqScales& u);
 
+/// QuantLab (11/13) STRATA_QL_UNPACK_ONCE=1: the calling thread's activation generation - while it is the same nonzero
+/// value, an activation pointer is taken to hold the same values, so the thread reuses what it unpacked from it.  The
+/// pool sets a new one per phase and 0 after; 0 = no reuse.
+void tq_set_act_generation(uint64_t gen);
+
 /// Largest token group per call and widest row the kernels take.
 inline constexpr int kTqMaxTokens = 8;
 inline constexpr int kTqMaxN = 5120;   // (DeepSeek-V4.1 hidden width; was 4096)
@@ -140,6 +145,10 @@ void tq_rows_avx512_r1q2(int kb, const int16_t* tab, const uint8_t* w, size_t ro
 /// exact S[k] (/ 64), so bitwise equal to it.  STRATA_TQ_BIH3_TABLE=1 keeps the table rows instead (A/B).
 void tq_rows_avx512_r1q2_bih3(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                               float* const* out, int r0, int r1, const TqScales& sc);
+/// QuantLab (11/13) STRATA_QL_TQ_PRE=1: the same rows, the block scales made once per call, token pairs folded in one
+/// YMM (bitwise equal to tq_rows_avx512_r1q2_bih3)
+void tq_rows_avx512_r1q2_bih3_pre(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                                  float* const* out, int r0, int r1, const TqScales& sc);
 /// QuantLab (11/12): STRATA_TQ_BIH3_LANES=1 - the same, the 16 lanes kept apart in floats until the row's end (another
 /// summation order: equal to the scalar kernel to the float rounding, not bitwise).
 void tq_rows_avx512_r1q2_bih3_lanes(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,

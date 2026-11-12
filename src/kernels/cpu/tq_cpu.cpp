@@ -323,12 +323,77 @@ struct ActSet {
     const tq_detail::TqAct* ptr[kTqMaxTokens];
 };
 
-ActSet& unpack_all(const void* const* act, int n, int nt) {
+// QuantLab (11/13) STRATA_QL_UNPACK_ONCE=1: the pool's tasks each unpacked their tokens' activations again (every task,
+// every expert of its row range).  With it a thread keeps what it unpacked, keyed by the source pointer and the batch's
+// generation (tq_set_act_generation; the pool sets it per phase, 0 = no reuse), and the AVX-512 bih3 exact rows - which
+// read only q8, d and bsum - get only those fields filled.  The same values: the rows' bits do not change.
+bool unpack_once_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_UNPACK_ONCE"); return v && v[0] == '1'; }();
+    return on;
+}
+thread_local uint64_t tl_act_gen = 0;
+
+struct ActSlot {
+    const void* src = nullptr;
+    uint64_t gen = 0;
+    int n = 0;
+    bool lean = false;
+    std::unique_ptr<tq_detail::TqAct> act;
+};
+constexpr int kActSlots = 16;
+
+void unpack_act_lean(const void* q8_0, int n, tq_detail::TqAct& a) {   // unpack_act's d, q8 and bsum only
+    const uint8_t* p = (const uint8_t*) q8_0;
+    for (int b = 0; b < n / 32; ++b, p += 34) {
+        a.d[b] = tq_detail::tq_half_to_float(tq_detail::tq_ld16(p));
+        const int8_t* q = (const int8_t*) (p + 2);
+        int32_t sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            a.q8[32 * b + j] = q[j];
+            sum += q[j];
+        }
+        a.bsum[b] = 384 * sum;
+    }
+}
+
+ActSet& unpack_all(const void* const* act, int n, int nt, bool lean = false) {
     thread_local std::unique_ptr<ActSet> set;
     if (!set) set.reset(new ActSet);
+    if (!unpack_once_on()) {
+        for (int t = 0; t < nt; ++t) {
+            tq_detail::unpack_act(act[t], n, set->act[t]);
+            set->ptr[t] = &set->act[t];
+        }
+        return *set;
+    }
+    thread_local ActSlot slots[kActSlots];
+    thread_local int next = 0;
+    const uint64_t gen = tl_act_gen;
     for (int t = 0; t < nt; ++t) {
-        tq_detail::unpack_act(act[t], n, set->act[t]);
-        set->ptr[t] = &set->act[t];
+        ActSlot* hit = nullptr;
+        if (gen != 0)
+            for (ActSlot& s : slots)
+                if (s.act && s.gen == gen && s.src == act[t] && s.n == n && (lean || !s.lean)) { hit = &s; break; }
+        if (hit == nullptr) {
+            // a slot not used by this call's earlier tokens (nt <= 8 < kActSlots)
+            for (;;) {
+                ActSlot& s = slots[next];
+                next = (next + 1) % kActSlots;
+                bool taken = false;
+                for (int u = 0; u < t; ++u) taken = taken || set->ptr[u] == s.act.get();
+                if (taken) continue;
+                hit = &s;
+                break;
+            }
+            if (!hit->act) hit->act.reset(new tq_detail::TqAct);
+            if (lean) unpack_act_lean(act[t], n, *hit->act);
+            else tq_detail::unpack_act(act[t], n, *hit->act);
+            hit->src = act[t];
+            hit->gen = gen;
+            hit->n = n;
+            hit->lean = lean;
+        }
+        set->ptr[t] = hit->act.get();
     }
     return *set;
 }
@@ -381,14 +446,28 @@ static bool bih3_table_only() {
     static const bool on = [] { const char* v = std::getenv("STRATA_TQ_BIH3_TABLE"); return v && v[0] == '1'; }();
     return on;
 }
+static bool bih3_lanes() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_TQ_BIH3_LANES"); return v && v[0] == '1'; }();
+    return on;
+}
+// QuantLab (11/13) STRATA_QL_TQ_PRE=1: the AVX-512 bih3 exact rows with their per-block scalar work hoisted
+// (tq_rows_avx512_r1q2_bih3_pre; the same bits)
+static bool tq_pre_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_TQ_PRE"); return v && v[0] == '1'; }();
+    return on;
+}
+// QuantLab (11/13) STRATA_QL_UNPACK_ONCE: the rows rows_r1_on runs read only q8, d and bsum (the AVX-512 bih3 exact rows)
+static bool lean_act(TqIsa isa, int ggml_type) {
+    return unpack_once_on() && isa == TqIsa::avx512 && tq_bih3_type(ggml_type) && !bih3_table_only() && !bih3_lanes();
+}
 // QuantLab (10/31): R1Q2 blocks (4K bytes, tq_detail::TqScales), each ISA its own kernel as rows_on
 void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n,
                 const tq_detail::TqAct* const* a, int nt, float* const* out, int r0, int r1, const tq_detail::TqScales& sc,
                 bool bih3 = false) {
 #if defined(STRATA_TQ_X86)
     if (isa == TqIsa::avx512 && bih3 && !bih3_table_only()) {   // QuantLab (11/12): computed, no table
-        static const bool lanes = [] { const char* v = std::getenv("STRATA_TQ_BIH3_LANES"); return v && v[0] == '1'; }();
-        if (lanes) tq_detail::tq_rows_avx512_r1q2_bih3_lanes(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        if (bih3_lanes()) tq_detail::tq_rows_avx512_r1q2_bih3_lanes(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
+        else if (tq_pre_on()) tq_detail::tq_rows_avx512_r1q2_bih3_pre(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         else tq_detail::tq_rows_avx512_r1q2_bih3(kb, w, row_bytes, n, a, nt, out, r0, r1, sc);
         return;
     }
@@ -428,7 +507,7 @@ void rows_r1_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t 
 void tq_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                   float* const* out, int r0, int r1, const tq_detail::TqScales& sc) {
     if (!tq_isa_ok(isa) || (ggml_type >= 147 && ggml_type <= 149)) std::abort();   // a caller bug
-    const ActSet& s = unpack_all(act, n, nt);
+    const ActSet& s = unpack_all(act, n, nt, lean_act(isa, ggml_type));
     rows_r1_on(isa, tq_kbits(ggml_type), tq_state_table_for(ggml_type), w, row_bytes, n, s.ptr, nt, out, r0, r1, sc,
                tq_bih3_type(ggml_type));
 }
@@ -437,7 +516,7 @@ void tq_gu_rows_r1q2(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_ro
                      const tq_detail::TqScales& u) {
     if (!tq_isa_ok(isa) || (ggml_type >= 147 && ggml_type <= 149)) std::abort();
     const int16_t* tab = tq_state_table_for(ggml_type);
-    const ActSet& s = unpack_all(act, n, nt);
+    const ActSet& s = unpack_all(act, n, nt, lean_act(isa, ggml_type));
     thread_local std::vector<float> gbuf, ubuf;
     const size_t nr = (size_t) r1;
     if (gbuf.size() < nr * kTqMaxTokens) { gbuf.resize(nr * kTqMaxTokens); ubuf.resize(nr * kTqMaxTokens); }
@@ -485,5 +564,7 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;   // native_gu_rows' SwiGLU expression
         }
 }
+
+void tq_set_act_generation(uint64_t gen) { tl_act_gen = gen; }
 
 }  // namespace strata::kernels::cpu

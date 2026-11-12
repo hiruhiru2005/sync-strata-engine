@@ -349,6 +349,31 @@ void check_r1q2(int type, int n) {
         std::printf("type %d n %d R1Q2 avx512 lane-wise vs the scalar R1Q2 kernel: worst %.2e of |want| + RMS  %s\n", type, n,
                     lw, lw < 1e-5 ? "ok" : "FAIL");
         if (!(lw < 1e-5)) fail("R1Q2 bih3 lane-wise rows differ", type, n);
+        // QuantLab (11/13) STRATA_QL_TQ_PRE: the hoisted exact rows, every group size and a row range in two calls
+        bool okp = true;
+        for (int nt = 1; nt <= NT; ++nt) {
+            std::fill(o_isa.begin(), o_isa.end(), 0.f);
+            tq_detail::tq_rows_avx512_r1q2_bih3_pre(K, wn.data(), rb_new, n, aptr, nt, pi, 0, rows / 3, sc);
+            tq_detail::tq_rows_avx512_r1q2_bih3_pre(K, wn.data(), rb_new, n, aptr, nt, pi, rows / 3, rows, sc);
+            okp = okp && same_bits(o_isa.data(), o_new.data(), (size_t) nt * rows);
+        }
+        std::printf("type %d n %d R1Q2 avx512 bih3 hoisted rows (STRATA_QL_TQ_PRE) vs the scalar R1Q2 kernel: %s\n", type, n,
+                    okp ? "bitwise equal" : "DIFFERENT");
+        if (!okp) fail("R1Q2 bih3 hoisted rows differ", type, n);
+        // QuantLab (11/13) STRATA_QL_UNPACK_ONCE: under a generation the second call reuses the first's unpacking
+        // (with the variable unset this is the plain path twice)
+        bool oku = true;
+        tq_set_act_generation(0x1113000000ull + (uint64_t) type * 8192 + (uint64_t) n);
+        for (int rep = 0; rep < 2; ++rep)
+            for (int nt = 1; nt <= NT; ++nt) {
+                std::fill(o_isa.begin(), o_isa.end(), 0.f);
+                tq_rows_r1q2(TqIsa::avx512, type, wn.data(), rb_new, n, ap, nt, pi, 0, rows, sc);
+                oku = oku && same_bits(o_isa.data(), o_new.data(), (size_t) nt * rows);
+            }
+        tq_set_act_generation(0);
+        std::printf("type %d n %d R1Q2 avx512 with an activation generation (STRATA_QL_UNPACK_ONCE reuse): %s\n", type, n,
+                    oku ? "bitwise equal" : "DIFFERENT");
+        if (!oku) fail("R1Q2 rows under an activation generation differ", type, n);
     }
     // fused gate/up: the same rows as gate and up (own scales each: up uses rowbase reversed)
     std::vector<uint8_t> blob = wn;
@@ -459,8 +484,9 @@ void bench(int type, int n, int rows) {
             if (nt > NT) continue;
             const double t_e = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
             const double t_l = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3_lanes(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
-            std::printf("bench type %d n %4d avx512 bih3 rows alone nt %d: exact %6.1f, lane-wise %6.1f ns/block (%+.0f%%)\n",
-                        type, n, nt, t_e, t_l, 100.0 * (t_l / t_e - 1.0));
+            const double t_p = time_ns([&] { tq_detail::tq_rows_avx512_r1q2_bih3_pre(K, wn.data(), rb_new, n, aptr, nt, po, 0, rows, sc); });
+            std::printf("bench type %d n %4d avx512 bih3 rows alone nt %d: exact %6.1f, lane-wise %6.1f ns/block (%+.0f%%), "
+                        "hoisted %6.1f (%+.0f%%)\n", type, n, nt, t_e, t_l, 100.0 * (t_l / t_e - 1.0), t_p, 100.0 * (t_p / t_e - 1.0));
         }
     }
 }
@@ -483,7 +509,7 @@ int main(int argc, char** argv) {
             break;
         }
     if (!args.empty() && args[0] == "--bench") {
-        for (int type : {145, 146, 170, 171, 186, 187, 190, 191})   // QuantLab (11/12): + bih3 K 6, 7, 10, 11
+        for (int type : {145, 146, 170, 171, 186, 187, 188, 190, 191})   // QuantLab (11/12): + bih3 K 6, 7, (11/13) 8, 10, 11
             for (int n : {2560, 640}) bench(type, n, n == 2560 ? 640 : 2560);
         return 0;
     }

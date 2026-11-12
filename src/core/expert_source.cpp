@@ -4619,8 +4619,21 @@ bool FileExpertSource::pin_cache_complement(
             if (paced) {   // page-aligned: the steps are registered on page boundaries
 #if !defined(_WIN32)
                 void* aligned = nullptr;
-                const uint64_t page = 4096;
+                // QuantLab (11/13) STRATA_QL_COMPLEMENT_THP=1: the arena 2 MiB aligned and MADV_HUGEPAGE before the paced
+                // touch, so transparent huge pages back it (THP "madvise": 4 KiB pages otherwise) - the CPU experts' rows
+                // then walk one TLB entry per 2 MiB instead of per 4 KiB.  Not with the NUMA placement (4 KiB there).
+                // The faults may compact memory (defrag "madvise"): start-up time and the page-locking are to be watched.
+                static const bool thp_on = [] { const char* v = std::getenv("STRATA_QL_COMPLEMENT_THP"); return v && v[0] == '1'; }();
+                const bool thp = thp_on && !numa.place;
+                const uint64_t page = thp ? (2ull << 20) : 4096;
                 if (posix_memalign(&aligned, (size_t) page, (size_t) ((bytes + page - 1) / page * page)) == 0) arena = aligned;
+#if defined(__linux__)
+                if (arena != nullptr && thp) {
+                    const int rc = madvise(arena, (size_t) ((bytes + page - 1) / page * page), MADV_HUGEPAGE);
+                    std::fprintf(stderr, "FileExpertSource: QuantLab: STRATA_QL_COMPLEMENT_THP: the complement 2 MiB aligned, "
+                                         "MADV_HUGEPAGE %s\n", rc == 0 ? "requested" : "refused");
+                }
+#endif
 #endif
 #if defined(__linux__)
                 // STRATA_NUMA_SPLIT: a 2 MiB huge page would put several slices on its toucher's node, so the arena

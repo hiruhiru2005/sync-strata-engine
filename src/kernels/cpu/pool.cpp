@@ -4,6 +4,7 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1107,6 +1108,10 @@ uint32_t ExpertPool::begin_batch(int n) {
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
     // nothing adds to `done` until this batch's first claim - which the release below orders after the reset.
     const uint32_t e = epoch_.load(std::memory_order_relaxed) + 1;   // only the host bumps the epoch
+    {   // QuantLab (11/13) STRATA_QL_UNPACK_ONCE: a generation no other batch of any pool had (published with the head)
+        static std::atomic<uint64_t> g_gen{0};
+        act_gen_ = g_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
     if (numa_phase()) {
         // every slice's head, even a slice with no task, and never `head_`: for this epoch only the slice heads
         // carry `e`, so a claim on `head_` fails, and every head left from an earlier batch is exhausted (pool.hpp)
@@ -1175,6 +1180,8 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     const int s = numa_n_ == 0 ? 0 : id >= 0 ? wslice_[(size_t) id] : hslice_;
+    struct GenReset { ~GenReset() { tq_set_act_generation(0); } } gen_reset;   // QuantLab (11/13): no reuse outside the batch
+    bool gen_set = false;
     for (;;) {
         // STRATA_NUMA_SPLIT: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
         // other family's claim fail, so `mode_` is never read before a claim has succeeded (pool.hpp)
@@ -1183,6 +1190,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         if (!sliced) ci = claim(epoch);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
+        if (!gen_set) { tq_set_act_generation(act_gen_); gen_set = true; }   // read after a claim of this batch succeeded
         static const bool ql_busy_on = [] { const char* v = std::getenv("STRATA_QL_LAYER_CPU"); return v && v[0] == '1'; }();
         const int64_t ql_t0 = ql_busy_on ? now_ns() : 0;   // QuantLab (11/12): the task's busy time (pool.hpp)
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
