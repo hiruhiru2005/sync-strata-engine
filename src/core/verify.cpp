@@ -2062,8 +2062,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
+                // QuantLab (11/13) STRATA_QL_MMVQ_PAIR=1: the keys and the values (one type and shape, one input) in one
+                // launch, each output bitwise its own call (native_mmvq_pair_kq); a launch's fixed cost once, not twice
+                static const bool kv_pair = [] { const char* e = std::getenv("STRATA_QL_MMVQ_PAIR"); return e && e[0] == '1'; }();
+                if (!(kv_pair && wk->native_type == wv->native_type && !strata::kernels::native_tq_type(wk->native_type) &&
+                      wk->ne0 == wv->ne0 && wk->ne1 == wv->ne1 &&
+                      strata::kernels::native_mmvq_pair_kq(wk->native_type, wk->native_data, wv->native_data, xq_,
+                                                           kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD, (int) N,
+                                                           (int) (NKV * HD), n, cs))) {
                 mmr(wk, xm, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mmr(wv, xm, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)

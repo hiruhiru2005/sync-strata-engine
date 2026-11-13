@@ -150,6 +150,10 @@ bool native_tq_type(int t) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+/// QuantLab (11/13) STRATA_QL_MMVQ_PAIR: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2) for Q4_K / Q5_K (the attention's
+/// keys and values) in ONE launch, every output bitwise its own call (1-8 columns); false (nothing launched) otherwise.
+bool native_mmvq_pair_kq(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                         int n_in, int n_out, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
