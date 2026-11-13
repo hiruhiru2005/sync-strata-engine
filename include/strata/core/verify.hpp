@@ -652,6 +652,11 @@ private:
     // QuantLab 11/8 STRATA_QL_GPU_AHEAD: layer l+1's predicted top-10 (device: logits, ids, weights; mapped: ids)
     float* plogits_ = nullptr; int32_t* pids_ = nullptr; float* pw_ = nullptr;
     int32_t* h_pids_ = nullptr;  int32_t* m_pids_ = nullptr;    // T * k
+    // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing's router logits (E0: the FFN-side read of the layer's
+    // entrance residual; E1: the mixer's input), device scratch and the mapped copy [layer][E0, E1][max_t][n_expert]
+    float* qe_logits_ = nullptr; float* qe_mixed_ = nullptr; float* qe_xn_ = nullptr;
+    float* qe_lo_ = nullptr;     float* qe_rs_ = nullptr;     float* qe_inj_ = nullptr;
+    float* h_qe_ = nullptr;      float* m_qe_ = nullptr;
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;

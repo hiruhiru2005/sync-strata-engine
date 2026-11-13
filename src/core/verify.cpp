@@ -810,7 +810,7 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (hcount_d_) cudaFree(hcount_d_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_pids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_qe_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -946,6 +946,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
+    // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing's logits per layer, read by the plan (expert_source.cpp)
+    if (ql_predict_stats_level() >= 2 &&
+        !mapped((size_t) g.n_layers * 2 * T * (size_t) g.n_expert * 4, (void**) &h_qe_, (void**) &m_qe_)) {
+        err = "verify: mapped early-routing allocation failed " + strata::core::pin_exhausted_hint();
+        return false;
+    }
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
     if (tap_path != nullptr && tap_path[0] == '\0') tap_path = nullptr;
@@ -1051,6 +1057,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         plogits_ = b.take<float>(T * (uint64_t) g.n_expert); pw_ = b.take<float>(T * K); pids_ = b.take<int32_t>(T * K);   // QuantLab 11/8
+        if (ql_predict_stats_level() >= 2) {   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2 only: nothing taken otherwise
+            qe_logits_ = b.take<float>(2 * T * (uint64_t) g.n_expert); qe_mixed_ = b.take<float>(T * N);
+            qe_xn_ = b.take<float>(T * HC * N); qe_lo_ = b.take<float>(T * (uint64_t) g.hc_lr);
+            qe_rs_ = b.take<float>(T * HC); qe_inj_ = b.take<float>(T * HC);
+        }
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
@@ -1571,6 +1582,43 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
+        }
+        // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing, for the plan's counters only (nothing else reads
+        // it; the buffers exist only under the flag, so no node is added without it).  E0 = this layer's FFN-side
+        // hyper-connection read (the router's own norm and mix, apply off: R is not written) of the entrance residual R -
+        // the router's input as if the mixer added nothing; E1 = the mixer's input, the attention-side read just made.
+        // Both through this layer's router matrix; the logits go to the mapped buffer, the host ranks them.
+        if (qe_logits_ != nullptr && h_qe_ != nullptr && n >= 1 && n <= kFusedGrMaxT) {
+            const WeightRef* wr = v.get("ffn_gate_inp.weight");
+            if (wr != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+                FusedGrArgs fa[kFusedGrMaxT];
+                for (int t = tb; t < te; ++t) {
+                    FusedGrArgs& a = fa[t - tb];
+                    a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
+                    a.bo_prev = bo_ + t * N; a.inj_prev = inj2_ + t * HC;
+                    a.w_norm = (const float*) wn[1]->data; a.w_down = (const uint16_t*) wd[1]->data;
+                    a.w_up = (const uint16_t*) wu[1]->data; a.w_inject = (const uint16_t*) wi[1]->data;
+                    a.q8_down = (const uint8_t*) wd[1]->hc_q8; a.q8_up = (const uint8_t*) wu[1]->hc_q8;
+                    a.q8_inject = (const uint8_t*) wi[1]->hc_q8;
+                    a.s_down = wd[1]->q8_scale; a.s_up = wu[1]->q8_scale;
+                    a.eps = EPS; a.lo = qe_lo_ + (t - tb) * g.hc_lr; a.rs = qe_rs_ + (t - tb) * HC;
+                    a.inject_out = qe_inj_ + (t - tb) * HC; a.mixed = qe_mixed_ + (t - tb) * N;
+                }
+                const size_t lay_off = (size_t) l * 2 * (size_t) max_t_ * (size_t) NE;
+                try {
+                    fused_gr_read_multi(fa, n, qe_xn_, cs);
+                    bf16_gemv_fp32_mmvf_multi(qe_mixed_, N, (const uint16_t*) wr->data, qe_logits_, NE, N, NE, n, cs);
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wr->data, qe_logits_ + (size_t) n * NE,
+                                              NE, N, NE, n, cs);
+                    for (int e = 0; e < 2; ++e)
+                        if (cudaMemcpyAsync(h_qe_ + lay_off + ((size_t) e * max_t_ + (size_t) tb) * NE,
+                                            qe_logits_ + (size_t) e * n * NE, (size_t) n * NE * sizeof(float),
+                                            cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                            err = "verify ql predict: the early logits' copy failed";
+                            return false;
+                        }
+                } catch (const std::exception& e) { err = "verify ql predict: " + std::string(e.what()); return false; }
+            }
         }
         if (inputs_pending) {   // the window's steps and positions, before the first mixer reads them
             join(1);
@@ -3421,6 +3469,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (ql_gpu_ahead_on() && n > 1 && l + 1 < g.n_layers)   // QuantLab 11/8: layer l+1's guess, for the read-ahead
             ql_set_gpu_pred(h_pids_ + (size_t) tb * ss.k, n * (int) ss.k, l + 1);
+        if (h_qe_ != nullptr)   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: this layer's early routing, for the plan's counters
+            ql_set_early(h_qe_ + ((size_t) l * 2 * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert,
+                         h_qe_ + (((size_t) l * 2 + 1) * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert, n, l,
+                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -5262,6 +5314,10 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         progress_at("verify window (pipelined): the CPU experts of layer", l);
         if (ql_gpu_ahead_on() && n > 1 && l + 1 < g.n_layers)   // QuantLab 11/8: layer l+1's guess, for the read-ahead
             ql_set_gpu_pred(h_pids_ + (size_t) tb * ss.k, n * (int) ss.k, l + 1);
+        if (h_qe_ != nullptr)   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: this layer's early routing, for the plan's counters
+            ql_set_early(h_qe_ + ((size_t) l * 2 * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert,
+                         h_qe_ + (((size_t) l * 2 + 1) * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert, n, l,
+                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

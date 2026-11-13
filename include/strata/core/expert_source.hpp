@@ -644,6 +644,15 @@ struct ExpertDispatch {
         int64_t hit[4] = {}, waste[4] = {};
         double hit_bytes[4] = {};
         int64_t band_a[4] = {}, band_hit[4][4] = {};   ///< layers 0-11, 12-23, 24-35, 36+; [band][predictor]
+        /// =2: the early routing (E0, E1) over every decode layer-window it reached (the first window too): A again
+        /// (its own denominators), [E][top k, k + 2, k + 4] hits / waste / hit bytes / band hits, and the routing's
+        /// own agreement (the true top-k entries found in the same token's early top k, over all entries)
+        int64_t e_lw = 0, e_a = 0, e_rtot = 0;
+        double e_a_bytes = 0;
+        int64_t e_band_a[4] = {};
+        int64_t e_hit[2][3] = {}, e_waste[2][3] = {}, e_rmatch[2] = {};
+        double e_hit_bytes[2][3] = {};
+        int64_t e_band_hit[2][3][4] = {};
     };
     bool ql_pred_live = false;
     int64_t ql_pred_words = 0, ql_pred_layers = 0;
@@ -718,6 +727,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 bool ql_predict_stats_on();
 void ql_pred_begin(ExpertDispatch& d);
 void ql_pred_end(ExpertDispatch& d);
+/// =2 (the level, read once): the verifier also runs the early routing (verify.cpp) and, right before the pool call of
+/// `layer`, hands its logits (mapped, n_tok rows of n_expert each, E0 then E1) and the route prior's lambda here.
+int ql_predict_stats_level();
+void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
