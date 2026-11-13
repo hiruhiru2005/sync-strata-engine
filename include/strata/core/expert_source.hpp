@@ -631,6 +631,26 @@ struct ExpertDispatch {
     std::vector<double> ql_lrun;
     std::vector<int64_t> ql_ljobs, ql_lwin;
     int64_t ql_nt[9] = {};
+    /// QuantLab (11/13) STRATA_QL_PREDICT_STATS=1: how well the earlier windows name the experts a decode window needs
+    /// from outside VRAM (A = the distinct experts of a layer-window computed on the CPU or read over PCIe; the tail
+    /// skip's are not in it).  Predictors: P1 = A of the last window at this layer, P2 / P4 = the union over the last
+    /// 2 / 4, Q1 = every expert the last window used at this layer (VRAM ones included); each minus what is resident
+    /// now.  A request's first window per layer has no prediction and is left out.  `ql_pred_live` is set by the
+    /// decode loop only (the prompt's windows are not counted); host-side counting, no effect on the output.
+    struct QlPredSum {
+        int64_t windows = 0, lw = 0;                 ///< windows (layer 0) and layer-windows scored
+        int64_t a = 0, pcie = 0, cpu = 0, file = 0;  ///< |A| summed; by kind; file: CPU ones read from the files
+        double a_bytes = 0;
+        int64_t hit[4] = {}, waste[4] = {};
+        double hit_bytes[4] = {};
+        int64_t band_a[4] = {}, band_hit[4][4] = {};   ///< layers 0-11, 12-23, 24-35, 36+; [band][predictor]
+    };
+    bool ql_pred_live = false;
+    int64_t ql_pred_words = 0, ql_pred_layers = 0;
+    std::vector<uint64_t> ql_pred_hist;   ///< [layer][4 slots][words]: A of the last 4 windows (slot = window % 4)
+    std::vector<uint64_t> ql_pred_used;   ///< [layer][words]: every expert the last window used (not tail-skipped)
+    std::vector<int64_t> ql_pred_nwin;    ///< per layer: windows seen in this request
+    QlPredSum ql_pred_req, ql_pred_all;
     /// 149-cold STRATA_COLD_OVERLAP: 0 off (the CPU starts once every blob of the layer is read), 1 the blobs that
     /// must be read are read in the background while the pool computes the ready experts, each landed one computed
     /// as it lands; 2 measure only (read everything first, then the ready experts, then the read ones, timed apart).
@@ -691,6 +711,13 @@ void set_tail_skip_rank(int r);
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
+
+/// QuantLab (11/13) STRATA_QL_PREDICT_STATS=1 (read once): on.  `ql_pred_begin` starts a request's decode (the
+/// history and the request's sums cleared, counting on); `ql_pred_end` stops counting and prints the request's line
+/// and the process's line (`strata ql predict: ...`) to stderr.  Both do nothing when off.
+bool ql_predict_stats_on();
+void ql_pred_begin(ExpertDispatch& d);
+void ql_pred_end(ExpertDispatch& d);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about

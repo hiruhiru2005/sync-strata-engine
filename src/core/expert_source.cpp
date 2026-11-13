@@ -5854,6 +5854,148 @@ void ql_set_gpu_pred(const int32_t* ids, int n, int64_t layer) {
     tl_gpu_pred_layer = layer;
 }
 
+// QuantLab (11/13) STRATA_QL_PREDICT_STATS: whether the experts a decode window needs from outside VRAM could be named
+// before its router runs, from the earlier windows at the same layer (ExpertDispatch::QlPredSum).  Bit sets of
+// n_expert bits per layer, fixed arrays on the stack per call; the history grows once (the first window's layers).
+bool ql_predict_stats_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_PREDICT_STATS"); return v && v[0] == '1'; }();
+    return on;
+}
+
+void ql_pred_begin(ExpertDispatch& d) {
+    if (!ql_predict_stats_on()) return;
+    d.ql_pred_live = true;
+    d.ql_pred_req = ExpertDispatch::QlPredSum{};
+    std::fill(d.ql_pred_nwin.begin(), d.ql_pred_nwin.end(), (int64_t) 0);
+}
+
+namespace {
+constexpr int64_t kQlPredMaxWords = 16;   // up to 1024 experts per layer; a larger model is not counted
+
+// one layer-window: kind[] as the dispatch planned it (-2 tail-skipped, -1 CPU, 0 VRAM, 1 PCIe, 2 peer / helper GPU),
+// nfile = the CPU experts whose blob was still to be read from the files (STRATA_COLD_OVERLAP != 0; else 0)
+void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n, const int32_t* kind, int nfile) {
+    const int64_t W = (d.n_expert + 63) / 64;
+    if (L < 0 || W <= 0 || W > kQlPredMaxWords || d.host_res == nullptr) return;
+    if (d.ql_pred_words != W) {
+        d.ql_pred_words = W;
+        d.ql_pred_layers = 0;
+        d.ql_pred_hist.clear();
+        d.ql_pred_used.clear();
+        d.ql_pred_nwin.clear();
+    }
+    if (L >= d.ql_pred_layers) {
+        d.ql_pred_layers = L + 1;
+        d.ql_pred_hist.resize((size_t) (L + 1) * 4 * (size_t) W, 0);
+        d.ql_pred_used.resize((size_t) (L + 1) * (size_t) W, 0);
+        d.ql_pred_nwin.resize((size_t) (L + 1), 0);
+    }
+    uint64_t a[kQlPredMaxWords] = {}, u[kQlPredMaxWords] = {};
+    int na = 0, npcie = 0, ncpu = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= d.n_expert || kind[i] == -2) continue;
+        const uint64_t b = 1ull << (e & 63);
+        u[e >> 6] |= b;
+        if ((kind[i] == -1 || kind[i] == 1) && (a[e >> 6] & b) == 0) {
+            a[e >> 6] |= b;
+            ++na;
+            if (kind[i] == 1) ++npcie; else ++ncpu;
+        }
+    }
+    uint64_t* hist = d.ql_pred_hist.data() + (size_t) L * 4 * (size_t) W;
+    uint64_t* used = d.ql_pred_used.data() + (size_t) L * (size_t) W;
+    int64_t& nw = d.ql_pred_nwin[(size_t) L];
+    if (nw > 0) {
+        uint64_t p[4][kQlPredMaxWords];   // P1, P2, P4, Q1
+        auto slot = [&](int64_t back, int64_t w) -> uint64_t { return nw >= back ? hist[((nw - back) & 3) * W + w] : 0; };
+        for (int64_t w = 0; w < W; ++w) {
+            p[0][w] = slot(1, w);
+            p[1][w] = p[0][w] | slot(2, w);
+            p[2][w] = p[1][w] | slot(3, w) | slot(4, w);
+            p[3][w] = used[w];
+            // what is resident now needs no copy: out of every prediction (P1 and P2 are inside P4)
+            for (uint64_t any = p[2][w] | p[3][w]; any != 0; any &= any - 1) {
+                const int64_t e = w * 64 + __builtin_ctzll(any);
+                if (e < d.n_expert && d.host_res[(size_t) L * (size_t) d.n_expert + (size_t) e] >= 0) {
+                    const uint64_t m = ~(1ull << (e & 63));
+                    for (int j = 0; j < 4; ++j) p[j][w] &= m;
+                }
+            }
+        }
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        double a_bytes = 0, hit_bytes[4] = {};
+        int hit[4] = {}, waste[4] = {};
+        for (int64_t w = 0; w < W; ++w) {
+            for (uint64_t x = a[w]; x != 0; x &= x - 1) a_bytes += (double) lay.expert_bytes(L, w * 64 + __builtin_ctzll(x));
+            for (int j = 0; j < 4; ++j) {
+                const uint64_t h = a[w] & p[j][w];
+                hit[j] += __builtin_popcountll(h);
+                waste[j] += __builtin_popcountll(p[j][w] & ~a[w]);
+                for (uint64_t x = h; x != 0; x &= x - 1) hit_bytes[j] += (double) lay.expert_bytes(L, w * 64 + __builtin_ctzll(x));
+            }
+        }
+        const int band = (int) std::min<int64_t>(3, L / 12);
+        for (ExpertDispatch::QlPredSum* s : {&d.ql_pred_req, &d.ql_pred_all}) {
+            if (L == 0) ++s->windows;
+            ++s->lw;
+            s->a += na;
+            s->pcie += npcie;
+            s->cpu += ncpu;
+            s->file += nfile;
+            s->a_bytes += a_bytes;
+            s->band_a[band] += na;
+            for (int j = 0; j < 4; ++j) {
+                s->hit[j] += hit[j];
+                s->waste[j] += waste[j];
+                s->hit_bytes[j] += hit_bytes[j];
+                s->band_hit[band][j] += hit[j];
+            }
+        }
+    }
+    uint64_t* cur = hist + (nw & 3) * W;
+    for (int64_t w = 0; w < W; ++w) {
+        cur[w] = a[w];
+        used[w] = u[w];
+    }
+    ++nw;
+}
+
+void ql_pred_print(const char* what, const ExpertDispatch::QlPredSum& s) {
+    if (s.lw == 0) {
+        std::fprintf(stderr, "strata ql predict: %s no decode window after the first\n", what);
+        return;
+    }
+    const double lw = (double) s.lw;
+    auto pct = [](double x, double y) { return y > 0 ? 100.0 * x / y : 0.0; };
+    std::string line;
+    char b[256];
+    std::snprintf(b, sizeof b,
+                  "strata ql predict: %s %lld windows (%lld layer-windows), A %.2f/layer-window (PCIe %.2f, CPU %.2f "
+                  "[file %.2f]), %.2f MB/layer-window;",
+                  what, (long long) s.windows, (long long) s.lw, (double) s.a / lw, (double) s.pcie / lw,
+                  (double) s.cpu / lw, (double) s.file / lw, s.a_bytes / lw / 1e6);
+    line += b;
+    static const char* const name[4] = {"P1", "P2", "P4", "Q1"};
+    for (int j = 0; j < 4; ++j) {
+        std::snprintf(b, sizeof b, " %s hit %.1f%% (bytes %.1f%%) waste %.2f, bands %.0f/%.0f/%.0f/%.0f%%;", name[j],
+                      pct((double) s.hit[j], (double) s.a), pct(s.hit_bytes[j], s.a_bytes), (double) s.waste[j] / lw,
+                      pct((double) s.band_hit[0][j], (double) s.band_a[0]), pct((double) s.band_hit[1][j], (double) s.band_a[1]),
+                      pct((double) s.band_hit[2][j], (double) s.band_a[2]), pct((double) s.band_hit[3][j], (double) s.band_a[3]));
+        line += b;
+    }
+    line.pop_back();
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+}  // namespace
+
+void ql_pred_end(ExpertDispatch& d) {
+    if (!ql_predict_stats_on() || !d.ql_pred_live) return;
+    d.ql_pred_live = false;
+    ql_pred_print("request", d.ql_pred_req);
+    ql_pred_print("total", d.ql_pred_all);
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -5888,6 +6030,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
+    static const bool ql_pred_on = ql_predict_stats_on();   // QuantLab (11/13) STRATA_QL_PREDICT_STATS
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
@@ -6136,6 +6279,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     static thread_local std::vector<uint8_t> mstate;   // per miss: 0 ready, 1 being read, 2 landed, 3 computed
     miss.clear();
     int64_t npend = 0;
+    int ql_nfile = 0;   // QuantLab (11/13) STRATA_QL_PREDICT_STATS: the CPU experts still to be read from the files
     double cold_r_ms = 0;
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         for (int64_t i = 0; i < n_tok * k; ++i)
@@ -6148,6 +6292,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             mstate.assign(miss.size(), 0);
             const auto r0 = std::chrono::steady_clock::now();
             npend = d.src->prefetch_begin(d.layers, miss.data(), (int64_t) miss.size(), mstate.data());
+            if (npend > 0 && ql_pred_on && d.ql_pred_live)
+                for (const uint8_t s : mstate) ql_nfile += s == 1;
             if (npend > 0 && d.cold_mode == 2) {   // measure: every read first, as mode 0 does
                 d.src->prefetch_end();
                 for (uint8_t& s : mstate) if (s == 1) s = 2;
@@ -6329,6 +6475,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (npend == 0)
             for (int jx = 0; jx < njobs; ++jx) ++d.ql_nt[std::min(std::max((int) d.jobs_multi[(size_t) jx].nt, 0), 8)];
     }
+    // QuantLab (11/13) STRATA_QL_PREDICT_STATS: this layer-window's experts from outside VRAM against the earlier windows'
+    if (ql_pred_on && d.ql_pred_live) ql_pred_note(d, d.layers, ids, n, kind, ql_nfile);
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

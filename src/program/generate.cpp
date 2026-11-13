@@ -16832,6 +16832,13 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
+            // QuantLab (11/13) STRATA_QL_PREDICT_STATS=1: the decode windows' layer-windows are counted from here to the
+            // line after the decode (expert_source.cpp); the guard stops the counting on every other way out
+            strata::core::ql_pred_begin(drive.d);
+            struct QlPredEnd {
+                strata::core::ExpertDispatch& d;
+                ~QlPredEnd() { strata::core::ql_pred_end(d); }
+            } ql_pred_end_guard{drive.d};
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
             struct DecSnap {
@@ -17999,6 +18006,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            strata::core::ql_pred_end(drive.d);   // QuantLab (11/13) STRATA_QL_PREDICT_STATS: the request's line and the total
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
