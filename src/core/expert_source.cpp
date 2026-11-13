@@ -3040,6 +3040,61 @@ void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, 
     fill_many(todo);
 }
 
+void FileExpertSource::refill_read_ahead(const int32_t* idx, size_t n, int depth, const std::atomic<size_t>& consumed,
+                                         size_t ahead, const std::atomic<bool>& stop, RefillReadStats& st) {
+    st = RefillReadStats{};
+    // only where blob() itself would read the file into a stage buffer (staged_blob): the unbuffered tier, no io prefetch
+    if (idx == nullptr || n == 0 || depth <= 0 || direct_.empty() || base_ == nullptr) return;
+    if (ahead < (size_t) depth) ahead = (size_t) depth;
+    using SClock = std::chrono::steady_clock;
+    const auto t0 = SClock::now();
+    std::atomic<size_t> next{0};
+    std::atomic<uint64_t> reads{0}, bytes{0}, first_ns{std::numeric_limits<uint64_t>::max()}, last_ns{0};
+    auto ns_since = [&](SClock::time_point t) {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t - t0).count();
+    };
+    auto work = [&] {
+        strata::aux_cpus::pin_current_thread();
+        for (size_t j; (j = next.fetch_add(1, std::memory_order_relaxed)) < n;) {
+            while (!stop.load(std::memory_order_relaxed) && j >= consumed.load(std::memory_order_acquire) + ahead)
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            if (stop.load(std::memory_order_relaxed)) return;
+            const int64_t index = idx[j];
+            if (index < 0 || index >= n_layers_ * n_expert_) continue;
+            const int64_t layer = index / n_expert_, e = index % n_expert_;
+            size_t v = 0;
+            bool fill = false;
+            uint8_t* dst = nullptr;
+            {
+                // the same order as blob(): the RAM copy, an exchange override, the ring of experts read before, then
+                // the stage buffers - a pair any of the first three hold is not read here
+                std::lock_guard<std::mutex> lk(stage_mu_);
+                if (complement_ready_ && resident_blob((size_t) index) != nullptr) continue;
+                if (complement_ready_ && !override_.empty() && override_[(size_t) index] != nullptr) continue;
+                if (complement_ready_ && dyn_get((size_t) index) != nullptr) continue;
+                if (claim_stage(index, v, fill) || !fill) continue;   // staged already, or being read by the caller
+                dst = stage_buf_[v].get();
+            }
+            const auto a = SClock::now();
+            const bool ok = fill_stage(v, layer, e, dst);   // publishes it (a failure drops it: the caller reads it itself)
+            const auto b = SClock::now();
+            if (!ok) continue;
+            reads.fetch_add(1, std::memory_order_relaxed);
+            bytes.fetch_add(blob_len(layer, e), std::memory_order_relaxed);
+            const uint64_t na = ns_since(a), nb = ns_since(b);
+            for (uint64_t f = first_ns.load(); na < f && !first_ns.compare_exchange_weak(f, na);) {}
+            for (uint64_t l = last_ns.load(); nb > l && !last_ns.compare_exchange_weak(l, nb);) {}
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve((size_t) depth);
+    for (int t = 0; t < depth; ++t) pool.emplace_back(work);
+    for (auto& t : pool) t.join();
+    st.reads = reads.load();
+    st.bytes = bytes.load();
+    st.span_ms = st.reads > 0 ? (double) (last_ns.load() - first_ns.load()) / 1e6 : 0.0;
+}
+
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
     if (base_ == nullptr || unmapped_ || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {

@@ -15855,9 +15855,51 @@ int main(int argc, char** argv) {
             // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
             // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
             static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
+            // QuantLab 11/13 STRATA_QL_REFILL_PAR=<depth> (default 0 = off, the path above unchanged): the lent slots'
+            // experts that only the file holds are read ahead on <depth> threads (FileExpertSource::refill_read_ahead,
+            // into stage buffers, in the lent order), while this thread copies each slot as before - the same expert into
+            // the same slot from the same bytes, the same queued copies and the one wait.  One refill read the file one
+            // blob at a time (O_DIRECT, queue depth 1: ~2.2 GB/s); the drive gives 3.9-4.2 GB/s from depth 2 (11/13 probe).
+            // STRATA_QL_REFILL_STATS=1 (or STRATA_TRACE=1): one line per refill, with the flag on or off.
+            // STRATA_QL_REFILL_VERIFY=1 (tests): every refilled slot read back and compared with the file / the RAM copy.
+            static const int ql_refill_par = [] { const char* v = std::getenv("STRATA_QL_REFILL_PAR"); return v != nullptr ? std::max(0, std::min(64, std::atoi(v))) : 0; }();
+            static const bool ql_refill_stats = [] { const char* v = std::getenv("STRATA_QL_REFILL_STATS"); return v != nullptr && std::atoi(v) != 0; }();
+            static const bool ql_refill_verify = [] { const char* v = std::getenv("STRATA_QL_REFILL_VERIFY"); return v != nullptr && std::atoi(v) != 0; }();
+            struct QlRefillStat {
+                Clock::time_point t0{};
+                int64_t ram_n = 0, file_n = 0;
+                uint64_t ram_bytes = 0, file_bytes = 0;
+                double file_wait_ms = 0;   // this thread's time in blob_stable() for the experts the RAM copy lacks
+                bool par = false;
+                strata::core::FileExpertSource::RefillReadStats rd{};
+            } ql_rf;
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                const bool want_stats = ql_refill_stats || trace;
+                if (want_stats) ql_rf = QlRefillStat{Clock::now()};
+                // the read-ahead: only the unbuffered file tier of this source, the default copy path, one device's thread
+                const bool par = ql_refill_par > 0 && srcp == &src && src.unbuffered() && !refill_parts && !refill_blocking() &&
+                                 p.dev <= 0 && p.lent.size() > 1;
+                std::atomic<size_t> rf_consumed{0};
+                std::atomic<bool> rf_stop{false};
+                std::vector<int32_t> rf_idx;
+                std::thread rf_thread;
+                if (par) {
+                    rf_idx.reserve(p.lent.size());
+                    for (const auto& [i, slot] : p.lent) rf_idx.push_back(i);
+                    // ahead: far below the 256 claims after which a stage buffer may be recycled
+                    const size_t ahead = (size_t) std::max(32, std::min(128, 8 * ql_refill_par));
+                    rf_thread = std::thread([&, ahead] {
+                        src.refill_read_ahead(rf_idx.data(), rf_idx.size(), ql_refill_par, rf_consumed, ahead, rf_stop, ql_rf.rd);
+                    });
+                    ql_rf.par = true;
+                }
+                struct RfJoin {   // every return below (a failed copy too) stops and joins the read-ahead first
+                    std::thread& t;
+                    std::atomic<bool>& stop;
+                    ~RfJoin() { if (t.joinable()) { stop.store(true); t.join(); } }
+                } rf_join{rf_thread, rf_stop};
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
@@ -15866,19 +15908,81 @@ int main(int argc, char** argv) {
                         host_res[(size_t) i] = slot;
                         continue;
                     }
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(i / g.n_expert, i % g.n_expert);
+                    const uint8_t* b = nullptr;
+                    if (want_stats) {
+                        const bool in_ram = srcp == &src && src.resident_blob(i / g.n_expert, i % g.n_expert) != nullptr;
+                        const auto b0 = Clock::now();
+                        b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                        if (in_ram) {
+                            ++ql_rf.ram_n;
+                            ql_rf.ram_bytes += (uint64_t) nb;
+                        } else {
+                            ++ql_rf.file_n;
+                            ql_rf.file_bytes += (uint64_t) nb;
+                            ql_rf.file_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - b0).count();
+                        }
+                    } else {
+                        b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    }
+                    // a read-ahead whose read failed leaves nothing staged (blob() answers nullptr for it once): read it here
+                    if (b == nullptr && par) b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
                     host_res[(size_t) i] = slot;
+                    if (par) rf_consumed.fetch_add(1, std::memory_order_release);
                 }
                 return true;
             };
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
                 const strata::core::OnDevice on(p.dev);
                 if (!p.cache->sync_queued(e)) return false;
+                if (ql_refill_stats || trace) {
+                    const double all_ms = std::chrono::duration<double, std::milli>(Clock::now() - ql_rf.t0).count();
+                    const double rd_ms = ql_rf.par ? ql_rf.rd.span_ms : ql_rf.file_wait_ms;
+                    std::fprintf(stderr, "strata ql refill: %zu slots in %.1f ms (to the copies landed): RAM %lld (%.3f GB), file %lld "
+                                         "(%.3f GB); file reads %.1f ms = %.2f GB/s, this thread waited %.1f ms on them; par %d "
+                                         "(read ahead %llu, %.3f GB)\n",
+                                 p.lent.size(), all_ms, (long long) ql_rf.ram_n, (double) ql_rf.ram_bytes / 1e9,
+                                 (long long) ql_rf.file_n, (double) ql_rf.file_bytes / 1e9, rd_ms,
+                                 rd_ms > 0 ? (double) ql_rf.file_bytes / 1e6 / rd_ms : 0.0, ql_rf.file_wait_ms,
+                                 ql_rf.par ? ql_refill_par : 0, (unsigned long long) ql_rf.rd.reads, (double) ql_rf.rd.bytes / 1e9);
+                    std::fflush(stderr);
+                }
+                if (ql_refill_verify && srcp == &src) {
+                    // every refilled slot back from the device, against the RAM copy or the file read again (unbuffered)
+                    std::vector<uint8_t> dev_b, ref_b;
+                    int64_t ok_n = 0, bad_n = 0, skip_n = 0;
+                    for (const auto& [i, slot] : p.lent) {
+                        const int64_t l = i / g.n_expert, x = i % g.n_expert;
+                        const size_t nb = (size_t) strata::kernels::cpu::expert_layout().expert_bytes(l, x);
+                        const uint8_t* d = p.cache->device_slot(slot);
+                        dev_b.resize(nb);
+                        if (d == nullptr || cudaMemcpy(dev_b.data(), d, nb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            ++bad_n;
+                            continue;
+                        }
+                        const uint8_t* ref = src.resident_blob(l, x);
+                        if (ref == nullptr) {
+                            ref_b.assign((size_t) std::max<uint64_t>(nb, src.refill_blob_bytes(l, x)), 0);
+                            if (!src.read_blob_fresh(l, x, ref_b.data())) { ++skip_n; continue; }
+                            ref = ref_b.data();
+                        }
+                        if (std::memcmp(dev_b.data(), ref, nb) == 0) ++ok_n;
+                        else {
+                            if (bad_n < 5)
+                                std::fprintf(stderr, "strata ql refill: BAD slot %d (layer %lld expert %lld, %zu bytes, %s)\n", (int) slot,
+                                             (long long) l, (long long) x, nb, src.resident_blob(l, x) != nullptr ? "RAM" : "file");
+                            ++bad_n;
+                        }
+                    }
+                    std::fprintf(stderr, "strata ql refill: verified %lld ok / %lld BAD (%lld not readable again)\n", (long long) ok_n,
+                                 (long long) bad_n, (long long) skip_n);
+                    std::fflush(stderr);
+                }
 #if defined(_WIN32)
                 // The copies have landed: the file pages touched by the loan need not stay in the working set.
                 for (const auto& [i, slot] : p.lent)
