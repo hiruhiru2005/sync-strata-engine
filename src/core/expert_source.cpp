@@ -5864,7 +5864,135 @@ int ql_predict_stats_level() {
 }
 bool ql_predict_stats_on() { return ql_predict_stats_level() >= 1; }
 
+// QuantLab (11/13) STRATA_QL_PREFETCH=m (1..kQlPrefetchMax; 0 / unset = off): the verifier copies up to m experts the
+// light early routing E0 predicts into prefetch slots before the layer's plan (verify.cpp); the plan points PCIe groups
+// of those experts at the slots.  STRATA_QL_PREFETCH_MODE=B (A default), STRATA_QL_PREFETCH_STATS=1,
+// STRATA_QL_PREFETCH_VERIFY=1 (test mode: each copy read back and compared).
+int ql_prefetch_m() {
+    static const int m = [] { const char* v = std::getenv("STRATA_QL_PREFETCH"); return v ? std::clamp(std::atoi(v), 0, kQlPrefetchMax) : 0; }();
+    return m;
+}
+int ql_prefetch_mode() {
+    static const int b = [] { const char* v = std::getenv("STRATA_QL_PREFETCH_MODE"); return v && (v[0] == 'B' || v[0] == 'b' || v[0] == '1') ? 1 : 0; }();
+    return b;
+}
+bool ql_prefetch_verify() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_PREFETCH_VERIFY"); return v && v[0] == '1'; }();
+    return on;
+}
+namespace {
+bool ql_prefetch_stats_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_PREFETCH_STATS"); return v && v[0] == '1'; }();
+    return on;
+}
+thread_local ExpertDispatch* tl_pf_d = nullptr;   // the dispatch this thread plans with (its residency, its source)
+thread_local int64_t tl_pf_layer = -1;
+thread_local int tl_pf_n = 0;
+thread_local int32_t tl_pf_ex[kQlPrefetchMax];
+thread_local unsigned long long tl_pf_ptr[kQlPrefetchMax];
+struct QlPfSum {
+    int64_t windows = 0, layers = 0, issued = 0, used = 0, late = 0, verify_ok = 0, verify_bad = 0;
+    double issued_bytes = 0, used_bytes = 0;
+};
+QlPfSum g_pf_req, g_pf_all;
+void ql_pf_add(int64_t QlPfSum::*f, int64_t v) { g_pf_req.*f += v; g_pf_all.*f += v; }
+void ql_pf_print(const char* what, const QlPfSum& s) {
+    const double L = s.layers > 0 ? (double) s.layers : 1.0;
+    std::fprintf(stderr,
+                 "strata ql prefetch: %s %lld windows, %lld layer-steps: copied ahead %lld (%.2f/layer-step, %.1f MB), used %lld "
+                 "(%.2f/layer-step, %.1f%%), wasted %lld; DMA saved %lld experts %.1f MB; E0 after the doorbell %lld layer-steps "
+                 "(%.1f%%)%s\n",
+                 what, (long long) s.windows, (long long) s.layers, (long long) s.issued, (double) s.issued / L,
+                 s.issued_bytes / 1e6, (long long) s.used, (double) s.used / L,
+                 s.issued > 0 ? 100.0 * (double) s.used / (double) s.issued : 0.0, (long long) (s.issued - s.used),
+                 (long long) s.used, s.used_bytes / 1e6, (long long) s.late,
+                 100.0 * (double) s.late / (double) std::max<int64_t>(1, s.layers + s.late),
+                 ql_prefetch_verify() ? (std::string("; verified ") + std::to_string(s.verify_ok) + " ok / " +
+                                         std::to_string(s.verify_bad) + " BAD").c_str() : "");
+}
+}  // namespace
+
+int ql_prefetch_pick(int64_t layer, const int32_t* e0, int n_tok, int k, int m, int32_t* ex, const uint8_t** src,
+                     size_t* bytes) {
+    ExpertDispatch* dp = tl_pf_d;
+    if (dp == nullptr || dp->src == nullptr || dp->host_res == nullptr || e0 == nullptr || n_tok < 1 || k < 1 ||
+        n_tok * k > 128 || m < 1 || layer < 0)
+        return 0;
+    ExpertDispatch& d = *dp;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (layer == 0) ql_pf_add(&QlPfSum::windows, 1);
+    ql_pf_add(&QlPfSum::layers, 1);
+    // the plan's own conditions for a PCIe share in this layer (expert_pool_dispatch_multi)
+    static const bool pcie_mixed = [] { const char* v = std::getenv("STRATA_QL_PCIE_MIXED"); return v && std::atoi(v) != 0; }();
+    const bool mixed = lay.native && lay.layer_mixed(layer);
+    if (!((d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(layer) && (!mixed || pcie_mixed))) return 0;
+    // E0's distinct experts in first-occurrence order (the plan's miss order), each with its best rank
+    int32_t dist[128];
+    int brank[128], nd = 0;
+    for (int i = 0; i < n_tok * k; ++i) {
+        const int32_t e = e0[i];
+        if (e < 0 || e >= d.n_expert) continue;
+        int q = 0;
+        while (q < nd && dist[q] != e) ++q;
+        if (q == nd) { dist[nd] = e; brank[nd] = i % k; ++nd; }
+        else brank[q] = std::min(brank[q], i % k);
+    }
+    // the misses as the plan would see them: outside VRAM, no peer; E0's own tail skip (every token ranks it >= R)
+    const int tail = d.peer == nullptr && d.remote_count == 0 ? tail_skip_rank() : 0;
+    int miss[128], nmiss = 0;
+    for (int q = 0; q < nd; ++q) {
+        const int32_t e = dist[q];
+        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+        if (d.peer != nullptr && d.peer->has(layer, e)) continue;
+        if (tail > 0 && brank[q] >= tail) continue;
+        miss[nmiss++] = q;
+    }
+    // mode A: the plan's PCIe share is the last `mp` misses in that order - those first; then by best rank (ties: order)
+    int mp = (nmiss * d.pcie_num) >> 8;
+    static const bool pcie_min1 = [] { const char* v = std::getenv("STRATA_PCIE_MIN1"); return v && std::atoi(v) != 0; }();
+    if (pcie_min1 && mp < 1 && nmiss >= 2) mp = 1;
+    const bool mode_a = ql_prefetch_mode() == 0;
+    int order[128];
+    for (int j = 0; j < nmiss; ++j) order[j] = j;
+    auto key = [&](int j) { return (mode_a && j >= nmiss - mp ? 0 : 100) + brank[miss[j]]; };
+    std::stable_sort(order, order + nmiss, [&](int x, int y) { return key(x) < key(y); });
+    int got = 0;
+    for (int j = 0; j < nmiss && got < m && got < kQlPrefetchMax; ++j) {
+        const int32_t e = dist[miss[order[j]]];
+        if (!d.src->pinned(layer, e)) continue;
+        const uint8_t* b = d.src->blob(layer, e);
+        if (b == nullptr) continue;
+        ex[got] = e;
+        src[got] = b;
+        bytes[got] = (size_t) lay.expert_bytes(layer, e);
+        ++got;
+    }
+    ql_pf_add(&QlPfSum::issued, got);
+    for (int j = 0; j < got; ++j) { g_pf_req.issued_bytes += (double) bytes[j]; g_pf_all.issued_bytes += (double) bytes[j]; }
+    return got;
+}
+
+void ql_prefetch_set(int64_t layer, const int32_t* ex, const unsigned long long* ptr, int n) {
+    tl_pf_layer = n > 0 ? layer : -1;
+    tl_pf_n = std::min(n, kQlPrefetchMax);
+    for (int j = 0; j < tl_pf_n; ++j) { tl_pf_ex[j] = ex[j]; tl_pf_ptr[j] = ptr[j]; }
+}
+void ql_prefetch_late() { ql_pf_add(&QlPfSum::late, 1); }
+void ql_prefetch_verified(int ok, int bad) {
+    ql_pf_add(&QlPfSum::verify_ok, ok);
+    ql_pf_add(&QlPfSum::verify_bad, bad);
+    if (bad > 0) std::fprintf(stderr, "strata ql prefetch: VERIFY: %d slot(s) differ from their source\n", bad);
+}
+namespace {
+void ql_prefetch_used(size_t bytes) {
+    ql_pf_add(&QlPfSum::used, 1);
+    g_pf_req.used_bytes += (double) bytes;
+    g_pf_all.used_bytes += (double) bytes;
+}
+}  // namespace
+
 void ql_pred_begin(ExpertDispatch& d) {
+    if (ql_prefetch_stats_on()) g_pf_req = QlPfSum{};
     if (!ql_predict_stats_on()) return;
     d.ql_pred_live = true;
     d.ql_pred_req = ExpertDispatch::QlPredSum{};
@@ -6201,6 +6329,11 @@ void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, fl
 }
 
 void ql_pred_end(ExpertDispatch& d) {
+    if (ql_prefetch_stats_on() && g_pf_req.layers + g_pf_req.late > 0) {   // QuantLab (11/13) STRATA_QL_PREFETCH_STATS
+        ql_pf_print("request", g_pf_req);
+        ql_pf_print("total", g_pf_all);
+        g_pf_req = QlPfSum{};
+    }
     if (!ql_predict_stats_on() || !d.ql_pred_live) return;
     d.ql_pred_live = false;
     ql_pred_print("request", d.ql_pred_req);
@@ -6242,6 +6375,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
     static const bool ql_pred_on = ql_predict_stats_on();   // QuantLab (11/13) STRATA_QL_PREDICT_STATS
+    static const bool pf_on = ql_prefetch_m() > 0;           // QuantLab (11/13) STRATA_QL_PREFETCH
+    if (pf_on) tl_pf_d = &d;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
@@ -6327,6 +6462,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
+        // QuantLab (11/13) STRATA_QL_PREFETCH=m: the experts the verifier copied into prefetch slots for this layer (E0's
+        // guess).  Mode A: who is PCIe is decided as without it; a PCIe expert found there reads the slot and needs no
+        // DMA.  Mode B: the PCIe count m stays, the prefetched misses go first (all of them, past m too).
+        const bool pf_here = pf_on && P.pcie_mode == 0 && tl_pf_layer == d.layers && tl_pf_n > 0;
+        int pf_slot_of_q[64];
+        int pf_npf = 0, pf_rank = 0;   // mode B: prefetched misses of this layer; the rank among the other misses
+        auto pf_find = [&](int32_t e) {
+            for (int j = 0; j < tl_pf_n; ++j)
+                if (tl_pf_ex[j] == e) return j;
+            return -1;
+        };
+        if (pf_here && ql_prefetch_mode() == 1)
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (!skip_d[q] && e >= 0 && e < d.n_expert &&
+                    d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e) && pf_find(e) >= 0)
+                    ++pf_npf;
+            }
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -6351,12 +6505,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    bool to_pcie = miss_rank >= nmiss - m;
+                    if (pf_npf > 0) {   // STRATA_QL_PREFETCH_MODE=B: the prefetched first, then the last of the others
+                        if (pf_find(e) >= 0) to_pcie = true;
+                        else to_pcie = pf_rank++ >= (nmiss - pf_npf) - std::max(0, m - pf_npf);
+                    }
+                    if (to_pcie && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
+                            if (pf_here) pf_slot_of_q[fetches] = pf_find(e);
                             ++fetches;
                         }
                     }
@@ -6389,10 +6549,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
         size_t fsz[64];                           // QuantLab: a mixed layer's own blob sizes for the DMA copies
+        // QuantLab (11/13) STRATA_QL_PREFETCH: a prefetched PCIe expert reads its slot; the others are staged in order
+        const uint8_t* pf_dma[64];
+        size_t pf_fsz[64];
+        int pf_ndma = 0;
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
+            if (pf_here) {
+                const size_t own = (size_t) lay.expert_bytes(d.layers, ids[i0]);
+                if (pf_slot_of_q[q] >= 0) {
+                    P.ptr2[q] = tl_pf_ptr[pf_slot_of_q[q]];
+                    ql_prefetch_used(own);
+                } else {
+                    P.ptr2[q] = P.staging + (unsigned long long) pf_ndma * (unsigned long long) bb;
+                    pf_dma[pf_ndma] = dma_src[q];
+                    pf_fsz[pf_ndma] = own;
+                    ++pf_ndma;
+                }
+            }
             if (mixed) {   // QuantLab: the staged (or mapped) blob carries its K pair like a VRAM group (tq_mix.hpp)
                 if ((P.ptr2[q] & ~strata::kernels::kTqAddrMask) != 0) {
                     std::fprintf(stderr, "strata: a PCIe blob address 0x%llx has its top byte in use; per-expert K "
@@ -6421,9 +6597,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
-        P.fetch_sizes = mixed && fetches > 0 ? fsz : nullptr;   // QuantLab: read by the fetch call only
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        P.fetch_sizes = mixed && fetches > 0 ? (pf_here ? pf_fsz : fsz) : nullptr;   // QuantLab: read by the fetch call only
+        if (P.fetch) P.fetch(P.ctx, pf_here ? pf_dma : dma_src, P.pcie_mode != 0 ? 0 : (pf_here ? pf_ndma : fetches),
+                             (size_t) bb);   // the copy engine, beside the CPU's work
         P.fetch_sizes = nullptr;
+        if (pf_on) tl_pf_layer = -1;   // QuantLab (11/13) STRATA_QL_PREFETCH: this layer's slots are spoken for
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];

@@ -658,6 +658,17 @@ private:
     float* qe_lo_ = nullptr;     float* qe_rs_ = nullptr;     float* qe_inj_ = nullptr;
     float* h_qe_ = nullptr;      float* m_qe_ = nullptr;
     uint32_t* h_qe_flag_ = nullptr; uint32_t* m_qe_flag_ = nullptr;   ///< the last step whose early logits landed
+    // QuantLab (11/13) STRATA_QL_PREFETCH=m: the light early routing E0 on a side stream (the FFN-side read of the layer's
+    // entrance residual, the router, the device top-10), its ids in mapped memory with a landed flag (the step number),
+    // and m staging slots per token group the host copies the predicted PCIe experts into before the layer's plan
+    int pf_m_ = 0;
+    float* pf_mixed_ = nullptr; float* pf_xn_ = nullptr; float* pf_lo_ = nullptr; float* pf_rs_ = nullptr;
+    float* pf_inj_ = nullptr;   float* pf_logits_ = nullptr; float* pf_w_ = nullptr; int32_t* pf_ids_ = nullptr;
+    uint8_t* pf_slots_ = nullptr;                                     ///< 2 x m slots of max_blob bytes (group 0, group 1)
+    int32_t* h_pf_ids_ = nullptr; int32_t* m_pf_ids_ = nullptr;      ///< T * k
+    uint32_t* h_pf_flag_ = nullptr; uint32_t* m_pf_flag_ = nullptr;
+    cudaStream_t pf_cs_ = nullptr;
+    cudaEvent_t pf_fork_ = nullptr, pf_join_ = nullptr;
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;

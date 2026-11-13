@@ -741,6 +741,21 @@ int ql_predict_stats_level();
 /// lead_state: 1 the logits were seen landing lead_us before the doorbell, 2 already there when the host began waiting
 /// (lead_us: that wait, a lower bound), 0 not seen, -1 not measured (the pipelined path)
 void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior, int lead_state, double lead_us);
+/// QuantLab (11/13) STRATA_QL_PREFETCH=m (read once; 0 off): the verifier, once a layer's E0 ids (n_tok x k, rank order)
+/// have landed, asks for up to m experts to copy ahead (`ql_prefetch_pick`: outside VRAM and the peer, pinned in RAM,
+/// not tail-skipped by E0's ranks; mode A puts the ones the plan's rule would send over PCIe first), copies them into
+/// its prefetch slots and, right before the layer's pool call, names them with their slot addresses (`ql_prefetch_set`).
+/// The plan points a PCIe group of such an expert at its slot and skips its DMA.  `ql_prefetch_late`: E0 came after the
+/// doorbell.  Stats (STRATA_QL_PREFETCH_STATS=1) print with ql_pred_end.
+constexpr int kQlPrefetchMax = 8;
+int ql_prefetch_m();
+int ql_prefetch_mode();   ///< 0 A (STRATA_QL_PREFETCH_MODE unset), 1 B
+bool ql_prefetch_verify();
+int ql_prefetch_pick(int64_t layer, const int32_t* e0, int n_tok, int k, int m, int32_t* ex, const uint8_t** src,
+                     size_t* bytes);
+void ql_prefetch_set(int64_t layer, const int32_t* ex, const unsigned long long* ptr, int n);
+void ql_prefetch_late();
+void ql_prefetch_verified(int ok, int bad);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
