@@ -657,6 +657,7 @@ private:
     float* qe_logits_ = nullptr; float* qe_mixed_ = nullptr; float* qe_xn_ = nullptr;
     float* qe_lo_ = nullptr;     float* qe_rs_ = nullptr;     float* qe_inj_ = nullptr;
     float* h_qe_ = nullptr;      float* m_qe_ = nullptr;
+    uint32_t* h_qe_flag_ = nullptr; uint32_t* m_qe_flag_ = nullptr;   ///< the last step whose early logits landed
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;

@@ -653,6 +653,14 @@ struct ExpertDispatch {
         int64_t e_hit[2][3] = {}, e_waste[2][3] = {}, e_rmatch[2] = {};
         double e_hit_bytes[2][3] = {};
         int64_t e_band_hit[2][3][4] = {};
+        /// =2, E0 in detail: by its best rank over the window's tokens (0 = first), the experts outside VRAM and of those
+        /// the ones in A; the first m (1..4) of those by rank: hits and waste; PE (top k) against A's PCIe and CPU parts;
+        /// PE's waste that the tail skip dropped; the lead time from the E0 logits landing (host-seen) to the doorbell
+        int64_t e0_rank_out[16] = {}, e0_rank_used[16] = {};
+        int64_t e0_top_hit[4] = {}, e0_top_waste[4] = {};
+        int64_t e_a_pcie = 0, e_a_cpu = 0, e0_hit_pcie = 0, e0_hit_cpu = 0, e0_waste_skip = 0;
+        double lead_us = 0, lead_ready_us = 0;   ///< summed: seen during the wait; already there (the wait, a lower bound)
+        int64_t lead_n = 0, lead_ready = 0, lead_none = 0;   ///< seen during the wait / already there / not seen
     };
     bool ql_pred_live = false;
     int64_t ql_pred_words = 0, ql_pred_layers = 0;
@@ -730,7 +738,9 @@ void ql_pred_end(ExpertDispatch& d);
 /// =2 (the level, read once): the verifier also runs the early routing (verify.cpp) and, right before the pool call of
 /// `layer`, hands its logits (mapped, n_tok rows of n_expert each, E0 then E1) and the route prior's lambda here.
 int ql_predict_stats_level();
-void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior);
+/// lead_state: 1 the logits were seen landing lead_us before the doorbell, 2 already there when the host began waiting
+/// (lead_us: that wait, a lower bound), 0 not seen, -1 not measured (the pipelined path)
+void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior, int lead_state, double lead_us);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about

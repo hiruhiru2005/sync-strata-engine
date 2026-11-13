@@ -810,7 +810,7 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (hcount_d_) cudaFree(hcount_d_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_pids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_qe_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_qe_, h_qe_flag_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -947,8 +947,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
     // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing's logits per layer, read by the plan (expert_source.cpp)
+    // and the step whose E0 logits have landed (`h_qe_flag_`, the doorbell's step numbering), for the lead time
     if (ql_predict_stats_level() >= 2 &&
-        !mapped((size_t) g.n_layers * 2 * T * (size_t) g.n_expert * 4, (void**) &h_qe_, (void**) &m_qe_)) {
+        (!mapped((size_t) g.n_layers * 2 * T * (size_t) g.n_expert * 4, (void**) &h_qe_, (void**) &m_qe_) ||
+         !mapped(64, (void**) &h_qe_flag_, (void**) &m_qe_flag_))) {
         err = "verify: mapped early-routing allocation failed " + strata::core::pin_exhausted_hint();
         return false;
     }
@@ -1617,6 +1619,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             err = "verify ql predict: the early logits' copy failed";
                             return false;
                         }
+                    // the step's E0 and E1 logits have landed: the host notes when it sees this (the lead time)
+                    if (m_qe_flag_ != nullptr)
+                        strata::kernels::set_flag_on_stream(m_qe_flag_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
                 } catch (const std::exception& e) { err = "verify ql predict: " + std::string(e.what()); return false; }
             }
         }
@@ -3418,8 +3423,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         auto last_flush = a;
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
+        // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: when this step's early logits landed, as the host sees it (the lead
+        // time to the doorbell below); 2 = already there when the wait began, 1 = seen during it, 0 = not seen
+        volatile uint32_t* const qe_flag = h_qe_flag_;
+        if (qe_flag != nullptr && k == 0) *qe_flag = 0;   // the last window's value; a step-0 write before this is lost
+        int qe_state = qe_flag != nullptr && *qe_flag >= want ? 2 : 0;
+        Clock::time_point qe_t = a;
         while (*seq < want) {
             strata_cpu_pause();
+            if (qe_flag != nullptr && qe_state == 0 && *qe_flag >= want) { qe_state = 1; qe_t = Clock::now(); }
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -3457,6 +3469,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         strata_load_fence();   // the layer rang: the GPU's activations are read after it (a no-op on x86)
         const Clock::time_point b = Clock::now();
+        if (qe_flag != nullptr && qe_state == 0 && *qe_flag >= want) { qe_state = 1; qe_t = b; }
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
@@ -3472,7 +3485,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (h_qe_ != nullptr)   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: this layer's early routing, for the plan's counters
             ql_set_early(h_qe_ + ((size_t) l * 2 * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert,
                          h_qe_ + (((size_t) l * 2 + 1) * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert, n, l,
-                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f);
+                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f,
+                         qe_state, std::chrono::duration<double, std::micro>(b - qe_t).count());
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -5317,7 +5331,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         if (h_qe_ != nullptr)   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: this layer's early routing, for the plan's counters
             ql_set_early(h_qe_ + ((size_t) l * 2 * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert,
                          h_qe_ + (((size_t) l * 2 + 1) * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert, n, l,
-                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f);
+                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f, -1, 0.0);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

@@ -5881,6 +5881,8 @@ thread_local const float* tl_early[2] = {nullptr, nullptr};
 thread_local int tl_early_n = 0;
 thread_local int64_t tl_early_layer = -1;
 thread_local float tl_early_prior = 0.0f;
+thread_local int tl_lead_state = -1;
+thread_local double tl_lead_us = 0;
 
 // one layer-window: kind[] as the dispatch planned it (-2 tail-skipped, -1 CPU, 0 VRAM, 1 PCIe, 2 peer / helper GPU),
 // nfile = the CPU experts whose blob was still to be read from the files (STRATA_COLD_OVERLAP != 0; else 0)
@@ -5890,6 +5892,8 @@ void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n_to
     const int64_t W = (d.n_expert + 63) / 64;
     const bool early = tl_early_layer == L && tl_early[0] != nullptr && tl_early_n == (int) n_tok;
     tl_early_layer = -1;
+    const int lead_state = tl_lead_state;
+    tl_lead_state = -1;
     if (L < 0 || W <= 0 || W > kQlPredMaxWords || d.host_res == nullptr) return;
     if (d.ql_pred_words != W) {
         d.ql_pred_words = W;
@@ -5906,16 +5910,18 @@ void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n_to
     }
     const int32_t* res = d.host_res + (size_t) L * (size_t) d.n_expert;
     uint64_t a[kQlPredMaxWords] = {}, u[kQlPredMaxWords] = {};
+    uint64_t a_pcie[kQlPredMaxWords] = {}, skipped[kQlPredMaxWords] = {};   // A's PCIe part; the tail skip's experts
     int na = 0, npcie = 0, ncpu = 0;
     for (int64_t i = 0; i < n; ++i) {
         const int32_t e = ids[i];
-        if (e < 0 || e >= d.n_expert || kind[i] == -2) continue;
+        if (e < 0 || e >= d.n_expert) continue;
         const uint64_t b = 1ull << (e & 63);
+        if (kind[i] == -2) { skipped[e >> 6] |= b; continue; }
         u[e >> 6] |= b;
         if ((kind[i] == -1 || kind[i] == 1) && (a[e >> 6] & b) == 0) {
             a[e >> 6] |= b;
             ++na;
-            if (kind[i] == 1) ++npcie; else ++ncpu;
+            if (kind[i] == 1) { ++npcie; a_pcie[e >> 6] |= b; } else ++ncpu;
         }
     }
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
@@ -5995,6 +6001,12 @@ void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n_to
     int e_hit[2][3] = {}, e_waste[2][3] = {};
     double e_hit_bytes[2][3] = {};
     int64_t rmatch[2] = {};
+    // E0 in detail: each expert's best rank over the window's tokens (the touched entries only are reset)
+    int8_t brank[1024];
+    int32_t touched[kQlEarlyMaxRank * 16];
+    int ntouched = 0;
+    int64_t r_out[kQlEarlyMaxRank] = {}, r_used[kQlEarlyMaxRank] = {}, top_hit[4] = {}, top_waste[4] = {};
+    int hit_pcie = 0, hit_cpu = 0, waste_skip = 0;
     for (int v = 0; v < 2; ++v) {
         if (tl_early[v] == nullptr) continue;
         uint64_t pe[3][kQlPredMaxWords] = {};
@@ -6014,6 +6026,14 @@ void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n_to
             for (int r = 0; r < m; ++r) {
                 const int wd = r < k ? 0 : r < k + 2 ? 1 : 2;
                 for (int x = wd; x < 3; ++x) pe[x][top[r] >> 6] |= 1ull << (top[r] & 63);
+                if (v == 0 && d.n_expert <= 1024) {
+                    const int e = top[r];
+                    bool seen = false;
+                    for (int q = 0; q < ntouched; ++q)
+                        if (touched[q] == e) { seen = true; break; }
+                    if (!seen && ntouched < (int) (sizeof touched / sizeof touched[0])) { touched[ntouched++] = e; brank[e] = (int8_t) r; }
+                    else if (seen && r < brank[e]) brank[e] = (int8_t) r;
+                }
             }
             for (int64_t j = 0; j < k; ++j) {   // the routing itself: the true top k against the early top k
                 const int32_t e = ids[t * k + j];
@@ -6025,6 +6045,34 @@ void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n_to
             drop_resident(pe[x]);
             score(pe[x], e_hit[v][x], e_waste[v][x], e_hit_bytes[v][x]);
         }
+        if (v != 0) continue;
+        for (int64_t w = 0; w < W; ++w) {   // PE (top k) against A's PCIe / CPU parts; its waste the tail skip dropped
+            hit_pcie += __builtin_popcountll(pe[0][w] & a_pcie[w]);
+            hit_cpu += __builtin_popcountll(pe[0][w] & a[w] & ~a_pcie[w]);
+            waste_skip += __builtin_popcountll(pe[0][w] & ~a[w] & skipped[w]);
+        }
+        // by best rank: the experts outside VRAM, those in A; then the first m by rank (ties: the lower id)
+        int order[kQlEarlyMaxRank * 16];
+        int no = 0;
+        for (int q = 0; q < ntouched; ++q) {
+            const int e = touched[q];
+            if (res[e] >= 0) continue;
+            const bool in_a = (a[e >> 6] & (1ull << (e & 63))) != 0;
+            ++r_out[brank[e]];
+            if (in_a) ++r_used[brank[e]];
+            int j = no++;
+            while (j > 0 && (brank[order[j - 1]] > brank[e] || (brank[order[j - 1]] == brank[e] && order[j - 1] > e))) {
+                order[j] = order[j - 1];
+                --j;
+            }
+            order[j] = e;
+        }
+        int h = 0;
+        for (int mm = 0; mm < 4; ++mm) {
+            if (mm < no) h += (a[order[mm] >> 6] & (1ull << (order[mm] & 63))) != 0;
+            top_hit[mm] += h;
+            top_waste[mm] += std::min(mm + 1, no) - h;
+        }
     }
     for (ExpertDispatch::QlPredSum* s : {&d.ql_pred_req, &d.ql_pred_all}) {
         ++s->e_lw;
@@ -6032,6 +6080,28 @@ void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n_to
         s->e_a_bytes += a_bytes;
         s->e_band_a[band] += na;
         s->e_rtot += n_tok * k;
+        for (int r = 0; r < kQlEarlyMaxRank; ++r) {
+            s->e0_rank_out[r] += r_out[r];
+            s->e0_rank_used[r] += r_used[r];
+        }
+        for (int mm = 0; mm < 4; ++mm) {
+            s->e0_top_hit[mm] += top_hit[mm];
+            s->e0_top_waste[mm] += top_waste[mm];
+        }
+        s->e_a_pcie += npcie;
+        s->e_a_cpu += ncpu;
+        s->e0_hit_pcie += hit_pcie;
+        s->e0_hit_cpu += hit_cpu;
+        s->e0_waste_skip += waste_skip;
+        if (lead_state == 1) {
+            s->lead_us += tl_lead_us;
+            ++s->lead_n;
+        } else if (lead_state == 2) {
+            s->lead_ready_us += tl_lead_us;
+            ++s->lead_ready;
+        } else if (lead_state == 0) {
+            ++s->lead_none;
+        }
         for (int v = 0; v < 2; ++v) {
             s->e_rmatch[v] += rmatch[v];
             for (int x = 0; x < 3; ++x) {
@@ -6093,10 +6163,36 @@ void ql_pred_print(const char* what, const ExpertDispatch::QlPredSum& s) {
     }
     line.pop_back();
     std::fprintf(stderr, "%s\n", line.c_str());
+    // E0 in detail
+    line.clear();
+    std::snprintf(b, sizeof b, "strata ql predict: %s E0 by best rank (outside VRAM/used):", what);
+    line += b;
+    for (int r = 0; r < kQlEarlyMaxRank; ++r) {
+        if (s.e0_rank_out[r] == 0) continue;
+        std::snprintf(b, sizeof b, " r%d %.2f/%.2f", r + 1, (double) s.e0_rank_out[r] / lw, (double) s.e0_rank_used[r] / lw);
+        line += b;
+    }
+    line += "; first m by rank:";
+    for (int mm = 0; mm < 4; ++mm) {
+        std::snprintf(b, sizeof b, " m%d hit %.2f waste %.2f (%.1f%% of A)", mm + 1, (double) s.e0_top_hit[mm] / lw,
+                      (double) s.e0_top_waste[mm] / lw, pct((double) s.e0_top_hit[mm], (double) s.e_a));
+        line += b;
+    }
+    std::snprintf(b, sizeof b, "; PE hit PCIe %.1f%% CPU %.1f%%; PE waste tail-skipped %.2f/layer-window", pct((double) s.e0_hit_pcie,
+                  (double) s.e_a_pcie), pct((double) s.e0_hit_cpu, (double) s.e_a_cpu), (double) s.e0_waste_skip / lw);
+    line += b;
+    std::snprintf(b, sizeof b, "; lead to the doorbell: %lld seen, avg %.1f us; %lld already there (wait avg %.1f us, a lower "
+                               "bound); %lld not seen",
+                  (long long) s.lead_n, s.lead_n > 0 ? s.lead_us / (double) s.lead_n : 0.0, (long long) s.lead_ready,
+                  s.lead_ready > 0 ? s.lead_ready_us / (double) s.lead_ready : 0.0, (long long) s.lead_none);
+    line += b;
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 }  // namespace
 
-void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior) {
+void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior, int lead_state, double lead_us) {
+    tl_lead_state = lead_state;
+    tl_lead_us = lead_us;
     tl_early[0] = e0;
     tl_early[1] = e1;
     tl_early_n = n_tok;
