@@ -2137,6 +2137,73 @@ __global__ void native_mmvq_il_pf_kernel(const typename I::F::Block* __restrict_
     }
 }
 
+// QuantLab (11/13) STRATA_QL_MMVQ_T (pf 7): native_mmvq_il_kernel's loop (a chunk's loads behind its own branch, no
+// register sets held across chunks) with the traits' P1 loads (loadr: the block's bytes at immediates off one pointer
+// set), P2's exact integer forms (applyr<FAST>: i2f_small in place of the int -> float conversions) and 8 blocks a SM
+// (64 registers, no spill at 2-4 columns): at 3-4 columns the plain kernel's 72-96 registers left 5-7 blocks a SM and
+// its conversions bound the issue.  The same per-lane order (acc[v] += block(4m + v), ((acc0 + acc1) + acc2) + acc3,
+// warp_sum): bitwise native_mmvq_il_kernel's output (mmvq_t_bench).  The same loop at 1 block a SM (no bound) measured
+// 0.5-2 us slower at 3-4 columns, and with the exact (non-FAST) forms 1-2 us slower.
+template <typename I, int NC, int R>
+__launch_bounds__(4 * WARP, 8)
+__global__ void native_mmvq_il_f_kernel(const typename I::F::Block* __restrict__ w, const int* __restrict__ xq,
+                                        const float* __restrict__ xd, float* __restrict__ y, int n_in, int n_out) {
+    using F = typename I::F;
+    constexpr int SUB = WARP / F::T;
+    const int lane = int(threadIdx.x) & (WARP - 1);
+    const auto x = q8_1_cols<NC, I::PM>(xq, xd, n_in / Q8K);
+    using X = std::remove_const_t<decltype(x)>;
+    const int bpr = n_in / F::DIV;
+    const int kqs = F::kqs(lane);
+    const int sub = lane / F::T;
+    const int nm = (bpr + SUB - 1) / SUB;
+    for (int grp = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); grp * R < n_out; grp += int(gridDim.x) * 4) {
+        const int row0 = grp * R;
+        typename I::RP wr[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) wr[i] = I::rowptrs(w + std::size_t(min(row0 + i, n_out - 1)) * bpr, kqs);
+        float acc[4][R][NC];
+#pragma unroll
+        for (int v = 0; v < 4; ++v)
+#pragma unroll
+            for (int i = 0; i < R; ++i)
+#pragma unroll
+                for (int c = 0; c < NC; ++c) acc[v][i][c] = 0.0f;
+        const int* xq0 = x.qbase(I::xb(kqs) + sub * F::KBY, I::xp(kqs));
+        const float* xd0 = x.dbase(I::xb(kqs) + sub * F::KBY);
+        for (int m0 = 0; m0 < nm; m0 += 4) {
+            const int* qg = static_cast<const int*>(madw(xq0, SUB * m0 * F::KBY, X::QB * 4));
+            const float* dg = static_cast<const float*>(madw(xd0, SUB * m0 * F::KBY, X::DB * 4));
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const int kbx = SUB * (m0 + v) + sub;
+                if (kbx < bpr) {
+#pragma unroll
+                    for (int i = 0; i < R; ++i) {
+                        const typename I::WR wv = I::loadr(I::at(wr[i], kbx), 0);
+                        float o[NC];
+                        I::template applyr<NC, true>(wv, x, qg + v * SUB * F::KBY * X::QB, dg + v * SUB * F::KBY * X::DB,
+                                                     kbx * F::KBY, kqs, o);
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) acc[v][i][c] += o[c];
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < R; ++i)
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                float s = acc[0][i][c];
+                s += acc[1][i][c];
+                s += acc[2][i][c];
+                s += acc[3][i][c];
+                s = warp_sum(s);
+                if (lane == 0 && row0 + i < n_out) y[std::size_t(c) * n_out + row0 + i] = s;
+            }
+    }
+}
+
 template <typename I, int NC, int R>
 __launch_bounds__(4 * WARP)
 __global__ void native_mmvq_il_kernel(const typename I::F::Block* __restrict__ w, const int* __restrict__ xq,
@@ -2198,9 +2265,23 @@ int il_pf_env() {
 int il_pf_table(int type, int ncols, int n_out);   // the sm_80 table below: pf << 4 | rows, 0 = today's kernel and table
 // the variant of one launch (g_il_pf, else STRATA_MMVQ_IL_PF: 0 / unset today's kernel, 1 the measured table, 2-6 that
 // variant for every type and shape), and with the table its rows a warp (0: the rows table's)
+int il_cc();
+// QuantLab (11/13) STRATA_QL_MMVQ_T=1: on sm_86 the Q4_K / Q5_K projections of 6144+ rows (GDN qkv and gate, the
+// attention's queries) at 2-4 columns take native_mmvq_il_f_kernel (pf 7) at one row a warp: mmvq_t_bench on an RTX
+// 3080 (cold weights), qkv 2560 -> 10240 T=2/3/4 30.7/32.2/40.4 -> 26.9/30.4/33.9 us, q 2560 -> 12288 35.8/37.9/40.8 ->
+// 31.6/35.4/39.2 us, gate (Q4_K 6144) 17.0/19.2/21.5 -> 16.1/18.9/20.7 us; bitwise the table's kernel.  The output
+// projections (2560 rows, 6144 inputs) were slower with it and keep the table
+bool ql_mmvq_t_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_MMVQ_T"); return v && v[0] == '1'; }();
+    return on;
+}
 int il_pf_for(int type, int ncols, int n_out, int* rows) {
     *rows = 0;
     if (g_il_pf >= 0) return g_il_pf;
+    if (ql_mmvq_t_on() && (type == 12 || type == 13) && ncols >= 2 && ncols <= 4 && n_out >= 6144 && il_cc() == 86) {
+        *rows = 1;
+        return 7;
+    }
     const int env = il_pf_env();
     if (env != 1) return env;
     const int t = il_pf_table(type, ncols, n_out);
@@ -2218,6 +2299,7 @@ void launch_il_one(unsigned blocks, const typename I::F::Block* w, const int* xq
         case 3: native_mmvq_il_pf_kernel<I, NC, R, 0, 4, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
         case 4: native_mmvq_il_pf_kernel<I, NC, R, 0, 5, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
         case 5: native_mmvq_il_pf_kernel<I, NC, R, 2, 5, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
+        case 7: native_mmvq_il_f_kernel<I, NC, R><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;   // STRATA_QL_MMVQ_T
         default: break;
         }
     }
@@ -3391,6 +3473,44 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
     else
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
+}
+
+// QuantLab (11/13) STRATA_QL_MMVQ_PAIR: two K-quant matrices of one type and shape on one input (the attention's keys and
+// values) in ONE launch - blocks n_out.. take w2's rows (native_mmvq_multi_kernel's PAIR), each block the exact layout at
+// one row a block, so every output is bitwise its own native_mmvq call (b6_mmvq_rows / the multi kernel / at one column
+// native_q5_k_mmvq: one layout, one sum order).  False (nothing launched) where that is not the case.
+template<typename F, int NCOLS>
+void kq_pair_launch(const void* w1, const void* w2, const Q81Block* x, float* y1, float* y2, int n_in, int n_out,
+                    cudaStream_t s) {
+    native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), dim3(WARP, WARPS), 0, s>>>(
+        static_cast<const typename F::Block*>(w1), x, y1, n_in, n_out, static_cast<const typename F::Block*>(w2), y2);
+}
+template<typename F>
+void kq_pair_n(const void* w1, const void* w2, const Q81Block* x, float* y1, float* y2, int n_in, int n_out, int ncols,
+               cudaStream_t s) {
+    switch (ncols) {
+        case 1: kq_pair_launch<F, 1>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+        case 2: kq_pair_launch<F, 2>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+        case 3: kq_pair_launch<F, 3>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+        case 4: kq_pair_launch<F, 4>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+        case 5: kq_pair_launch<F, 5>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+        case 6: kq_pair_launch<F, 6>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+        case 7: kq_pair_launch<F, 7>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+        default: kq_pair_launch<F, 8>(w1, w2, x, y1, y2, n_in, n_out, s); break;
+    }
+}
+bool native_mmvq_pair_kq(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                         int n_in, int n_out, int ncols, void* stream) {
+    if ((ggml_type != 12 && ggml_type != 13) || !g_multi_exact || s26_tsum_on() || ncols < 1 || ncols > 8 ||
+        n_out <= 0 || n_in <= 0 || n_in % QK != 0 || n_in / QK < Q5KTraits::BPI || !w1 || !w2 || !x_q8_1 || !y1 ||
+        !y2 || !stream)
+        return false;
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    if (ggml_type == 13) kq_pair_n<Q5KTraits>(w1, w2, x, y1, y2, n_in, n_out, ncols, s);
+    else kq_pair_n<Q4KTraits>(w1, w2, x, y1, y2, n_in, n_out, ncols, s);
+    launch_check();
+    return true;
 }
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

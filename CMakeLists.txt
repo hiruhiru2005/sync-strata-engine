@@ -2436,6 +2436,11 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(tq_mix_parity PRIVATE ${_strata_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
     target_link_libraries(tq_mix_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
     # QuantLab (11/13): STRATA_QL_FUSE_HADQ / STRATA_QL_FUSE_HITS's folded launches against the launches they replace
+    # QuantLab (11/13): STRATA_QL_MMVQ_T - the token-mixing projections' kernels at the engine's shapes, byte for byte and
+    # timed against today's (native_mmvq_il's table) with cold weights
+    add_executable(mmvq_t_bench tests/cuda/mmvq_t_bench.cpp)
+    target_include_directories(mmvq_t_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(mmvq_t_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_executable(ql_fuse_parity_test tests/cuda/ql_fuse_parity_test.cpp)
     target_include_directories(ql_fuse_parity_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(ql_fuse_parity_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
