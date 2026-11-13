@@ -933,6 +933,24 @@ public:
     /// #286, unbuffered: assembles the blobs of these pairs ahead of the `blob` calls that will ask for them (the
     /// GPU cache's fill from the profile) - one batch of reads instead of one blob at a time.  At most 64 pairs.
     void prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n);
+    /// QuantLab 11/13 STRATA_QL_REFILL_PAR: what `refill_read_ahead` read (the blobs only the file holds).
+    struct RefillReadStats {
+        uint64_t reads = 0, bytes = 0;   ///< blobs read into stage buffers by the read-ahead, and their bytes
+        double span_ms = 0;              ///< first read's start to the last read's end
+    };
+    /// QuantLab 11/13 STRATA_QL_REFILL_PAR=<depth>: the lent slots' refill reads ahead, on `depth` threads, the blobs of
+    /// `idx[0..n)` (layer * n_expert + expert, in the order the caller will ask for them) that only the file holds, into
+    /// stage buffers - the same claim_stage / fill_stage a `blob()` call would do, so the caller's blob_stable() of such a
+    /// pair finds it staged (or waits for the read in flight).  Never more than `ahead` pairs past `consumed` (the pairs
+    /// the caller has taken), so a buffer read ahead is not recycled (256 claims) before it is used.  Returns when every
+    /// pair has been claimed or skipped, or `stop` is set.  Unbuffered (O_DIRECT) file tier only; otherwise does nothing.
+    void refill_read_ahead(const int32_t* idx, size_t n, int depth, const std::atomic<size_t>& consumed, size_t ahead,
+                           const std::atomic<bool>& stop, RefillReadStats& st);
+    /// QuantLab 11/13 STRATA_QL_REFILL_VERIFY: the blob read from the file again (unbuffered, into `dst`, blob_len bytes),
+    /// never through a stage buffer or the RAM copy.  False when it cannot be read.
+    bool read_blob_fresh(int64_t layer, int64_t expert, uint8_t* dst) const { return copy_from_files(layer, expert, dst); }
+    /// QuantLab 11/13: the bytes of this expert's blob (its own size, v6)
+    uint64_t refill_blob_bytes(int64_t layer, int64_t expert) const { return blob_len(layer, expert); }
     /// Mapped reads: asks the OS for these pairs' blobs ahead (platform::advise_willneed).  False when unbuffered,
     /// when read-ahead is off, or before `open`.
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
