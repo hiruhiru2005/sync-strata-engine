@@ -2376,7 +2376,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs,
+                                     mapped_wide() ? (uint32_t) ((l - lb_) * G + grp + 1) : 0u);   // QuantLab (11/13)
             }
             if (sh_fork_late) {
                 note_prio_fork(cs);

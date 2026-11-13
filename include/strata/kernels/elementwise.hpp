@@ -122,8 +122,11 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
                             void* stream);
+/// `value` != 0 (QuantLab 11/13, STRATA_QL_MAPPED_WIDE=1): the ring is stored as that number instead of incremented.
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
-                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream);
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream, uint32_t value = 0);
+/// STRATA_QL_MAPPED_WIDE=1 (read once): the copies from mapped host memory take one round over PCIe.
+bool mapped_wide();
 /// SYCL: publishes launched or recorded while `on` store the payload with plain stores instead of uncached ones, for
 /// a caller that reads the payload only after the publishing kernel has ended (the stepped verify window).
 void doorbell_plain_payload(bool on);

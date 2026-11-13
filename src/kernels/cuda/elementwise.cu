@@ -276,6 +276,13 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
     }
     scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
 }
+// QuantLab (11/13) STRATA_QL_MAPPED_WIDE=1: one float4 a thread (640 for a row of 2560), so the row is one round over
+// PCIe instead of five; 128 threads otherwise, as before
+static unsigned rows_threads(int64_t row4) {
+    if (!mapped_wide()) return 128u;
+    const int64_t t = (row4 + 31) / 32 * 32;
+    return (unsigned) (t < 128 ? 128 : t > 1024 ? 1024 : t);
+}
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream) {
     if (rows <= 0) return;
@@ -283,8 +290,8 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
         std::fprintf(stderr, "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned\n");
         std::exit(1);
     }
-    copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
-                                                                                  width / 4, hit_rows, count);
+    copy_rows_from_mapped_kernel<<<(unsigned) rows, rows_threads(width / 4), 0, (cudaStream_t) stream>>>(
+        (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count);
 }
 void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* dst, const float* src, int64_t rows,
                                  int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream) {
@@ -293,7 +300,7 @@ void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* ds
         std::fprintf(stderr, "copy_rows_from_mapped_after: width must be a multiple of 4 and both pointers 16-byte aligned\n");
         std::exit(1);
     }
-    copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
+    copy_rows_from_mapped_kernel<<<(unsigned) rows, rows_threads(width / 4), 0, (cudaStream_t) stream>>>(
         (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, (const volatile uint32_t*) flag, value);
 }
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
@@ -328,7 +335,7 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
 
 __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                             const int32_t* __restrict__ d_res, int n_expert, int n, int k,
-                                            float* x_out, int32_t* ids_out, uint32_t* seq) {
+                                            float* x_out, int32_t* ids_out, uint32_t* seq, uint32_t value) {
     int any_miss = 0;
     if ((int) threadIdx.x < k) {
         const int32_t id = ids[threadIdx.x];
@@ -343,7 +350,9 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        // QuantLab (11/13) STRATA_QL_MAPPED_WIDE=1: value != 0 is the step's own ring number (known at capture) - one store,
+        // no read of host memory over PCIe; the steps publish in order from 0, so it is the number the increment writes
+        *(volatile uint32_t*) seq = value != 0u ? value : *(volatile uint32_t*) seq + 1u;
 #if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
         __threadfence_system();
 #endif
@@ -383,15 +392,27 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 }
 
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
-                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream, uint32_t value) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
     doorbell_publish_res_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, d_res, n_expert, (int) n, (int) k,
-                                                                        x_out, ids_out, d_seq);
+                                                                        x_out, ids_out, d_seq, value);
     check_launch("doorbell_publish_res");
 }
 
 __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+// QuantLab (11/13) STRATA_QL_MAPPED_WIDE=1: a read of mapped host memory is a round trip over PCIe, and a thread's reads
+// go one after another (the plan's ~500 words on 128 threads: 4-5 rounds, 7-13 us a layer in the nsys trace against
+// 1.6-1.8 us for a copy of one round).  One element a thread, so every read is in flight at once.  The same words to the
+// same places: nothing computed changes.
+__global__ void copy_i32_from_mapped_wide_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
+    const int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+bool mapped_wide() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_MAPPED_WIDE"); return v != nullptr && v[0] == '1'; }();
+    return on;
 }
 
 #if !defined(__HIPCC__)
@@ -429,6 +450,12 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
+    if (mapped_wide() && n > 128) {   // QuantLab (11/13): one round over PCIe (see the kernel)
+        copy_i32_from_mapped_wide_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+            dst, (const volatile int32_t*) src, (int) n);
+        check_launch("copy_i32_from_mapped (wide)");
+        return;
+    }
     copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
 }
