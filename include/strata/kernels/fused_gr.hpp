@@ -67,6 +67,10 @@ void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks
 bool fused_gr_q8_split(uint8_t* q8, int64_t n_blocks, void* stream);
 void fused_gr_set_q8_i8(int on);
 int fused_gr_q8_i8();
+/// QuantLab (11/13) STRATA_QL_HC_BW=1|2 (CUDA; default off): the int8 read above, bitwise the same outputs, with its
+/// loads hoisted (=1; STRATA_QL_HC_BW_UPW=1|2|4|8 warps an up block) or down and up as one kernel (=2).  The bench's
+/// switch: mode -1 = the environment, up_warps 0 = STRATA_QL_HC_BW_UPW.
+void fused_gr_set_hc_bw(int mode, int up_warps = 0);
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four
