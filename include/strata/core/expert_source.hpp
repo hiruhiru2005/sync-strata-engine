@@ -631,6 +631,43 @@ struct ExpertDispatch {
     std::vector<double> ql_lrun;
     std::vector<int64_t> ql_ljobs, ql_lwin;
     int64_t ql_nt[9] = {};
+    /// QuantLab (11/13) STRATA_QL_PREDICT_STATS=1: how well the earlier windows name the experts a decode window needs
+    /// from outside VRAM (A = the distinct experts of a layer-window computed on the CPU or read over PCIe; the tail
+    /// skip's are not in it).  Predictors: P1 = A of the last window at this layer, P2 / P4 = the union over the last
+    /// 2 / 4, Q1 = every expert the last window used at this layer (VRAM ones included); each minus what is resident
+    /// now.  A request's first window per layer has no prediction and is left out.  `ql_pred_live` is set by the
+    /// decode loop only (the prompt's windows are not counted); host-side counting, no effect on the output.
+    struct QlPredSum {
+        int64_t windows = 0, lw = 0;                 ///< windows (layer 0) and layer-windows scored
+        int64_t a = 0, pcie = 0, cpu = 0, file = 0;  ///< |A| summed; by kind; file: CPU ones read from the files
+        double a_bytes = 0;
+        int64_t hit[4] = {}, waste[4] = {};
+        double hit_bytes[4] = {};
+        int64_t band_a[4] = {}, band_hit[4][4] = {};   ///< layers 0-11, 12-23, 24-35, 36+; [band][predictor]
+        /// =2: the early routing (E0, E1) over every decode layer-window it reached (the first window too): A again
+        /// (its own denominators), [E][top k, k + 2, k + 4] hits / waste / hit bytes / band hits, and the routing's
+        /// own agreement (the true top-k entries found in the same token's early top k, over all entries)
+        int64_t e_lw = 0, e_a = 0, e_rtot = 0;
+        double e_a_bytes = 0;
+        int64_t e_band_a[4] = {};
+        int64_t e_hit[2][3] = {}, e_waste[2][3] = {}, e_rmatch[2] = {};
+        double e_hit_bytes[2][3] = {};
+        int64_t e_band_hit[2][3][4] = {};
+        /// =2, E0 in detail: by its best rank over the window's tokens (0 = first), the experts outside VRAM and of those
+        /// the ones in A; the first m (1..4) of those by rank: hits and waste; PE (top k) against A's PCIe and CPU parts;
+        /// PE's waste that the tail skip dropped; the lead time from the E0 logits landing (host-seen) to the doorbell
+        int64_t e0_rank_out[16] = {}, e0_rank_used[16] = {};
+        int64_t e0_top_hit[4] = {}, e0_top_waste[4] = {};
+        int64_t e_a_pcie = 0, e_a_cpu = 0, e0_hit_pcie = 0, e0_hit_cpu = 0, e0_waste_skip = 0;
+        double lead_us = 0, lead_ready_us = 0;   ///< summed: seen during the wait; already there (the wait, a lower bound)
+        int64_t lead_n = 0, lead_ready = 0, lead_none = 0;   ///< seen during the wait / already there / not seen
+    };
+    bool ql_pred_live = false;
+    int64_t ql_pred_words = 0, ql_pred_layers = 0;
+    std::vector<uint64_t> ql_pred_hist;   ///< [layer][4 slots][words]: A of the last 4 windows (slot = window % 4)
+    std::vector<uint64_t> ql_pred_used;   ///< [layer][words]: every expert the last window used (not tail-skipped)
+    std::vector<int64_t> ql_pred_nwin;    ///< per layer: windows seen in this request
+    QlPredSum ql_pred_req, ql_pred_all;
     /// 149-cold STRATA_COLD_OVERLAP: 0 off (the CPU starts once every blob of the layer is read), 1 the blobs that
     /// must be read are read in the background while the pool computes the ready experts, each landed one computed
     /// as it lands; 2 measure only (read everything first, then the ready experts, then the read ones, timed apart).
@@ -691,6 +728,34 @@ void set_tail_skip_rank(int r);
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
+
+/// QuantLab (11/13) STRATA_QL_PREDICT_STATS=1 (read once): on.  `ql_pred_begin` starts a request's decode (the
+/// history and the request's sums cleared, counting on); `ql_pred_end` stops counting and prints the request's line
+/// and the process's line (`strata ql predict: ...`) to stderr.  Both do nothing when off.
+bool ql_predict_stats_on();
+void ql_pred_begin(ExpertDispatch& d);
+void ql_pred_end(ExpertDispatch& d);
+/// =2 (the level, read once): the verifier also runs the early routing (verify.cpp) and, right before the pool call of
+/// `layer`, hands its logits (mapped, n_tok rows of n_expert each, E0 then E1) and the route prior's lambda here.
+int ql_predict_stats_level();
+/// lead_state: 1 the logits were seen landing lead_us before the doorbell, 2 already there when the host began waiting
+/// (lead_us: that wait, a lower bound), 0 not seen, -1 not measured (the pipelined path)
+void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior, int lead_state, double lead_us);
+/// QuantLab (11/13) STRATA_QL_PREFETCH=m (read once; 0 off): the verifier, once a layer's E0 ids (n_tok x k, rank order)
+/// have landed, asks for up to m experts to copy ahead (`ql_prefetch_pick`: outside VRAM and the peer, pinned in RAM,
+/// not tail-skipped by E0's ranks; mode A puts the ones the plan's rule would send over PCIe first), copies them into
+/// its prefetch slots and, right before the layer's pool call, names them with their slot addresses (`ql_prefetch_set`).
+/// The plan points a PCIe group of such an expert at its slot and skips its DMA.  `ql_prefetch_late`: E0 came after the
+/// doorbell.  Stats (STRATA_QL_PREFETCH_STATS=1) print with ql_pred_end.
+constexpr int kQlPrefetchMax = 8;
+int ql_prefetch_m();
+int ql_prefetch_mode();   ///< 0 A (STRATA_QL_PREFETCH_MODE unset), 1 B
+bool ql_prefetch_verify();
+int ql_prefetch_pick(int64_t layer, const int32_t* e0, int n_tok, int k, int m, int32_t* ex, const uint8_t** src,
+                     size_t* bytes);
+void ql_prefetch_set(int64_t layer, const int32_t* ex, const unsigned long long* ptr, int n);
+void ql_prefetch_late();
+void ql_prefetch_verified(int ok, int bad);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about

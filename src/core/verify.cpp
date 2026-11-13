@@ -791,6 +791,9 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (pf_cs_) { cudaStreamSynchronize(pf_cs_); cudaStreamDestroy(pf_cs_); }   // QuantLab (11/13) STRATA_QL_PREFETCH
+    for (cudaEvent_t e : {pf_fork_, pf_join_})
+        if (e) cudaEventDestroy(e);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
@@ -810,7 +813,7 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (hcount_d_) cudaFree(hcount_d_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_pids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_qe_, h_qe_flag_, h_pf_ids_, h_pf_flag_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -946,6 +949,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
+    // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing's logits per layer, read by the plan (expert_source.cpp)
+    // and the step whose E0 logits have landed (`h_qe_flag_`, the doorbell's step numbering), for the lead time
+    if (ql_predict_stats_level() >= 2 &&
+        (!mapped((size_t) g.n_layers * 2 * T * (size_t) g.n_expert * 4, (void**) &h_qe_, (void**) &m_qe_) ||
+         !mapped(64, (void**) &h_qe_flag_, (void**) &m_qe_flag_))) {
+        err = "verify: mapped early-routing allocation failed " + strata::core::pin_exhausted_hint();
+        return false;
+    }
+    if (h_qe_flag_ != nullptr) *(volatile uint32_t*) h_qe_flag_ = 0;
+    // QuantLab (11/13) STRATA_QL_PREFETCH=m: E0's ids and its landed flag (mapped)
+    pf_m_ = ql_prefetch_m();
+    if (pf_m_ > 0 && (!mapped(T * K * 4, (void**) &h_pf_ids_, (void**) &m_pf_ids_) ||
+                      !mapped(64, (void**) &h_pf_flag_, (void**) &m_pf_flag_))) {
+        err = "verify: mapped prefetch allocation failed " + strata::core::pin_exhausted_hint();
+        return false;
+    }
+    if (h_pf_flag_ != nullptr) *(volatile uint32_t*) h_pf_flag_ = 0;
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
     if (tap_path != nullptr && tap_path[0] == '\0') tap_path = nullptr;
@@ -1051,6 +1071,17 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         plogits_ = b.take<float>(T * (uint64_t) g.n_expert); pw_ = b.take<float>(T * K); pids_ = b.take<int32_t>(T * K);   // QuantLab 11/8
+        if (ql_predict_stats_level() >= 2) {   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2 only: nothing taken otherwise
+            qe_logits_ = b.take<float>(2 * T * (uint64_t) g.n_expert); qe_mixed_ = b.take<float>(T * N);
+            qe_xn_ = b.take<float>(T * HC * N); qe_lo_ = b.take<float>(T * (uint64_t) g.hc_lr);
+            qe_rs_ = b.take<float>(T * HC); qe_inj_ = b.take<float>(T * HC);
+        }
+        if (pf_m_ > 0) {   // QuantLab (11/13) STRATA_QL_PREFETCH=m only: nothing taken otherwise
+            pf_mixed_ = b.take<float>(T * N); pf_xn_ = b.take<float>(T * HC * N);
+            pf_lo_ = b.take<float>(T * (uint64_t) g.hc_lr); pf_rs_ = b.take<float>(T * HC); pf_inj_ = b.take<float>(T * HC);
+            pf_logits_ = b.take<float>(T * (uint64_t) g.n_expert); pf_w_ = b.take<float>(T * K); pf_ids_ = b.take<int32_t>(T * K);
+            pf_slots_ = b.take<uint8_t>(2 * (uint64_t) pf_m_ * strata::kernels::cpu::expert_layout().max_blob);
+        }
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
@@ -1204,6 +1235,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
+        return false;
+    }
+    if (pf_m_ > 0 && pf_cs_ == nullptr &&   // QuantLab (11/13) STRATA_QL_PREFETCH: E0's side stream
+        (cudaStreamCreateWithFlags(&pf_cs_, cudaStreamNonBlocking) != cudaSuccess ||
+         cudaEventCreateWithFlags(&pf_fork_, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "verify: the prefetch stream could not be created";
         return false;
     }
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
@@ -1571,6 +1609,83 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
+        }
+        // QuantLab (11/13) STRATA_QL_PREFETCH=m: E0 on the side stream from here (the entrance residual R is final: the
+        // read above folded the previous layer's write in), joined back before the FFN-side read below rewrites R.  The
+        // FFN-side read with apply off (R untouched), the router GEMV, the device top-10; the ids to mapped memory, then
+        // the flag = this step's number, which the host's doorbell wait watches.  Nothing on the main stream reads it.
+        bool pf_forked = false;
+        if (pf_m_ > 0 && pf_ids_ != nullptr && !batch_rec_ && n >= 1 && n <= kFusedGrMaxT && NE == 512 && K == 10 &&
+            native_router_enabled()) {
+            const WeightRef* wr = v.get("ffn_gate_inp.weight");
+            if (wr != nullptr) {
+                if (!branch(pf_fork_, cs, pf_cs_, "fork (prefetch)")) return false;
+                pf_forked = true;
+                FusedGrArgs fa[kFusedGrMaxT];
+                for (int t = tb; t < te; ++t) {
+                    FusedGrArgs& a = fa[t - tb];
+                    a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
+                    a.bo_prev = bo_ + t * N; a.inj_prev = inj2_ + t * HC;
+                    a.w_norm = (const float*) wn[1]->data; a.w_down = (const uint16_t*) wd[1]->data;
+                    a.w_up = (const uint16_t*) wu[1]->data; a.w_inject = (const uint16_t*) wi[1]->data;
+                    a.q8_down = (const uint8_t*) wd[1]->hc_q8; a.q8_up = (const uint8_t*) wu[1]->hc_q8;
+                    a.q8_inject = (const uint8_t*) wi[1]->hc_q8;
+                    a.s_down = wd[1]->q8_scale; a.s_up = wu[1]->q8_scale;
+                    a.eps = EPS; a.lo = pf_lo_ + (t - tb) * g.hc_lr; a.rs = pf_rs_ + (t - tb) * HC;
+                    a.inject_out = pf_inj_ + (t - tb) * HC; a.mixed = pf_mixed_ + (t - tb) * N;
+                }
+                try {
+                    fused_gr_read_multi(fa, n, pf_xn_, pf_cs_);
+                    bf16_gemv_fp32_mmvf_multi(pf_mixed_, N, (const uint16_t*) wr->data, pf_logits_, NE, N, NE, n, pf_cs_);
+                    native_router_top10_multi(pf_logits_, pf_ids_ + tb * K, pf_w_ + tb * K, n, pf_cs_);
+                    if (cudaMemcpyAsync(h_pf_ids_ + (size_t) tb * K, pf_ids_ + tb * K, (size_t) n * K * sizeof(int32_t),
+                                        cudaMemcpyDeviceToHost, pf_cs_) != cudaSuccess) {
+                        err = "verify ql prefetch: the ids' copy failed";
+                        return false;
+                    }
+                    strata::kernels::set_flag_on_stream(m_pf_flag_, (uint32_t) ((l - lb_) * G + grp + 1), pf_cs_);
+                } catch (const std::exception& e) { err = "verify ql prefetch: " + std::string(e.what()); return false; }
+            }
+        }
+        // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing, for the plan's counters only (nothing else reads
+        // it; the buffers exist only under the flag, so no node is added without it).  E0 = this layer's FFN-side
+        // hyper-connection read (the router's own norm and mix, apply off: R is not written) of the entrance residual R -
+        // the router's input as if the mixer added nothing; E1 = the mixer's input, the attention-side read just made.
+        // Both through this layer's router matrix; the logits go to the mapped buffer, the host ranks them.
+        if (qe_logits_ != nullptr && h_qe_ != nullptr && n >= 1 && n <= kFusedGrMaxT) {
+            const WeightRef* wr = v.get("ffn_gate_inp.weight");
+            if (wr != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+                FusedGrArgs fa[kFusedGrMaxT];
+                for (int t = tb; t < te; ++t) {
+                    FusedGrArgs& a = fa[t - tb];
+                    a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
+                    a.bo_prev = bo_ + t * N; a.inj_prev = inj2_ + t * HC;
+                    a.w_norm = (const float*) wn[1]->data; a.w_down = (const uint16_t*) wd[1]->data;
+                    a.w_up = (const uint16_t*) wu[1]->data; a.w_inject = (const uint16_t*) wi[1]->data;
+                    a.q8_down = (const uint8_t*) wd[1]->hc_q8; a.q8_up = (const uint8_t*) wu[1]->hc_q8;
+                    a.q8_inject = (const uint8_t*) wi[1]->hc_q8;
+                    a.s_down = wd[1]->q8_scale; a.s_up = wu[1]->q8_scale;
+                    a.eps = EPS; a.lo = qe_lo_ + (t - tb) * g.hc_lr; a.rs = qe_rs_ + (t - tb) * HC;
+                    a.inject_out = qe_inj_ + (t - tb) * HC; a.mixed = qe_mixed_ + (t - tb) * N;
+                }
+                const size_t lay_off = (size_t) l * 2 * (size_t) max_t_ * (size_t) NE;
+                try {
+                    fused_gr_read_multi(fa, n, qe_xn_, cs);
+                    bf16_gemv_fp32_mmvf_multi(qe_mixed_, N, (const uint16_t*) wr->data, qe_logits_, NE, N, NE, n, cs);
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wr->data, qe_logits_ + (size_t) n * NE,
+                                              NE, N, NE, n, cs);
+                    for (int e = 0; e < 2; ++e)
+                        if (cudaMemcpyAsync(h_qe_ + lay_off + ((size_t) e * max_t_ + (size_t) tb) * NE,
+                                            qe_logits_ + (size_t) e * n * NE, (size_t) n * NE * sizeof(float),
+                                            cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                            err = "verify ql predict: the early logits' copy failed";
+                            return false;
+                        }
+                    // the step's E0 and E1 logits have landed: the host notes when it sees this (the lead time)
+                    if (m_qe_flag_ != nullptr)
+                        strata::kernels::set_flag_on_stream(m_qe_flag_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                } catch (const std::exception& e) { err = "verify ql predict: " + std::string(e.what()); return false; }
+            }
         }
         if (inputs_pending) {   // the window's steps and positions, before the first mixer reads them
             join(1);
@@ -2139,6 +2254,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
+        if (pf_forked && !branch(pf_join_, pf_cs_, cs, "join (prefetch)")) return false;   // QuantLab (11/13): R is rewritten next
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
@@ -3345,6 +3461,18 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
+    // QuantLab (11/13) STRATA_QL_PREFETCH=m: on only where flag B is raised in the copy stream's order (the DMA mode with
+    // STRATA_QL_DMA_GPUFLAG=1, no DMA thread), so a prefetch copy issued before a layer's plan lands before its flag B
+    const bool pf_live = pf_m_ > 0 && h_pf_flag_ != nullptr && pf_slots_ != nullptr && sink_.pcie_mode == 0 &&
+                         ql_dma_gpuflag() && !ql_dma_thread_on();
+    if (pf_m_ > 0 && !pf_live) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "strata ql prefetch: off (it needs --pcie-mode dma and STRATA_QL_DMA_GPUFLAG=1 without "
+                                 "STRATA_QL_DMA_THREAD)\n");
+        }
+    }
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
@@ -3370,8 +3498,54 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         auto last_flush = a;
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
+        // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: when this step's early logits landed, as the host sees it (the lead
+        // time to the doorbell below); 2 = already there when the wait began, 1 = seen during it, 0 = not seen
+        volatile uint32_t* const qe_flag = h_qe_flag_;
+        int qe_state = qe_flag != nullptr && *qe_flag >= want ? 2 : 0;
+        Clock::time_point qe_t = a;
+        // QuantLab (11/13) STRATA_QL_PREFETCH=m: once this step's E0 ids have landed, up to m predicted PCIe experts are
+        // copied into this group's prefetch slots on the copy stream (before any DMA of the layer's plan)
+        volatile uint32_t* const pf_flag = pf_live ? h_pf_flag_ : nullptr;
+        bool pf_seen = false;
+        int pf_n = 0;
+        int32_t pf_ex[kQlPrefetchMax];
+        unsigned long long pf_ptr[kQlPrefetchMax];
+        auto pf_issue = [&] {
+            pf_seen = true;
+            strata_load_fence();
+            const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+            const uint8_t* srcs[kQlPrefetchMax];
+            size_t bytes[kQlPrefetchMax];
+            pf_n = ql_prefetch_pick(l, h_pf_ids_ + (size_t) tb * ss.k, n, (int) ss.k, pf_m_, pf_ex, srcs, bytes);
+            const size_t mb = strata::kernels::cpu::expert_layout().max_blob;
+            for (int i = 0; i < pf_n; ++i) {
+                uint8_t* dst = pf_slots_ + ((size_t) grp * (size_t) pf_m_ + (size_t) i) * mb;
+                pf_ptr[i] = (unsigned long long) dst;
+                if (cudaMemcpyAsync(dst, srcs[i], bytes[i], cudaMemcpyHostToDevice, copy_) != cudaSuccess) {
+                    std::fprintf(stderr, "strata ql prefetch: a copy could not be issued: %s\n", cudaGetErrorString(cudaGetLastError()));
+                    std::fflush(stderr);
+                    release_gpu_waits(5000);
+                    std::abort();
+                }
+            }
+            if (pf_n > 0) copy_used_ = true;   // the window's end syncs the copy stream
+            if (pf_n > 0 && ql_prefetch_verify()) {   // test mode: the slots hold the experts' own bytes
+                cudaStreamSynchronize(copy_);
+                int ok = 0, bad = 0;
+                for (int i = 0; i < pf_n; ++i) {
+                    std::vector<uint8_t> back(bytes[i]);
+                    const bool same = cudaMemcpy(back.data(), (const void*) pf_ptr[i], bytes[i], cudaMemcpyDeviceToHost) ==
+                                          cudaSuccess && std::memcmp(back.data(), srcs[i], bytes[i]) == 0;
+                    ++(same ? ok : bad);
+                }
+                ql_prefetch_verified(ok, bad);
+            }
+        };
+        if (pf_flag != nullptr && *pf_flag >= want) pf_issue();
         while (*seq < want) {
             strata_cpu_pause();
+            if (pf_flag != nullptr && !pf_seen && *pf_flag >= want) pf_issue();
+            if (qe_flag != nullptr && qe_state == 0 && *qe_flag >= want) { qe_state = 1; qe_t = Clock::now(); }
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -3409,6 +3583,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         strata_load_fence();   // the layer rang: the GPU's activations are read after it (a no-op on x86)
         const Clock::time_point b = Clock::now();
+        if (qe_flag != nullptr && qe_state == 0 && *qe_flag >= want) { qe_state = 1; qe_t = b; }
+        if (pf_flag != nullptr && !pf_seen) ql_prefetch_late();   // E0 after the doorbell: nothing copied ahead
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
@@ -3421,6 +3597,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (ql_gpu_ahead_on() && n > 1 && l + 1 < g.n_layers)   // QuantLab 11/8: layer l+1's guess, for the read-ahead
             ql_set_gpu_pred(h_pids_ + (size_t) tb * ss.k, n * (int) ss.k, l + 1);
+        if (h_qe_ != nullptr)   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: this layer's early routing, for the plan's counters
+            ql_set_early(h_qe_ + ((size_t) l * 2 * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert,
+                         h_qe_ + (((size_t) l * 2 + 1) * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert, n, l,
+                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f,
+                         qe_state, std::chrono::duration<double, std::micro>(b - qe_t).count());
+        if (pf_live) ql_prefetch_set(l, pf_ex, pf_ptr, pf_n);   // QuantLab (11/13) STRATA_QL_PREFETCH: the plan reads them
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3464,6 +3646,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    // QuantLab (11/13) STRATA_QL_PREFETCH / PREDICT_STATS=2: every step's E0 landed before its doorbell (joined into the
+    // main stream before the router), so the flags start the next window at 0 (a window launched ahead of this point
+    // would find a step-1 flag lost: that step counts as late)
+    if (h_pf_flag_ != nullptr) *(volatile uint32_t*) h_pf_flag_ = 0;
+    if (h_qe_flag_ != nullptr) *(volatile uint32_t*) h_qe_flag_ = 0;
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
     if (chain) {
         // The overlapped split: no host sync between the stages.  The next stage's GPU starts on this stage's flag;
@@ -5262,6 +5449,10 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         progress_at("verify window (pipelined): the CPU experts of layer", l);
         if (ql_gpu_ahead_on() && n > 1 && l + 1 < g.n_layers)   // QuantLab 11/8: layer l+1's guess, for the read-ahead
             ql_set_gpu_pred(h_pids_ + (size_t) tb * ss.k, n * (int) ss.k, l + 1);
+        if (h_qe_ != nullptr)   // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: this layer's early routing, for the plan's counters
+            ql_set_early(h_qe_ + ((size_t) l * 2 * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert,
+                         h_qe_ + (((size_t) l * 2 + 1) * (size_t) max_t_ + (size_t) tb) * (size_t) g.n_expert, n, l,
+                         hits_.d_res != nullptr && g.n_expert == 512 && ss.k == 10 ? g_route_prior() : 0.0f, -1, 0.0);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

@@ -5854,6 +5854,492 @@ void ql_set_gpu_pred(const int32_t* ids, int n, int64_t layer) {
     tl_gpu_pred_layer = layer;
 }
 
+// QuantLab (11/13) STRATA_QL_PREDICT_STATS: whether the experts a decode window needs from outside VRAM could be named
+// before its router runs, from the earlier windows at the same layer (ExpertDispatch::QlPredSum).  Bit sets of
+// n_expert bits per layer, fixed arrays on the stack per call; the history grows once (the first window's layers).
+// =2 also the early routing (Verifier, verify.cpp): this layer's router on an earlier state of the same window.
+int ql_predict_stats_level() {
+    static const int level = [] { const char* v = std::getenv("STRATA_QL_PREDICT_STATS"); return v ? std::max(0, std::atoi(v)) : 0; }();
+    return level;
+}
+bool ql_predict_stats_on() { return ql_predict_stats_level() >= 1; }
+
+// QuantLab (11/13) STRATA_QL_PREFETCH=m (1..kQlPrefetchMax; 0 / unset = off): the verifier copies up to m experts the
+// light early routing E0 predicts into prefetch slots before the layer's plan (verify.cpp); the plan points PCIe groups
+// of those experts at the slots.  STRATA_QL_PREFETCH_MODE=B (A default), STRATA_QL_PREFETCH_STATS=1,
+// STRATA_QL_PREFETCH_VERIFY=1 (test mode: each copy read back and compared).
+int ql_prefetch_m() {
+    static const int m = [] { const char* v = std::getenv("STRATA_QL_PREFETCH"); return v ? std::clamp(std::atoi(v), 0, kQlPrefetchMax) : 0; }();
+    return m;
+}
+int ql_prefetch_mode() {
+    static const int b = [] { const char* v = std::getenv("STRATA_QL_PREFETCH_MODE"); return v && (v[0] == 'B' || v[0] == 'b' || v[0] == '1') ? 1 : 0; }();
+    return b;
+}
+bool ql_prefetch_verify() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_PREFETCH_VERIFY"); return v && v[0] == '1'; }();
+    return on;
+}
+namespace {
+bool ql_prefetch_stats_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_PREFETCH_STATS"); return v && v[0] == '1'; }();
+    return on;
+}
+thread_local ExpertDispatch* tl_pf_d = nullptr;   // the dispatch this thread plans with (its residency, its source)
+thread_local int64_t tl_pf_layer = -1;
+thread_local int tl_pf_n = 0;
+thread_local int32_t tl_pf_ex[kQlPrefetchMax];
+thread_local unsigned long long tl_pf_ptr[kQlPrefetchMax];
+struct QlPfSum {
+    int64_t windows = 0, layers = 0, issued = 0, used = 0, late = 0, verify_ok = 0, verify_bad = 0;
+    double issued_bytes = 0, used_bytes = 0;
+};
+QlPfSum g_pf_req, g_pf_all;
+void ql_pf_add(int64_t QlPfSum::*f, int64_t v) { g_pf_req.*f += v; g_pf_all.*f += v; }
+void ql_pf_print(const char* what, const QlPfSum& s) {
+    const double L = s.layers > 0 ? (double) s.layers : 1.0;
+    std::fprintf(stderr,
+                 "strata ql prefetch: %s %lld windows, %lld layer-steps: copied ahead %lld (%.2f/layer-step, %.1f MB), used %lld "
+                 "(%.2f/layer-step, %.1f%%), wasted %lld; DMA saved %lld experts %.1f MB; E0 after the doorbell %lld layer-steps "
+                 "(%.1f%%)%s\n",
+                 what, (long long) s.windows, (long long) s.layers, (long long) s.issued, (double) s.issued / L,
+                 s.issued_bytes / 1e6, (long long) s.used, (double) s.used / L,
+                 s.issued > 0 ? 100.0 * (double) s.used / (double) s.issued : 0.0, (long long) (s.issued - s.used),
+                 (long long) s.used, s.used_bytes / 1e6, (long long) s.late,
+                 100.0 * (double) s.late / (double) std::max<int64_t>(1, s.layers + s.late),
+                 ql_prefetch_verify() ? (std::string("; verified ") + std::to_string(s.verify_ok) + " ok / " +
+                                         std::to_string(s.verify_bad) + " BAD").c_str() : "");
+}
+}  // namespace
+
+int ql_prefetch_pick(int64_t layer, const int32_t* e0, int n_tok, int k, int m, int32_t* ex, const uint8_t** src,
+                     size_t* bytes) {
+    ExpertDispatch* dp = tl_pf_d;
+    if (dp == nullptr || dp->src == nullptr || dp->host_res == nullptr || e0 == nullptr || n_tok < 1 || k < 1 ||
+        n_tok * k > 128 || m < 1 || layer < 0)
+        return 0;
+    ExpertDispatch& d = *dp;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (layer == 0) ql_pf_add(&QlPfSum::windows, 1);
+    ql_pf_add(&QlPfSum::layers, 1);
+    // the plan's own conditions for a PCIe share in this layer (expert_pool_dispatch_multi)
+    static const bool pcie_mixed = [] { const char* v = std::getenv("STRATA_QL_PCIE_MIXED"); return v && std::atoi(v) != 0; }();
+    const bool mixed = lay.native && lay.layer_mixed(layer);
+    if (!((d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(layer) && (!mixed || pcie_mixed))) return 0;
+    // E0's distinct experts in first-occurrence order (the plan's miss order), each with its best rank
+    int32_t dist[128];
+    int brank[128], nd = 0;
+    for (int i = 0; i < n_tok * k; ++i) {
+        const int32_t e = e0[i];
+        if (e < 0 || e >= d.n_expert) continue;
+        int q = 0;
+        while (q < nd && dist[q] != e) ++q;
+        if (q == nd) { dist[nd] = e; brank[nd] = i % k; ++nd; }
+        else brank[q] = std::min(brank[q], i % k);
+    }
+    // the misses as the plan would see them: outside VRAM, no peer; E0's own tail skip (every token ranks it >= R)
+    const int tail = d.peer == nullptr && d.remote_count == 0 ? tail_skip_rank() : 0;
+    int miss[128], nmiss = 0;
+    for (int q = 0; q < nd; ++q) {
+        const int32_t e = dist[q];
+        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+        if (d.peer != nullptr && d.peer->has(layer, e)) continue;
+        if (tail > 0 && brank[q] >= tail) continue;
+        miss[nmiss++] = q;
+    }
+    // mode A: the plan's PCIe share is the last `mp` misses in that order - those first; then by best rank (ties: order)
+    int mp = (nmiss * d.pcie_num) >> 8;
+    static const bool pcie_min1 = [] { const char* v = std::getenv("STRATA_PCIE_MIN1"); return v && std::atoi(v) != 0; }();
+    if (pcie_min1 && mp < 1 && nmiss >= 2) mp = 1;
+    const bool mode_a = ql_prefetch_mode() == 0;
+    int order[128];
+    for (int j = 0; j < nmiss; ++j) order[j] = j;
+    auto key = [&](int j) { return (mode_a && j >= nmiss - mp ? 0 : 100) + brank[miss[j]]; };
+    std::stable_sort(order, order + nmiss, [&](int x, int y) { return key(x) < key(y); });
+    int got = 0;
+    for (int j = 0; j < nmiss && got < m && got < kQlPrefetchMax; ++j) {
+        const int32_t e = dist[miss[order[j]]];
+        if (!d.src->pinned(layer, e)) continue;
+        const uint8_t* b = d.src->blob(layer, e);
+        if (b == nullptr) continue;
+        ex[got] = e;
+        src[got] = b;
+        bytes[got] = (size_t) lay.expert_bytes(layer, e);
+        ++got;
+    }
+    ql_pf_add(&QlPfSum::issued, got);
+    for (int j = 0; j < got; ++j) { g_pf_req.issued_bytes += (double) bytes[j]; g_pf_all.issued_bytes += (double) bytes[j]; }
+    return got;
+}
+
+void ql_prefetch_set(int64_t layer, const int32_t* ex, const unsigned long long* ptr, int n) {
+    tl_pf_layer = n > 0 ? layer : -1;
+    tl_pf_n = std::min(n, kQlPrefetchMax);
+    for (int j = 0; j < tl_pf_n; ++j) { tl_pf_ex[j] = ex[j]; tl_pf_ptr[j] = ptr[j]; }
+}
+void ql_prefetch_late() { ql_pf_add(&QlPfSum::late, 1); }
+void ql_prefetch_verified(int ok, int bad) {
+    ql_pf_add(&QlPfSum::verify_ok, ok);
+    ql_pf_add(&QlPfSum::verify_bad, bad);
+    if (bad > 0) std::fprintf(stderr, "strata ql prefetch: VERIFY: %d slot(s) differ from their source\n", bad);
+}
+namespace {
+void ql_prefetch_used(size_t bytes) {
+    ql_pf_add(&QlPfSum::used, 1);
+    g_pf_req.used_bytes += (double) bytes;
+    g_pf_all.used_bytes += (double) bytes;
+}
+}  // namespace
+
+void ql_pred_begin(ExpertDispatch& d) {
+    if (ql_prefetch_stats_on()) g_pf_req = QlPfSum{};
+    if (!ql_predict_stats_on()) return;
+    d.ql_pred_live = true;
+    d.ql_pred_req = ExpertDispatch::QlPredSum{};
+    std::fill(d.ql_pred_nwin.begin(), d.ql_pred_nwin.end(), (int64_t) 0);
+}
+
+namespace {
+constexpr int64_t kQlPredMaxWords = 16;   // up to 1024 experts per layer; a larger model is not counted
+constexpr int kQlEarlyMaxRank = 16;       // the early ranking keeps k + 4 <= 16 experts per token
+
+// QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing's logits of the layer the dispatch is about to plan
+// (mapped, [E0, E1][token][n_expert]), set by the verifier on the dispatching thread right before the pool call
+thread_local const float* tl_early[2] = {nullptr, nullptr};
+thread_local int tl_early_n = 0;
+thread_local int64_t tl_early_layer = -1;
+thread_local float tl_early_prior = 0.0f;
+thread_local int tl_lead_state = -1;
+thread_local double tl_lead_us = 0;
+
+// one layer-window: kind[] as the dispatch planned it (-2 tail-skipped, -1 CPU, 0 VRAM, 1 PCIe, 2 peer / helper GPU),
+// nfile = the CPU experts whose blob was still to be read from the files (STRATA_COLD_OVERLAP != 0; else 0)
+void ql_pred_note(ExpertDispatch& d, int64_t L, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
+                  int nfile) {
+    const int64_t n = n_tok * k;
+    const int64_t W = (d.n_expert + 63) / 64;
+    const bool early = tl_early_layer == L && tl_early[0] != nullptr && tl_early_n == (int) n_tok;
+    tl_early_layer = -1;
+    const int lead_state = tl_lead_state;
+    tl_lead_state = -1;
+    if (L < 0 || W <= 0 || W > kQlPredMaxWords || d.host_res == nullptr) return;
+    if (d.ql_pred_words != W) {
+        d.ql_pred_words = W;
+        d.ql_pred_layers = 0;
+        d.ql_pred_hist.clear();
+        d.ql_pred_used.clear();
+        d.ql_pred_nwin.clear();
+    }
+    if (L >= d.ql_pred_layers) {
+        d.ql_pred_layers = L + 1;
+        d.ql_pred_hist.resize((size_t) (L + 1) * 4 * (size_t) W, 0);
+        d.ql_pred_used.resize((size_t) (L + 1) * (size_t) W, 0);
+        d.ql_pred_nwin.resize((size_t) (L + 1), 0);
+    }
+    const int32_t* res = d.host_res + (size_t) L * (size_t) d.n_expert;
+    uint64_t a[kQlPredMaxWords] = {}, u[kQlPredMaxWords] = {};
+    uint64_t a_pcie[kQlPredMaxWords] = {}, skipped[kQlPredMaxWords] = {};   // A's PCIe part; the tail skip's experts
+    int na = 0, npcie = 0, ncpu = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= d.n_expert) continue;
+        const uint64_t b = 1ull << (e & 63);
+        if (kind[i] == -2) { skipped[e >> 6] |= b; continue; }
+        u[e >> 6] |= b;
+        if ((kind[i] == -1 || kind[i] == 1) && (a[e >> 6] & b) == 0) {
+            a[e >> 6] |= b;
+            ++na;
+            if (kind[i] == 1) { ++npcie; a_pcie[e >> 6] |= b; } else ++ncpu;
+        }
+    }
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    auto bytes_of = [&](const uint64_t* set) {
+        double s = 0;
+        for (int64_t w = 0; w < W; ++w)
+            for (uint64_t x = set[w]; x != 0; x &= x - 1) s += (double) lay.expert_bytes(L, w * 64 + __builtin_ctzll(x));
+        return s;
+    };
+    // out of a prediction: what is resident now (it needs no copy)
+    auto drop_resident = [&](uint64_t* set) {
+        for (int64_t w = 0; w < W; ++w)
+            for (uint64_t any = set[w]; any != 0; any &= any - 1) {
+                const int64_t e = w * 64 + __builtin_ctzll(any);
+                if (e < d.n_expert && res[e] >= 0) set[w] &= ~(1ull << (e & 63));
+            }
+    };
+    // a prediction p against A: hits, waste (p outside A), the hits' bytes
+    auto score = [&](const uint64_t* p, int& hit, int& waste, double& hit_bytes) {
+        uint64_t h[kQlPredMaxWords];
+        hit = waste = 0;
+        for (int64_t w = 0; w < W; ++w) {
+            h[w] = a[w] & p[w];
+            hit += __builtin_popcountll(h[w]);
+            waste += __builtin_popcountll(p[w] & ~a[w]);
+        }
+        hit_bytes = bytes_of(h);
+    };
+    const int band = (int) std::min<int64_t>(3, L / 12);
+    const double a_bytes = bytes_of(a);
+    uint64_t* hist = d.ql_pred_hist.data() + (size_t) L * 4 * (size_t) W;
+    uint64_t* used = d.ql_pred_used.data() + (size_t) L * (size_t) W;
+    int64_t& nw = d.ql_pred_nwin[(size_t) L];
+    if (nw > 0) {
+        uint64_t p[4][kQlPredMaxWords];   // P1, P2, P4, Q1
+        auto slot = [&](int64_t back, int64_t w) -> uint64_t { return nw >= back ? hist[((nw - back) & 3) * W + w] : 0; };
+        for (int64_t w = 0; w < W; ++w) {
+            p[0][w] = slot(1, w);
+            p[1][w] = p[0][w] | slot(2, w);
+            p[2][w] = p[1][w] | slot(3, w) | slot(4, w);
+            p[3][w] = used[w];
+        }
+        double hit_bytes[4] = {};
+        int hit[4] = {}, waste[4] = {};
+        for (int j = 0; j < 4; ++j) {
+            drop_resident(p[j]);
+            score(p[j], hit[j], waste[j], hit_bytes[j]);
+        }
+        for (ExpertDispatch::QlPredSum* s : {&d.ql_pred_req, &d.ql_pred_all}) {
+            if (L == 0) ++s->windows;
+            ++s->lw;
+            s->a += na;
+            s->pcie += npcie;
+            s->cpu += ncpu;
+            s->file += nfile;
+            s->a_bytes += a_bytes;
+            s->band_a[band] += na;
+            for (int j = 0; j < 4; ++j) {
+                s->hit[j] += hit[j];
+                s->waste[j] += waste[j];
+                s->hit_bytes[j] += hit_bytes[j];
+                s->band_hit[band][j] += hit[j];
+            }
+        }
+    }
+    uint64_t* cur = hist + (nw & 3) * W;
+    for (int64_t w = 0; w < W; ++w) {
+        cur[w] = a[w];
+        used[w] = u[w];
+    }
+    ++nw;
+    // =2: the early routing.  Per token its top k + 4 by the router's selection score (the logit, plus the route
+    // prior's bonus on what is resident as route_prior.cu adds it; ties to the lower id, as the device's top-10), before
+    // the tail skip.  PE+0 / +2 / +4 = the window's union of each token's top k / k + 2 / k + 4, minus what is resident.
+    const int kr = (int) std::min<int64_t>(k + 4, kQlEarlyMaxRank);
+    if (!early || k < 1 || k + 4 > kQlEarlyMaxRank) return;
+    int e_hit[2][3] = {}, e_waste[2][3] = {};
+    double e_hit_bytes[2][3] = {};
+    int64_t rmatch[2] = {};
+    // E0 in detail: each expert's best rank over the window's tokens (the touched entries only are reset)
+    int8_t brank[1024];
+    int32_t touched[kQlEarlyMaxRank * 16];
+    int ntouched = 0;
+    int64_t r_out[kQlEarlyMaxRank] = {}, r_used[kQlEarlyMaxRank] = {}, top_hit[4] = {}, top_waste[4] = {};
+    int hit_pcie = 0, hit_cpu = 0, waste_skip = 0;
+    for (int v = 0; v < 2; ++v) {
+        if (tl_early[v] == nullptr) continue;
+        uint64_t pe[3][kQlPredMaxWords] = {};
+        for (int64_t t = 0; t < n_tok; ++t) {
+            const float* lg = tl_early[v] + (size_t) t * (size_t) d.n_expert;
+            int top[kQlEarlyMaxRank];
+            float ts[kQlEarlyMaxRank];
+            int m = 0;
+            for (int e = 0; e < (int) d.n_expert; ++e) {
+                const float sc = lg[e] + (res[e] >= 0 ? tl_early_prior : 0.0f);
+                if (m == kr && !(sc > ts[m - 1])) continue;
+                int j = m < kr ? m++ : m - 1;
+                while (j > 0 && sc > ts[j - 1]) { ts[j] = ts[j - 1]; top[j] = top[j - 1]; --j; }
+                ts[j] = sc;
+                top[j] = e;
+            }
+            for (int r = 0; r < m; ++r) {
+                const int wd = r < k ? 0 : r < k + 2 ? 1 : 2;
+                for (int x = wd; x < 3; ++x) pe[x][top[r] >> 6] |= 1ull << (top[r] & 63);
+                if (v == 0 && d.n_expert <= 1024) {
+                    const int e = top[r];
+                    bool seen = false;
+                    for (int q = 0; q < ntouched; ++q)
+                        if (touched[q] == e) { seen = true; break; }
+                    if (!seen && ntouched < (int) (sizeof touched / sizeof touched[0])) { touched[ntouched++] = e; brank[e] = (int8_t) r; }
+                    else if (seen && r < brank[e]) brank[e] = (int8_t) r;
+                }
+            }
+            for (int64_t j = 0; j < k; ++j) {   // the routing itself: the true top k against the early top k
+                const int32_t e = ids[t * k + j];
+                for (int r = 0; r < k && r < m; ++r)
+                    if (top[r] == e) { ++rmatch[v]; break; }
+            }
+        }
+        for (int x = 0; x < 3; ++x) {
+            drop_resident(pe[x]);
+            score(pe[x], e_hit[v][x], e_waste[v][x], e_hit_bytes[v][x]);
+        }
+        if (v != 0) continue;
+        for (int64_t w = 0; w < W; ++w) {   // PE (top k) against A's PCIe / CPU parts; its waste the tail skip dropped
+            hit_pcie += __builtin_popcountll(pe[0][w] & a_pcie[w]);
+            hit_cpu += __builtin_popcountll(pe[0][w] & a[w] & ~a_pcie[w]);
+            waste_skip += __builtin_popcountll(pe[0][w] & ~a[w] & skipped[w]);
+        }
+        // by best rank: the experts outside VRAM, those in A; then the first m by rank (ties: the lower id)
+        int order[kQlEarlyMaxRank * 16];
+        int no = 0;
+        for (int q = 0; q < ntouched; ++q) {
+            const int e = touched[q];
+            if (res[e] >= 0) continue;
+            const bool in_a = (a[e >> 6] & (1ull << (e & 63))) != 0;
+            ++r_out[brank[e]];
+            if (in_a) ++r_used[brank[e]];
+            int j = no++;
+            while (j > 0 && (brank[order[j - 1]] > brank[e] || (brank[order[j - 1]] == brank[e] && order[j - 1] > e))) {
+                order[j] = order[j - 1];
+                --j;
+            }
+            order[j] = e;
+        }
+        int h = 0;
+        for (int mm = 0; mm < 4; ++mm) {
+            if (mm < no) h += (a[order[mm] >> 6] & (1ull << (order[mm] & 63))) != 0;
+            top_hit[mm] += h;
+            top_waste[mm] += std::min(mm + 1, no) - h;
+        }
+    }
+    for (ExpertDispatch::QlPredSum* s : {&d.ql_pred_req, &d.ql_pred_all}) {
+        ++s->e_lw;
+        s->e_a += na;
+        s->e_a_bytes += a_bytes;
+        s->e_band_a[band] += na;
+        s->e_rtot += n_tok * k;
+        for (int r = 0; r < kQlEarlyMaxRank; ++r) {
+            s->e0_rank_out[r] += r_out[r];
+            s->e0_rank_used[r] += r_used[r];
+        }
+        for (int mm = 0; mm < 4; ++mm) {
+            s->e0_top_hit[mm] += top_hit[mm];
+            s->e0_top_waste[mm] += top_waste[mm];
+        }
+        s->e_a_pcie += npcie;
+        s->e_a_cpu += ncpu;
+        s->e0_hit_pcie += hit_pcie;
+        s->e0_hit_cpu += hit_cpu;
+        s->e0_waste_skip += waste_skip;
+        if (lead_state == 1) {
+            s->lead_us += tl_lead_us;
+            ++s->lead_n;
+        } else if (lead_state == 2) {
+            s->lead_ready_us += tl_lead_us;
+            ++s->lead_ready;
+        } else if (lead_state == 0) {
+            ++s->lead_none;
+        }
+        for (int v = 0; v < 2; ++v) {
+            s->e_rmatch[v] += rmatch[v];
+            for (int x = 0; x < 3; ++x) {
+                s->e_hit[v][x] += e_hit[v][x];
+                s->e_waste[v][x] += e_waste[v][x];
+                s->e_hit_bytes[v][x] += e_hit_bytes[v][x];
+                s->e_band_hit[v][x][band] += e_hit[v][x];
+            }
+        }
+    }
+}
+
+void ql_pred_print(const char* what, const ExpertDispatch::QlPredSum& s) {
+    auto pct = [](double x, double y) { return y > 0 ? 100.0 * x / y : 0.0; };
+    char b[320];
+    if (s.lw == 0) {
+        std::fprintf(stderr, "strata ql predict: %s no decode window after the first\n", what);
+    } else {
+        const double lw = (double) s.lw;
+        std::string line;
+        std::snprintf(b, sizeof b,
+                      "strata ql predict: %s %lld windows (%lld layer-windows), A %.2f/layer-window (PCIe %.2f, CPU %.2f "
+                      "[file %.2f]), %.2f MB/layer-window;",
+                      what, (long long) s.windows, (long long) s.lw, (double) s.a / lw, (double) s.pcie / lw,
+                      (double) s.cpu / lw, (double) s.file / lw, s.a_bytes / lw / 1e6);
+        line += b;
+        static const char* const name[4] = {"P1", "P2", "P4", "Q1"};
+        for (int j = 0; j < 4; ++j) {
+            std::snprintf(b, sizeof b, " %s hit %.1f%% (bytes %.1f%%) waste %.2f, bands %.0f/%.0f/%.0f/%.0f%%;", name[j],
+                          pct((double) s.hit[j], (double) s.a), pct(s.hit_bytes[j], s.a_bytes), (double) s.waste[j] / lw,
+                          pct((double) s.band_hit[0][j], (double) s.band_a[0]), pct((double) s.band_hit[1][j], (double) s.band_a[1]),
+                          pct((double) s.band_hit[2][j], (double) s.band_a[2]), pct((double) s.band_hit[3][j], (double) s.band_a[3]));
+            line += b;
+        }
+        line.pop_back();
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+    if (s.e_lw == 0) return;   // =2 only
+    const double lw = (double) s.e_lw;
+    std::string line;
+    std::snprintf(b, sizeof b, "strata ql predict: %s early routing over %lld layer-windows, A %.2f/layer-window;", what,
+                  (long long) s.e_lw, (double) s.e_a / lw);
+    line += b;
+    static const char* const ename[2] = {"E0", "E1"};
+    static const char* const wname[3] = {"", "+2", "+4"};
+    for (int v = 0; v < 2; ++v) {
+        std::snprintf(b, sizeof b, " %s route match %.1f%%", ename[v], pct((double) s.e_rmatch[v], (double) s.e_rtot));
+        line += b;
+        for (int x = 0; x < 3; ++x) {
+            std::snprintf(b, sizeof b, ", PE%s hit %.1f%% (bytes %.1f%%) waste %.2f bands %.0f/%.0f/%.0f/%.0f%%", wname[x],
+                          pct((double) s.e_hit[v][x], (double) s.e_a), pct(s.e_hit_bytes[v][x], s.e_a_bytes),
+                          (double) s.e_waste[v][x] / lw, pct((double) s.e_band_hit[v][x][0], (double) s.e_band_a[0]),
+                          pct((double) s.e_band_hit[v][x][1], (double) s.e_band_a[1]),
+                          pct((double) s.e_band_hit[v][x][2], (double) s.e_band_a[2]),
+                          pct((double) s.e_band_hit[v][x][3], (double) s.e_band_a[3]));
+            line += b;
+        }
+        line += ';';
+    }
+    line.pop_back();
+    std::fprintf(stderr, "%s\n", line.c_str());
+    // E0 in detail
+    line.clear();
+    std::snprintf(b, sizeof b, "strata ql predict: %s E0 by best rank (outside VRAM/used):", what);
+    line += b;
+    for (int r = 0; r < kQlEarlyMaxRank; ++r) {
+        if (s.e0_rank_out[r] == 0) continue;
+        std::snprintf(b, sizeof b, " r%d %.2f/%.2f", r + 1, (double) s.e0_rank_out[r] / lw, (double) s.e0_rank_used[r] / lw);
+        line += b;
+    }
+    line += "; first m by rank:";
+    for (int mm = 0; mm < 4; ++mm) {
+        std::snprintf(b, sizeof b, " m%d hit %.2f waste %.2f (%.1f%% of A)", mm + 1, (double) s.e0_top_hit[mm] / lw,
+                      (double) s.e0_top_waste[mm] / lw, pct((double) s.e0_top_hit[mm], (double) s.e_a));
+        line += b;
+    }
+    std::snprintf(b, sizeof b, "; PE hit PCIe %.1f%% CPU %.1f%%; PE waste tail-skipped %.2f/layer-window", pct((double) s.e0_hit_pcie,
+                  (double) s.e_a_pcie), pct((double) s.e0_hit_cpu, (double) s.e_a_cpu), (double) s.e0_waste_skip / lw);
+    line += b;
+    std::snprintf(b, sizeof b, "; lead to the doorbell: %lld seen, avg %.1f us; %lld already there (wait avg %.1f us, a lower "
+                               "bound); %lld not seen",
+                  (long long) s.lead_n, s.lead_n > 0 ? s.lead_us / (double) s.lead_n : 0.0, (long long) s.lead_ready,
+                  s.lead_ready > 0 ? s.lead_ready_us / (double) s.lead_ready : 0.0, (long long) s.lead_none);
+    line += b;
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+}  // namespace
+
+void ql_set_early(const float* e0, const float* e1, int n_tok, int64_t layer, float prior, int lead_state, double lead_us) {
+    tl_lead_state = lead_state;
+    tl_lead_us = lead_us;
+    tl_early[0] = e0;
+    tl_early[1] = e1;
+    tl_early_n = n_tok;
+    tl_early_layer = layer;
+    tl_early_prior = prior;
+}
+
+void ql_pred_end(ExpertDispatch& d) {
+    if (ql_prefetch_stats_on() && g_pf_req.layers + g_pf_req.late > 0) {   // QuantLab (11/13) STRATA_QL_PREFETCH_STATS
+        ql_pf_print("request", g_pf_req);
+        ql_pf_print("total", g_pf_all);
+        g_pf_req = QlPfSum{};
+    }
+    if (!ql_predict_stats_on() || !d.ql_pred_live) return;
+    d.ql_pred_live = false;
+    ql_pred_print("request", d.ql_pred_req);
+    ql_pred_print("total", d.ql_pred_all);
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -5888,6 +6374,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
+    static const bool ql_pred_on = ql_predict_stats_on();   // QuantLab (11/13) STRATA_QL_PREDICT_STATS
+    static const bool pf_on = ql_prefetch_m() > 0;           // QuantLab (11/13) STRATA_QL_PREFETCH
+    if (pf_on) tl_pf_d = &d;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
@@ -5973,6 +6462,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
+        // QuantLab (11/13) STRATA_QL_PREFETCH=m: the experts the verifier copied into prefetch slots for this layer (E0's
+        // guess).  Mode A: who is PCIe is decided as without it; a PCIe expert found there reads the slot and needs no
+        // DMA.  Mode B: the PCIe count m stays, the prefetched misses go first (all of them, past m too).
+        const bool pf_here = pf_on && P.pcie_mode == 0 && tl_pf_layer == d.layers && tl_pf_n > 0;
+        int pf_slot_of_q[64];
+        int pf_npf = 0, pf_rank = 0;   // mode B: prefetched misses of this layer; the rank among the other misses
+        auto pf_find = [&](int32_t e) {
+            for (int j = 0; j < tl_pf_n; ++j)
+                if (tl_pf_ex[j] == e) return j;
+            return -1;
+        };
+        if (pf_here && ql_prefetch_mode() == 1)
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (!skip_d[q] && e >= 0 && e < d.n_expert &&
+                    d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e) && pf_find(e) >= 0)
+                    ++pf_npf;
+            }
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -5997,12 +6505,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    bool to_pcie = miss_rank >= nmiss - m;
+                    if (pf_npf > 0) {   // STRATA_QL_PREFETCH_MODE=B: the prefetched first, then the last of the others
+                        if (pf_find(e) >= 0) to_pcie = true;
+                        else to_pcie = pf_rank++ >= (nmiss - pf_npf) - std::max(0, m - pf_npf);
+                    }
+                    if (to_pcie && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
+                            if (pf_here) pf_slot_of_q[fetches] = pf_find(e);
                             ++fetches;
                         }
                     }
@@ -6035,10 +6549,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
         size_t fsz[64];                           // QuantLab: a mixed layer's own blob sizes for the DMA copies
+        // QuantLab (11/13) STRATA_QL_PREFETCH: a prefetched PCIe expert reads its slot; the others are staged in order
+        const uint8_t* pf_dma[64];
+        size_t pf_fsz[64];
+        int pf_ndma = 0;
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
+            if (pf_here) {
+                const size_t own = (size_t) lay.expert_bytes(d.layers, ids[i0]);
+                if (pf_slot_of_q[q] >= 0) {
+                    P.ptr2[q] = tl_pf_ptr[pf_slot_of_q[q]];
+                    ql_prefetch_used(own);
+                } else {
+                    P.ptr2[q] = P.staging + (unsigned long long) pf_ndma * (unsigned long long) bb;
+                    pf_dma[pf_ndma] = dma_src[q];
+                    pf_fsz[pf_ndma] = own;
+                    ++pf_ndma;
+                }
+            }
             if (mixed) {   // QuantLab: the staged (or mapped) blob carries its K pair like a VRAM group (tq_mix.hpp)
                 if ((P.ptr2[q] & ~strata::kernels::kTqAddrMask) != 0) {
                     std::fprintf(stderr, "strata: a PCIe blob address 0x%llx has its top byte in use; per-expert K "
@@ -6067,9 +6597,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
-        P.fetch_sizes = mixed && fetches > 0 ? fsz : nullptr;   // QuantLab: read by the fetch call only
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        P.fetch_sizes = mixed && fetches > 0 ? (pf_here ? pf_fsz : fsz) : nullptr;   // QuantLab: read by the fetch call only
+        if (P.fetch) P.fetch(P.ctx, pf_here ? pf_dma : dma_src, P.pcie_mode != 0 ? 0 : (pf_here ? pf_ndma : fetches),
+                             (size_t) bb);   // the copy engine, beside the CPU's work
         P.fetch_sizes = nullptr;
+        if (pf_on) tl_pf_layer = -1;   // QuantLab (11/13) STRATA_QL_PREFETCH: this layer's slots are spoken for
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -6136,6 +6668,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     static thread_local std::vector<uint8_t> mstate;   // per miss: 0 ready, 1 being read, 2 landed, 3 computed
     miss.clear();
     int64_t npend = 0;
+    int ql_nfile = 0;   // QuantLab (11/13) STRATA_QL_PREDICT_STATS: the CPU experts still to be read from the files
     double cold_r_ms = 0;
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         for (int64_t i = 0; i < n_tok * k; ++i)
@@ -6148,6 +6681,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             mstate.assign(miss.size(), 0);
             const auto r0 = std::chrono::steady_clock::now();
             npend = d.src->prefetch_begin(d.layers, miss.data(), (int64_t) miss.size(), mstate.data());
+            if (npend > 0 && ql_pred_on && d.ql_pred_live)
+                for (const uint8_t s : mstate) ql_nfile += s == 1;
             if (npend > 0 && d.cold_mode == 2) {   // measure: every read first, as mode 0 does
                 d.src->prefetch_end();
                 for (uint8_t& s : mstate) if (s == 1) s = 2;
@@ -6329,6 +6864,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (npend == 0)
             for (int jx = 0; jx < njobs; ++jx) ++d.ql_nt[std::min(std::max((int) d.jobs_multi[(size_t) jx].nt, 0), 8)];
     }
+    // QuantLab (11/13) STRATA_QL_PREDICT_STATS: this layer-window's experts from outside VRAM against the earlier windows'
+    if (ql_pred_on && d.ql_pred_live) ql_pred_note(d, d.layers, ids, n_tok, k, kind, ql_nfile);
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
