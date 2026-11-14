@@ -5805,6 +5805,107 @@ bool FileExpertSource::in_ram(int64_t layer, int64_t expert) const {
     return at_index < complement_offsets_.size() && complement_offsets_[at_index] != kNoComplement;
 }
 
+std::string FileExpertSource::ql_probe_host() const {   // QuantLab (11/15) STRATA_QL_PROBE (E-F)
+    std::string j;
+    char b[256];
+    auto num = [&](const char* k, double v) {
+        if (v < 0) std::snprintf(b, sizeof b, "%s\"%s\": null", j.empty() ? "" : ", ", k);
+        else std::snprintf(b, sizeof b, "%s\"%s\": %.5g", j.empty() ? "" : ", ", k, v);
+        j += b;
+    };
+    using clk = std::chrono::steady_clock;
+    const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
+    num("n_layers", (double) n_layers_);
+    num("n_expert", (double) n_expert_);
+    uint64_t lb = 0;
+    for (uint64_t x : layer_blob_bytes_) lb += x;
+    num("expert_mib_mean", layer_blob_bytes_.empty() ? -1 : lb / (double) layer_blob_bytes_.size() / 1048576.0);
+    num("ram_copy_gib", complement_ready_ ? complement_bytes_ / 1073741824.0 : 0);
+    num("ram_copy_registered_gib", complement_pinned_ ? complement_pin_limit_ / 1073741824.0 : 0);
+    num("logical_cores", (double) hc);
+    // the RAM copy's read bandwidth: 64-bit sums over up to 2 GiB of it (1 thread: 512 MiB), the best of 3
+    if (complement_ready_ && complement_host_ != nullptr && complement_bytes_ >= (64ull << 20)) {
+        const uint64_t* base = (const uint64_t*) complement_host_;
+        auto pass = [&](unsigned T, size_t bytes) -> double {
+            const size_t words = bytes / 8;
+            double best = -1;
+            for (int r = 0; r < 3; ++r) {
+                std::vector<uint64_t> part(T, 0);
+                const auto t0 = clk::now();
+                std::vector<std::thread> th;
+                for (unsigned t = 0; t < T; ++t)
+                    th.emplace_back([&, t] {
+                        const size_t a = words * t / T, z = words * (t + 1) / T;
+                        uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                        size_t i = a;
+                        for (; i + 4 <= z; i += 4) { s0 += base[i]; s1 += base[i + 1]; s2 += base[i + 2]; s3 += base[i + 3]; }
+                        for (; i < z; ++i) s0 += base[i];
+                        part[t] = s0 ^ s1 ^ s2 ^ s3;
+                    });
+                for (auto& x : th) x.join();
+                const double s = std::chrono::duration<double>(clk::now() - t0).count();
+                volatile uint64_t keep = 0;
+                for (uint64_t x : part) keep = keep + x;
+                (void) keep;
+                if (s > 0) best = std::max(best, bytes / s / 1e9);
+            }
+            return best;
+        };
+        const size_t big = (size_t) std::min<uint64_t>(complement_bytes_, 2ull << 30) & ~(size_t) 63;
+        num("ram_read_1t_gbs", pass(1, std::min<size_t>(big, 512ull << 20)));
+        num("ram_read_half_gbs", pass(std::max(1u, hc / 2), big));
+        num("ram_read_all_gbs", pass(hc, big));
+    }
+    // the drive: unbuffered reads of whole experts (the cold reads of a decode), spread over the layers and the experts
+    if (!direct_.empty() && n_layers_ > 0 && n_expert_ > 0 && stage_blob_ > 0) {
+        auto pick = [&](int i, int64_t& l, int64_t& e) {
+            l = (int64_t) ((i * 7) % n_layers_);
+            e = (int64_t) (((int64_t) i * 131 + 17) % n_expert_);
+        };
+        std::vector<double> one;
+        {
+            std::vector<uint8_t> buf((size_t) stage_blob_ + 4096);
+            for (int i = 0; i < 40; ++i) {
+                int64_t l, e;
+                pick(i, l, e);
+                const Fill f{0, l, e, buf.data()};
+                const auto t0 = clk::now();
+                if (!read_direct(&f, 1)) { one.clear(); break; }
+                one.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+            }
+        }
+        if (one.size() > 8) {
+            std::vector<double> s(one.begin() + 4, one.end());   // the first four warm the reader
+            std::sort(s.begin(), s.end());
+            num("ssd_expert_ms_median", s[s.size() / 2]);
+            num("ssd_expert_ms_p90", s[s.size() * 9 / 10]);
+        } else {
+            num("ssd_expert_ms_median", -1);
+        }
+        const int T = 8, per = 6;
+        std::atomic<int> fails{0};
+        const auto t0 = clk::now();
+        std::vector<std::thread> th;
+        for (int t = 0; t < T; ++t)
+            th.emplace_back([&, t] {
+                std::vector<uint8_t> buf((size_t) stage_blob_ + 4096);
+                for (int k = 0; k < per; ++k) {
+                    int64_t l, e;
+                    pick(100 + t * per + k, l, e);
+                    const Fill f{0, l, e, buf.data()};
+                    if (!read_direct(&f, 1)) fails.fetch_add(1);
+                }
+            });
+        for (auto& x : th) x.join();
+        const double s = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        num("ssd_8way_ms_per_expert", fails.load() == 0 ? s / (T * per) : -1);
+        num("ssd_8way_gbs", fails.load() == 0 && !layer_blob_bytes_.empty() ? (lb / (double) layer_blob_bytes_.size()) * T * per / (s * 1e-3) / 1e9 : -1);
+    } else {
+        j += ", \"ssd_probe\": \"no unbuffered reads (the pack is read through the mapping)\"";
+    }
+    return j;
+}
+
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;

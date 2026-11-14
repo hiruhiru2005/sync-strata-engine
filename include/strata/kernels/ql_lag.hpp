@@ -7,6 +7,7 @@
 // released (the layer's combine + the next layer's dense part up to its router): the host's GPU-reach wait minus this is
 // the time the CPU waited for the GPU's experts.  Mapped host memory, read by the host after the window; off = null.
 #include <cstdint>
+#include <string>
 
 namespace strata::kernels {
 
@@ -27,5 +28,10 @@ QlLag* ql_lag_host();
 void ql_lag_set_flags(const void* flag_a, const void* flag_b, const void* flag_rows);
 /// Before a decode window: forget the last CPU-rows release (the first layer's router follows the draft, not a wait).
 void ql_lag_window_begin();
+
+/// QuantLab (11/15) STRATA_QL_PROBE (E-F): the GPU half of the start-up probe - the card, the H2D copies (pinned and
+/// pageable) and D2H, the GPU's read of VRAM and of mapped host memory (the PCIe share's path), and the round trip of a
+/// host flag to a spinning kernel and back.  JSON members without the braces ("gpu_probe": "skipped" on HIP builds).
+std::string ql_probe_gpu();
 
 }  // namespace strata::kernels

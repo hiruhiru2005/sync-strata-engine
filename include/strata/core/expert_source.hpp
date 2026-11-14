@@ -936,6 +936,10 @@ public:
     bool ql_swap_pin(int64_t layer, int64_t a, int64_t b);
     /// The copy is registered only in part (CS-T: complement_pin_limit_ < its bytes): STRATA_QL_PIN_SWAP has work to do.
     bool ql_partial_pin() const { return complement_ready_ && complement_partial_ && complement_pin_limit_ < complement_bytes_; }
+    /// QuantLab (11/15) STRATA_QL_PROBE (E-F): the host half of the start-up probe - the pack's shape, the RAM copy's read
+    /// bandwidth (1 thread, half and all the logical cores) and the drive's unbuffered expert reads (one at a time, 8 at
+    /// once).  JSON members without the braces.
+    std::string ql_probe_host() const;
     /// The bytes an expert's place in the copy holds (its own size when packed by size, else the layer's largest).
     uint64_t ql_place_bytes(int64_t layer, int64_t expert) const { return blob_len(layer, expert); }
     int64_t ql_pin_swaps() const { return ql_pin_swaps_; }

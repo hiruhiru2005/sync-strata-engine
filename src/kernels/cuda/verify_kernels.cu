@@ -21,6 +21,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>   // QuantLab (11/15) STRATA_QL_LAG
+#include <atomic>    // QuantLab (11/15) STRATA_QL_PROBE
+#include <chrono>
+#include <climits>
+#include <cstdlib>
+#include <string>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -1691,6 +1696,140 @@ void ql_lag_set_flags(const void* flag_a, const void* flag_b, const void* flag_r
 void ql_lag_window_begin() {
     QlLag* L = ql_lag_host();
     if (L != nullptr) *(volatile unsigned long long*) &L->last_go = 0ull;
+}
+
+// QuantLab (11/15) STRATA_QL_PROBE (E-F, ql_lag.hpp): the GPU half of the start-up probe.
+#if !defined(__HIPCC__)
+__global__ void ql_probe_read_kernel(const uint4* p, size_t n, unsigned int* sink) {
+    uint32_t acc = 0;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const uint4 v = p[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x9e3779b9u) atomicAdd(sink, 1u);   // never in practice; keeps the reads
+}
+__global__ void ql_probe_pong_kernel(const volatile int* h2d, volatile int* d2h, int n, long long limit) {
+    for (int i = 1; i <= n; ++i) {
+        const long long t0 = clock64();
+        while (*h2d < i) {
+            if (clock64() - t0 > limit) { *d2h = -1; __threadfence_system(); return; }
+        }
+        *d2h = i;
+        __threadfence_system();
+    }
+}
+#endif
+
+std::string ql_probe_gpu() {
+#if defined(__HIPCC__)
+    return "\"gpu_probe\": \"skipped\"";
+#else
+    std::string j;
+    char b[512];
+    auto num = [&](const char* k, double v) {
+        if (v < 0) std::snprintf(b, sizeof b, ", \"%s\": null", k);
+        else std::snprintf(b, sizeof b, ", \"%s\": %.5g", k, v);
+        j += b;
+    };
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceProp pr{};
+    cudaGetDeviceProperties(&pr, dev);
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);
+    std::string name;
+    for (const char* c = pr.name; *c != 0 && name.size() < 120; ++c) if (*c != '"' && *c != '\\') name += *c;
+    std::snprintf(b, sizeof b, "\"gpu_name\": \"%s\", \"gpu_sm\": %d, \"gpu_cc\": \"%d.%d\"", name.c_str(),
+                  pr.multiProcessorCount, pr.major, pr.minor);
+    j += b;
+    num("gpu_mem_total_gib", tot / 1073741824.0);
+    num("gpu_mem_free_gib", fr / 1073741824.0);
+    const size_t B = fr > (256ull << 20) ? (64ull << 20) : (16ull << 20);
+    num("probe_copy_mib", (double) (B >> 20));
+    void *d = nullptr, *hp = nullptr, *hm = nullptr, *hmd = nullptr, *pm = nullptr, *pmd = nullptr;
+    unsigned int* sink = nullptr;
+    cudaStream_t st = nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    void* hpg = std::malloc(B);
+    const bool ok = hpg != nullptr && cudaMalloc(&d, B) == cudaSuccess && cudaMalloc((void**) &sink, 4) == cudaSuccess &&
+                    cudaHostAlloc(&hp, B, cudaHostAllocDefault) == cudaSuccess &&
+                    cudaHostAlloc(&hm, B, cudaHostAllocMapped) == cudaSuccess && cudaHostGetDevicePointer(&hmd, hm, 0) == cudaSuccess &&
+                    cudaHostAlloc(&pm, 4096, cudaHostAllocMapped) == cudaSuccess && cudaHostGetDevicePointer(&pmd, pm, 0) == cudaSuccess &&
+                    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess && cudaEventCreate(&e0) == cudaSuccess &&
+                    cudaEventCreate(&e1) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        j += ", \"gpu_probe\": \"no memory for the buffers\"";
+    } else {
+        std::memset(hpg, 1, B);
+        std::memset(hp, 2, B);
+        std::memset(hm, 3, B);
+        cudaMemsetAsync(d, 0, B, st);
+        cudaStreamSynchronize(st);
+        auto best_gbs = [&](auto&& op) -> double {   // the best of 5 passes, GB/s (10^9)
+            double best = -1;
+            for (int r = 0; r < 5; ++r) {
+                cudaEventRecord(e0, st);
+                if (!op()) { cudaGetLastError(); return -1; }
+                cudaEventRecord(e1, st);
+                cudaEventSynchronize(e1);
+                float ms = 0;
+                cudaEventElapsedTime(&ms, e0, e1);
+                if (ms > 0) best = std::max(best, (double) B / (ms * 1e-3) / 1e9);
+            }
+            return best;
+        };
+        num("h2d_pinned_gbs", best_gbs([&] { return cudaMemcpyAsync(d, hp, B, cudaMemcpyHostToDevice, st) == cudaSuccess; }));
+        num("h2d_pageable_gbs", best_gbs([&] { return cudaMemcpyAsync(d, hpg, B, cudaMemcpyHostToDevice, st) == cudaSuccess; }));
+        num("d2h_pinned_gbs", best_gbs([&] { return cudaMemcpyAsync(hp, d, B, cudaMemcpyDeviceToHost, st) == cudaSuccess; }));
+        const int grid = std::max(1, pr.multiProcessorCount) * 4;
+        num("gpu_read_vram_gbs", best_gbs([&] {
+            ql_probe_read_kernel<<<grid, 256, 0, st>>>((const uint4*) d, B / 16, sink);
+            return cudaGetLastError() == cudaSuccess;
+        }));
+        num("gpu_read_mapped_gbs", best_gbs([&] {   // the PCIe share reads the registered RAM copy like this
+            ql_probe_read_kernel<<<grid, 256, 0, st>>>((const uint4*) hmd, B / 16, sink);
+            return cudaGetLastError() == cudaSuccess;
+        }));
+        // a host flag to a spinning kernel and back (the host's plan / PCIe / CPU-rows flags work this way)
+        volatile int* hh = (volatile int*) pm;
+        volatile int* hd = (volatile int*) ((char*) pm + 128);
+        *hh = 0;
+        *hd = 0;
+        const int N = 2000;
+        ql_probe_pong_kernel<<<1, 1, 0, st>>>((const volatile int*) pmd, (volatile int*) ((char*) pmd + 128), N, 4000000000LL);
+        double rtt_us = -1;
+        if (cudaGetLastError() == cudaSuccess) {
+            const auto ts = std::chrono::steady_clock::now();
+            auto t0 = ts;
+            bool good = true;
+            for (int i = 1; i <= N && good; ++i) {
+                if (i == 11) t0 = std::chrono::steady_clock::now();   // the first ten carry the launch
+                *hh = i;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                while (*hd < i) {
+                    if (*hd == -1 || std::chrono::steady_clock::now() - ts > std::chrono::seconds(5)) { good = false; break; }
+                }
+            }
+            if (good) rtt_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / (N - 10);
+            *hh = INT_MAX;   // a stuck kernel leaves at once
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
+        cudaStreamSynchronize(st);
+        num("flag_round_trip_us", rtt_us);
+        cudaGetLastError();
+    }
+    if (e0) cudaEventDestroy(e0);
+    if (e1) cudaEventDestroy(e1);
+    if (st) cudaStreamDestroy(st);
+    if (d) cudaFree(d);
+    if (sink) cudaFree(sink);
+    if (hp) cudaFreeHost(hp);
+    if (hm) cudaFreeHost(hm);
+    if (pm) cudaFreeHost(pm);
+    std::free(hpg);
+    return j;
+#endif
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {

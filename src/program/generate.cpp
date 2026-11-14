@@ -13074,6 +13074,34 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // QuantLab (11/15) STRATA_QL_PROBE=<file.json> (E-F): after the load, measure this PC's parts (ql_probe_host,
+        // ql_probe_gpu) into the file, then end the engine (STRATA_QL_PROBE_KEEP=1: go on to READY).  STRATA_QL_PROBE_WAIT_S
+        // (default 5): seconds to let the start-up's background reads calm down first.
+        if (const char* qp = std::getenv("STRATA_QL_PROBE"); qp != nullptr && qp[0] != 0) {
+            const char* qw = std::getenv("STRATA_QL_PROBE_WAIT_S");
+            std::this_thread::sleep_for(std::chrono::seconds(qw != nullptr ? std::max(0, std::atoi(qw)) : 5));
+            const auto qt0 = std::chrono::steady_clock::now();
+            std::string js = "{\"strata_ql_probe\": 1, " + src.ql_probe_host() + ", " + strata::kernels::ql_probe_gpu();
+            char qb[160];
+            std::snprintf(qb, sizeof qb, ", \"pcie_frac\": %.3f, \"probe_s\": %.1f}\n", o.pcie_frac,
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - qt0).count());
+            js += qb;
+            if (FILE* qf = std::fopen(qp, "wb")) {
+                std::fwrite(js.data(), 1, js.size(), qf);
+                std::fclose(qf);
+                std::fprintf(stderr, "strata ql probe: wrote %s\n", qp);
+            } else {
+                std::fprintf(stderr, "strata ql probe: could not write %s\n", qp);
+            }
+            std::fprintf(stderr, "strata ql probe: %s", js.c_str());
+            const char* qk = std::getenv("STRATA_QL_PROBE_KEEP");
+            if (qk == nullptr || qk[0] != '1') {
+                std::fflush(stdout);
+                strata::core::release_gpu_waits(stderr);
+                std::fflush(stderr);
+                std::_Exit(0);
+            }
+        }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
