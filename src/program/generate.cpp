@@ -12668,7 +12668,8 @@ int main(int argc, char** argv) {
                         const ASwap w = aswaps[i];
                         const size_t out = (size_t) w.layer * g.n_expert + w.out;
                         if (host_res[out] != w.slot) continue;   // the table moved since the snapshot: not this one
-                        if (w.exchange && !src.stage_exchange(w.layer, w.victim >= 0 ? w.victim : w.in, w.out, w.j)) {
+                        if (w.exchange && !(w.victim >= 0 ? src.stage_retire_exchange(w.layer, w.victim, w.out, w.j)   // QuantLab (11/15)
+                                                          : src.stage_exchange(w.layer, w.in, w.out, w.j))) {
                             std::fprintf(stderr, "strata serve: adaptive tier: stage_exchange refused layer %d in %d out %d\n",
                                          (int) w.layer, (int) w.in, (int) w.out);
                             return false;

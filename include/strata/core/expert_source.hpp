@@ -878,6 +878,13 @@ public:
     uint8_t* exchange_buffer(int64_t q, int64_t layer = -1) const;
     /// Requires `has_resident(layer, in)`, `!has_resident(layer, out)` and `exchange_buffer(q)` holding out's blob.
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
+    /// QuantLab (11/15) STRATA_QL_RAM_ROTATE: an exchange whose leaver `victim` goes to the files (not to the GPU).  The victim
+    /// leaves the RAM table now (called between windows: no CPU job holds its place), its place is remembered, and the commit
+    /// (a window boundary later) writes `out` there - so no reader of the victim can see the place rewritten.
+    bool stage_retire_exchange(int64_t layer, int64_t victim, int64_t out, int64_t q);
+    /// STRATA_QL_RAM_ROTATE_VERIFY=1: the committed `out` copies read back from the files and compared (ok, BAD)
+    int64_t ql_rot_ok() const { return ql_rot_ok_.load(); }
+    int64_t ql_rot_bad() const { return ql_rot_bad_.load(); }
     /// --pipeline-windows: size the exchange table now, so a `stage_exchange` on the adaptive tier's thread never
     /// reallocates it under a concurrent `blob` (the pool reads it while windows are in flight).
     void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
@@ -1438,7 +1445,9 @@ private:
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
-    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
+    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; uint64_t at = UINT64_MAX; };   ///< at: a retire's place (QuantLab 11/15)
+    std::atomic<int64_t> ql_rot_ok_{0}, ql_rot_bad_{0};   ///< QuantLab (11/15) STRATA_QL_RAM_ROTATE_VERIFY
+    void ql_rot_verify(const Exchange& x, uint64_t at);
     std::vector<Exchange> staged_;
     std::atomic<ForesightSwap*> fs_swap_{nullptr};   ///< set_foresight_swap
     void fs_hold_staged(bool hold);

@@ -5235,6 +5235,46 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     return true;
 }
 
+bool FileExpertSource::stage_retire_exchange(int64_t layer, int64_t victim, int64_t out, int64_t q) {
+    // QuantLab (11/15): the same checks as stage_exchange (one blob size when packed), then the victim leaves the RAM table at once
+    const bool packed = fes_pack(n_layers_);
+    if (packed) {
+        static const bool swap_mixed = [] { const char* v = std::getenv("STRATA_QL_SWAP_MIXED"); return v && std::atoi(v) != 0; }();
+        if (!swap_mixed || victim < 0 || victim >= n_expert_ || out < 0 || out >= n_expert_ || blob_len(layer, victim) != blob_len(layer, out))
+            return false;
+    }
+    if (exchange_storage_.active() || !soft_in_.empty() || out < 0 || out >= n_expert_ || !has_resident(layer, victim) ||
+        has_resident(layer, out) || exchange_buffer(q, layer) == nullptr) return false;
+    const size_t i_v = (size_t) layer * (size_t) n_expert_ + (size_t) victim;
+    const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    if (override_.empty()) override_.assign((size_t) blobs_, nullptr);
+    if (override_[i_out] != nullptr) return false;
+    for (const Exchange& x : staged_)
+        if (x.in == i_v || x.q == q) return false;
+    const uint64_t at = complement_offsets_[i_v];
+    if (at == kNoComplement) return false;
+    complement_offsets_[i_v] = kNoComplement;   // the victim is read from the files from the next window on
+    override_[i_out] = exchange_buffer(q, layer);
+    staged_.push_back({i_v, i_out, q, packed ? blob_len(layer, out) : layer_blob_bytes_[(size_t) layer], at});
+    return true;
+}
+
+void FileExpertSource::ql_rot_verify(const Exchange& x, uint64_t at) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_RAM_ROTATE_VERIFY"); return v != nullptr && v[0] == '1'; }();
+    if (!on || n_expert_ <= 0 || complement_host_ == nullptr) return;
+    const int64_t layer = (int64_t) (x.out / (size_t) n_expert_), e = (int64_t) (x.out % (size_t) n_expert_);
+    thread_local std::vector<uint8_t> buf;
+    buf.resize((size_t) x.bytes);
+    const Fill f{0, layer, e, buf.data(), nullptr, 0};
+    const bool ok = !direct_.empty() && read_direct(&f, 1, 0) &&
+                    std::memcmp(buf.data(), (const uint8_t*) complement_host_ + (size_t) at, (size_t) x.bytes) == 0;
+    const int64_t n = (ok ? ql_rot_ok_ : ql_rot_bad_).fetch_add(1) + 1;
+    if (!ok || (ql_rot_ok_.load() + ql_rot_bad_.load()) % 200 == 0)
+        std::fprintf(stderr, "strata ql ram rotate verify: %lld ok, %lld BAD%s\n", (long long) ql_rot_ok_.load(),
+                     (long long) ql_rot_bad_.load(), ok ? "" : " (this one: layer, expert below)");
+    if (!ok) std::fprintf(stderr, "strata ql ram rotate verify: BAD layer %lld expert %lld (%lld)\n", (long long) layer, (long long) e, (long long) n);
+}
+
 bool FileExpertSource::soft_commit_exchanges() {
     if (staged_.empty()) return true;
     if (exchange_storage_.active() || !xstage_pinned_ || xstage_ == nullptr || !complement_pinned_ || complement_device_ == nullptr)
@@ -5284,7 +5324,7 @@ int64_t FileExpertSource::commit_exchanges() {
                 int64_t done = 0;
                 for (const Exchange& x : commit_bg_) {
                     const uint8_t* src = override_[x.out];
-                    const uint64_t at = complement_offsets_[x.in];
+                    const uint64_t at = x.at != UINT64_MAX ? x.at : complement_offsets_[x.in];   // QuantLab (11/15): a retire
                     if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
                         complement_host_ != nullptr && complement_offsets_[x.out] == kNoComplement && x.in != x.out) {
                         complement_offsets_[x.in] = kNoComplement;
@@ -5293,6 +5333,7 @@ int64_t FileExpertSource::commit_exchanges() {
                         std::atomic_thread_fence(std::memory_order_seq_cst);
                         complement_offsets_[x.out] = at;
                         std::atomic_thread_fence(std::memory_order_seq_cst);
+                        if (x.at != UINT64_MAX) ql_rot_verify(x, at);
                         ++done;
                     }
                     override_[x.out] = nullptr;
@@ -5317,11 +5358,15 @@ int64_t FileExpertSource::commit_exchanges() {
             override_[x.out] = nullptr;
             continue;
         }
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at != UINT64_MAX ? x.at : complement_offsets_[x.in];   // QuantLab (11/15): a retire's saved place
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr) {
             std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
-            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+            if (x.at != UINT64_MAX) {   // the victim left the table at its stage: out takes the place
+                complement_offsets_[x.out] = at;
+                ql_rot_verify(x, at);
+                ++n;
+            } else if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
         }
         override_[x.out] = nullptr;
     }
