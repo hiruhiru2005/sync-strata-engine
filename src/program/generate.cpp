@@ -54,6 +54,11 @@
 // (default 0.8) longer than the other gets 1/32 of the missed experts moved away from the late side, between
 // STRATA_QL_PCIE_AUTO_LO and _HI (0.2 .. 1.0); the share is remembered across requests (a request's own pcie_frac wins).
 // Single GPU only.  STRATA_QL_PCIE_AUTO_VERBOSE=1 prints each move.
+namespace strata::core {   // QuantLab (11/15) E-B2 (expert_source.cpp)
+bool ql_pcie_layer_on();
+double ql_pcie_layer_beta();
+void ql_pcie_layer_beta_add(double d);
+}
 struct QlPcieAuto {
     bool on = false, verbose = false;
     int every = 16, step = 8, lo = 51, hi = 256, num = -1;
@@ -63,7 +68,7 @@ static QlPcieAuto& ql_pcie_auto() {
     static QlPcieAuto a = [] {
         QlPcieAuto x;
         const char* v = std::getenv("STRATA_QL_PCIE_AUTO");
-        x.on = v != nullptr && v[0] == '1';
+        x.on = (v != nullptr && v[0] == '1') || strata::core::ql_pcie_layer_on();   // E-B2 learns its offset here
         if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_EVERY")) x.every = std::max(2, std::atoi(e));
         if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_BAND")) x.band = std::max(0.0, std::atof(e));
         if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_LO")) x.lo = std::max(0, std::min(256, (int) (std::atof(e) * 256.0 + 0.5)));
@@ -12349,7 +12354,8 @@ int main(int argc, char** argv) {
         // read the expert cache - so a slot whose expert was marked non-resident here may be overwritten right away;
         // and the job thread never touches host_res or drive.d.usage (it works on the snapshots a_usage / a_res).
         // Anything that gives a slot to something else (kvg_ensure's quiesce, a prompt's lend) calls adapt_quiesce first.
-        struct ASwap { int32_t layer, in, out, slot; int home; int64_t j; bool exchange; const uint8_t* from; };
+        struct ASwap { int32_t layer, in, out, slot; int home; int64_t j; bool exchange; const uint8_t* from;
+                       int32_t victim = -1; };   // QuantLab (11/15) STRATA_QL_RAM_ROTATE: the RAM resident `out` replaces
         struct AHome { strata::core::ExpertCache* cache; cudaStream_t stream; cudaEvent_t ev; int dev; bool used; };
         enum class AState { Idle, Pick, CopyBack, SwapIn, RamFence, Commit };
         AState astate = AState::Idle;
@@ -12432,16 +12438,59 @@ int main(int argc, char** argv) {
             }
             std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.gain > b.gain; });
             aswaps.clear();
+            // QuantLab (11/15) STRATA_QL_RAM_ROTATE=1 (E-E (a)): when `in` has no RAM copy (read from the files), `out`
+            // would leave the GPU for the files and the RAM copy would never change.  Instead `out` takes the RAM place of
+            // the least used resident of its layer and size whose usage is below STRATA_QL_RAM_ROTATE_MAX (default 0.5:
+            // one rarely routed, so a CPU job is unlikely to be reading it while its place is rewritten) and below out's;
+            // that resident goes to the files (an exchange with a different leaver: stage_exchange(layer, victim, out)).
+            static const bool rot_on = [] { const char* v = std::getenv("STRATA_QL_RAM_ROTATE"); return v != nullptr && v[0] == '1'; }();
+            static const float rot_max = [] { const char* v = std::getenv("STRATA_QL_RAM_ROTATE_MAX"); return v ? (float) std::atof(v) : 0.5f; }();
+            static int64_t rot_n = 0, rot_miss = 0, rot_rounds = 0;
+            static double rot_vu = 0.0, rot_ou = 0.0;
+            std::vector<int32_t> rot_taken;
             for (const C& c : all) {
                 if ((int64_t) aswaps.size() >= a_cap) break;
                 const int32_t slot = a_res[(size_t) c.layer * g.n_expert + c.out];
                 if (slot < 0) continue;
                 // an exchange (as resident_stage_swaps): `in` from the RAM copy, `out` held by its slot alone takes its
                 // place there; otherwise `out` is in the copy already (the lend region) or `in` is not (a RAM budget)
-                const bool x = !a_arena && src.has_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out);
+                bool x = !a_arena && src.has_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out);
+                int32_t victim = -1;
+                if (rot_on && !x && !a_arena && !src.has_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out)) {
+                    const float* u = a_usage.data() + (size_t) c.layer * g.n_expert;
+                    const int32_t* rr = a_res.data() + (size_t) c.layer * g.n_expert;
+                    const auto& EL = strata::kernels::cpu::expert_layout();
+                    const auto ob = EL.expert_bytes(c.layer, c.out);
+                    float best = std::min(rot_max, u[c.out]);
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        if (e == c.in || e == c.out || rr[e] >= 0 || !src.has_resident(c.layer, e) || u[e] >= best) continue;
+                        if (EL.expert_bytes(c.layer, e) != ob) continue;
+                        const int32_t key = c.layer * (int32_t) g.n_expert + e;
+                        if (std::find(rot_taken.begin(), rot_taken.end(), key) != rot_taken.end()) continue;
+                        bool used_here = false;   // not an `in` or victim of another swap this round
+                        for (const ASwap& w : aswaps) used_here = used_here || (w.layer == c.layer && (w.in == e || w.victim == e));
+                        if (used_here) continue;
+                        best = u[e];
+                        victim = e;
+                    }
+                    if (victim >= 0) {
+                        x = true;
+                        rot_taken.push_back(c.layer * (int32_t) g.n_expert + victim);
+                        ++rot_n;
+                        rot_vu += best;
+                        rot_ou += u[c.out];
+                    } else {
+                        ++rot_miss;
+                    }
+                }
                 aswaps.push_back({c.layer, c.in, c.out, slot, multi_gpu ? stage_of(c.layer) : 0, (int64_t) aswaps.size(), x,
-                                  nullptr});
+                                  nullptr, victim});
             }
+            if (rot_on && ++rot_rounds % 50 == 0)   // QuantLab (11/15) E-E (c)
+                std::fprintf(stderr, "strata ql ram rotate: %lld evicted experts given a RAM place (victim usage %.3f, theirs %.3f "
+                                     "on average), %lld found none, over %lld rounds\n", (long long) rot_n,
+                             rot_n ? rot_vu / (double) rot_n : 0.0, rot_n ? rot_ou / (double) rot_n : 0.0, (long long) rot_miss,
+                             (long long) rot_rounds);
         };
         auto a_back = [&](int hi) {   // step 1's copies back (D2H) from home hi's cache, then its event
             AHome& h = ahomes[(size_t) hi];
@@ -12618,7 +12667,7 @@ int main(int argc, char** argv) {
                         const ASwap w = aswaps[i];
                         const size_t out = (size_t) w.layer * g.n_expert + w.out;
                         if (host_res[out] != w.slot) continue;   // the table moved since the snapshot: not this one
-                        if (w.exchange && !src.stage_exchange(w.layer, w.in, w.out, w.j)) {
+                        if (w.exchange && !src.stage_exchange(w.layer, w.victim >= 0 ? w.victim : w.in, w.out, w.j)) {
                             std::fprintf(stderr, "strata serve: adaptive tier: stage_exchange refused layer %d in %d out %d\n",
                                          (int) w.layer, (int) w.in, (int) w.out);
                             return false;
@@ -16990,6 +17039,7 @@ int main(int argc, char** argv) {
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
+            const int64_t tail_cold0 = drive.d.ql_tail_cold;   // QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD
             strata::kernels::QlLag lag0{};   // QuantLab (11/15) STRATA_QL_LAG: the counters as this request's decode starts
             if (strata::kernels::QlLag* L = strata::kernels::ql_lag_host()) std::memcpy(&lag0, (const void*) L, sizeof lag0);
             // QuantLab (11/15) STRATA_QL_PCIE_AUTO=1 (E-B): the share moves by the measured lag, every few windows
@@ -18003,8 +18053,16 @@ int main(int argc, char** argv) {
                         const double cw = ((s1.wait - pa_snap.wait) - (double) (l1.post_ns - pa_lag.post_ns) / 1e6) / nw;   // CPU for the GPU
                         auto& A = ql_pcie_auto();
                         int num = drive.d.pcie_num;
+                        if (strata::core::ql_pcie_layer_on()) {   // E-B2: the share stays, the per-layer offset moves
+                            if (gw - cw > A.band) strata::core::ql_pcie_layer_beta_add(-0.125);      // the GPU waits: more over PCIe
+                            else if (cw - gw > A.band) strata::core::ql_pcie_layer_beta_add(0.125);  // the CPU waits: fewer
+                            if (A.verbose)
+                                std::fprintf(stderr, "strata ql pcie layer: GPU waited %.2f, CPU waited %.2f ms/window -> beta %.3f\n",
+                                             gw, cw, strata::core::ql_pcie_layer_beta());
+                        } else {
                         if (gw - cw > A.band) num += A.step;        // the CPU is late: more of the missed experts over PCIe
                         else if (cw - gw > A.band) num -= A.step;   // the GPU is late: more of them on the CPU
+                        }
                         num = std::max(A.lo, std::min(A.hi, num));
                         if (num != drive.d.pcie_num) {
                             ++pa_moves;
@@ -18216,6 +18274,9 @@ int main(int argc, char** argv) {
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);
+                if (strata::core::ql_tail_skip_cold_rank() > 0)   // QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD
+                    std::fprintf(stderr, "strata ql tail cold: %.2f experts per window skipped by the file-only rank %d (beyond R's)\n",
+                                 (double) (drive.d.ql_tail_cold - tail_cold0) / w, strata::core::ql_tail_skip_cold_rank());
                 if (strata::kernels::QlLag* L = strata::kernels::ql_lag_host()) {   // QuantLab (11/15) STRATA_QL_LAG
                     strata::kernels::QlLag l1{};
                     std::memcpy(&l1, (const void*) L, sizeof l1);
@@ -18229,8 +18290,10 @@ int main(int argc, char** argv) {
                                  ms(2), nrows > 0 ? 100.0 * spun / nrows : 0.0, nrows / w, ms(0), ms(1), ms(3), post,
                                  (double) (l1.n_post - lag0.n_post) / w, reach, reach - post > 0 ? reach - post : 0.0);
                     if (ql_pcie_auto().on && !req_pcie_set)
-                        std::fprintf(stderr, "strata ql pcie auto: the share %.3f -> %.3f over this request (%d moves)\n",
-                                     pa_start / 256.0, drive.d.pcie_num / 256.0, pa_moves);
+                        std::fprintf(stderr, "strata ql pcie auto: the share %.3f -> %.3f over this request (%d moves)%s%.3f\n",
+                                     pa_start / 256.0, drive.d.pcie_num / 256.0, pa_moves,
+                                     strata::core::ql_pcie_layer_on() ? ", layer mode beta " : "",
+                                     strata::core::ql_pcie_layer_on() ? strata::core::ql_pcie_layer_beta() : 0.0);
                 }
                 if (!drive.d.ql_lrun.empty()) {   // QuantLab (11/12) STRATA_QL_LAYER_CPU=1 (expert_source.cpp)
                     auto& dd = drive.d;

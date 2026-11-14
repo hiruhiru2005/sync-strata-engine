@@ -3595,23 +3595,40 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, int drive) const
         sc.buf = (uint8_t*) VirtualAlloc(nullptr, sc.cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (sc.buf == nullptr) { sc.cap = 0; return false; }
     }
-    while (sc.ev.size() < sc.req.size()) {
+    // QuantLab (11/15) STRATA_QL_DIRECT_CHUNK_KIB=c (a multiple of 4; 0 / unset = off): each request goes out as reads of at
+    // most c KiB, all in flight at once (one 1.3 MB expert is one ReadFile otherwise: ~1.06 ms, ~1.2 GB/s on this PC's E:
+    // in the 11/15 jconv runs).  The same bytes land in the same places.
+    static const uint64_t chunk = [] {
+        const char* v = std::getenv("STRATA_QL_DIRECT_CHUNK_KIB");
+        const long long c = v != nullptr ? std::atoll(v) : 0;
+        return c >= 4 ? (uint64_t) (c / 4 * 4) * 1024ull : 0ull;
+    }();
+    struct Io { size_t q; uint64_t off, size; };
+    thread_local std::vector<Io> ios;
+    ios.clear();
+    for (size_t q = 0; q < sc.req.size(); ++q) {
+        const uint64_t sz = sc.req[q].size;
+        if (chunk == 0 || sz <= chunk) { ios.push_back({q, 0, sz}); continue; }
+        for (uint64_t o = 0; o < sz; o += chunk) ios.push_back({q, o, std::min<uint64_t>(chunk, sz - o)});
+    }
+    while (sc.ev.size() < ios.size()) {
         HANDLE e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (e == nullptr) return false;
         sc.ev.push_back(e);
     }
-    sc.ov.assign(sc.req.size(), OVERLAPPED{});
+    sc.ov.assign(ios.size(), OVERLAPPED{});
     const auto qp1 = std::chrono::steady_clock::now();
-    // every request in flight before the first wait: the drive sees the whole batch as one queue
     size_t issued = 0;
     bool ok = true;
-    for (size_t q = 0; q < sc.req.size(); ++q) {
-        const Req& r = sc.req[q];
-        OVERLAPPED& o = sc.ov[q];
-        o.Offset = (DWORD) r.a0;
-        o.OffsetHigh = (DWORD) (r.a0 >> 32);
-        o.hEvent = sc.ev[q];
-        if (!ReadFile(r.h, r.direct != nullptr ? r.direct : sc.buf + r.pos, (DWORD) r.size, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
+    for (size_t i = 0; i < ios.size(); ++i) {
+        const Req& r = sc.req[ios[i].q];
+        OVERLAPPED& o = sc.ov[i];
+        const uint64_t at = r.a0 + ios[i].off;
+        o.Offset = (DWORD) at;
+        o.OffsetHigh = (DWORD) (at >> 32);
+        o.hEvent = sc.ev[i];
+        uint8_t* dst = (r.direct != nullptr ? r.direct : sc.buf + r.pos) + ios[i].off;
+        if (!ReadFile(r.h, dst, (DWORD) ios[i].size, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
             ok = false;
             break;
         }
@@ -3620,9 +3637,13 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, int drive) const
     const auto qp2 = std::chrono::steady_clock::now();
     std::vector<DWORD>& got = sc.got;
     got.assign(sc.req.size(), 0);
-    for (size_t q = 0; q < issued; ++q)
-        if (!GetOverlappedResult(sc.req[q].h, &sc.ov[q], &got[q], TRUE)) ok = false;
-    if (!ok || issued < sc.req.size()) return false;
+    for (size_t i = 0; i < issued; ++i) {
+        DWORD g = 0;
+        if (!GetOverlappedResult(sc.req[ios[i].q].h, &sc.ov[i], &g, TRUE)) ok = false;
+        // a request's bytes: the chunks before a short one count; a chunk short of its size ends the request there
+        if (got[ios[i].q] == ios[i].off) got[ios[i].q] += g;
+    }
+    if (!ok || issued < ios.size()) return false;
     const auto qp3 = std::chrono::steady_clock::now();
     uint64_t qbytes = 0;
     for (const Window& x : sc.win) {
@@ -5721,6 +5742,17 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
            complement_offsets_[at_index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
 }
 
+// QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD: a RAM copy of the expert, pinned or pageable (pinned()'s test without the
+// partial pin's limit); no RAM copy = the expert is read from the files
+bool FileExpertSource::in_ram(int64_t layer, int64_t expert) const {
+    if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+        return false;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (exchange_storage_.active()) return exchange_storage_.resident(index).host != nullptr;
+    const size_t at_index = !soft_in_.empty() && soft_in_[index] != SIZE_MAX ? soft_in_[index] : index;
+    return at_index < complement_offsets_.size() && complement_offsets_[at_index] != kNoComplement;
+}
+
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -5874,6 +5906,54 @@ namespace {
 // explicit environment value is read once; the serve start-up (generate.cpp) sets the CUDA default where it applies.
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
+// QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD=Rc (1..9; unset/0 = off; changes the output): a missed expert with no RAM
+// copy (read from the files) is skipped when every token of the window routes it at rank >= Rc - a stricter rank than
+// STRATA_ROUTE_TAIL_SKIP's R for the experts that cost an SSD read.  Works with R off too.
+int ql_tail_skip_cold_rank() {
+    static const int r = [] {
+        const char* v = std::getenv("STRATA_QL_TAIL_SKIP_COLD");
+        const int x = v != nullptr ? std::atoi(v) : 0;
+        if (x > 0 && x < 10)
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_TAIL_SKIP_COLD=%d: a missed expert read from the files is skipped "
+                                 "when every token ranks it %d or lower (changes the output)\n", x, x);
+        return x > 0 && x < 10 ? x : 0;
+    }();
+    return r;
+}
+
+// QuantLab (11/15) STRATA_QL_PCIE_LAYER=1 (E-B2; off by default): each layer's PCIe count from its own misses instead of
+// the share of all of them: the misses split into pinned (movable), RAM-only (CPU) and file-only (cold); a layer with a cold
+// miss sends none over PCIe (STRATA_QL_PCIE_LAYER_COLD0=0 lets it) - the CPU waits for the SSD anyway and computes the
+// others meanwhile; else k = clamp(round((pinned + RAM-only) * w - beta), 0, pinned), w = STRATA_QL_PCIE_LAYER_W (0.5),
+// beta learned by the decode loop from STRATA_QL_LAG's waits (generate.cpp), and the k are chosen among the pinned misses
+// (the last in routing order), so none falls back to the CPU for want of a pinned blob.  Single GPU, no Foresight.
+struct QlPcieLayer {
+    bool on = false, cold0 = true;
+    double w = 0.5;
+};
+static const QlPcieLayer& ql_pcie_layer_cfg() {
+    static const QlPcieLayer c = [] {
+        QlPcieLayer x;
+        const char* v = std::getenv("STRATA_QL_PCIE_LAYER");
+        x.on = v != nullptr && v[0] == '1';
+        if (const char* e = std::getenv("STRATA_QL_PCIE_LAYER_COLD0")) x.cold0 = e[0] != '0';
+        if (const char* e = std::getenv("STRATA_QL_PCIE_LAYER_W")) x.w = std::max(0.0, std::min(2.0, std::atof(e)));
+        if (x.on)
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_PCIE_LAYER=1: the PCIe count per layer from its pinned, RAM-only "
+                                 "and file-only misses (w %.2f, a cold layer %s), the offset learned from the lag\n", x.w,
+                         x.cold0 ? "sends none" : "as the others");
+        return x;
+    }();
+    return c;
+}
+static std::atomic<double> g_ql_pl_beta{0.5};
+bool ql_pcie_layer_on() { return ql_pcie_layer_cfg().on; }
+double ql_pcie_layer_beta() { return g_ql_pl_beta.load(std::memory_order_relaxed); }
+void ql_pcie_layer_beta_add(double d) {
+    const double b = std::max(-4.0, std::min(4.0, g_ql_pl_beta.load(std::memory_order_relaxed) + d));
+    g_ql_pl_beta.store(b, std::memory_order_relaxed);
+}
+
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
@@ -6004,12 +6084,14 @@ int ql_prefetch_pick(int64_t layer, const int32_t* e0, int n_tok, int k, int m, 
     }
     // the misses as the plan would see them: outside VRAM, no peer; E0's own tail skip (every token ranks it >= R)
     const int tail = d.peer == nullptr && d.remote_count == 0 ? tail_skip_rank() : 0;
+    const int tail_cold = d.peer == nullptr && d.remote_count == 0 ? ql_tail_skip_cold_rank() : 0;   // QuantLab (11/15)
     int miss[128], nmiss = 0;
     for (int q = 0; q < nd; ++q) {
         const int32_t e = dist[q];
         if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0) continue;
         if (d.peer != nullptr && d.peer->has(layer, e)) continue;
         if (tail > 0 && brank[q] >= tail) continue;
+        if (tail_cold > 0 && brank[q] >= tail_cold && !d.src->in_ram(layer, e)) continue;
         miss[nmiss++] = q;
     }
     // mode A: the plan's PCIe share is the last `mp` misses in that order - those first; then by best rank (ties: order)
@@ -6491,9 +6573,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
         const int tail_rank = tail_skip_rank();
+        const int tail_cold = ql_tail_skip_cold_rank();   // QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+        if ((tail_rank > 0 || tail_cold > 0) && d.peer == nullptr && d.remote_count == 0) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
@@ -6503,11 +6586,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                if (e < 0 || e >= d.n_expert) continue;
+                const bool by_r = tail_rank > 0 && minr[q] >= tail_rank;
+                const bool by_cold = !by_r && tail_cold > 0 && minr[q] >= tail_cold;   // checked against the files below
+                if (!by_r && !by_cold) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                if (by_cold && d.src->in_ram(d.layers, e)) continue;   // a RAM copy: the cold rank does not apply
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;
+                if (by_cold) ++d.ql_tail_cold;
             }
         }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
@@ -6523,6 +6611,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // pinned (the fetch below checks), else it stays a CPU miss exactly as before.  Read once.
         static const bool pcie_min1 = [] { const char* v = std::getenv("STRATA_PCIE_MIN1"); return v && std::atoi(v) != 0; }();
         if (pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
+        // QuantLab (11/15) STRATA_QL_PCIE_LAYER=1 (E-B2): this layer's count from its pinned / RAM-only / file-only misses;
+        // the chosen are the last `m` pinned misses in routing order (pl_pin_rank below)
+        const bool pl_on = pcie_ok && ql_pcie_layer_cfg().on && d.fs == nullptr && !(d.peer != nullptr) && !pf_on;
+        int pl_mv = 0;
+        if (pl_on) {
+            int u = 0, c = 0;
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (skip_d[q] || e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0 ||
+                    helper_holds(e)) continue;
+                if (d.src->pinned(d.layers, e)) ++pl_mv;
+                else if (d.src->in_ram(d.layers, e)) ++u;
+                else ++c;
+            }
+            const auto& C = ql_pcie_layer_cfg();
+            if (c > 0 && C.cold0) m = 0;
+            else m = std::max(0, std::min(pl_mv, (int) std::lround((double) (u + pl_mv) * C.w - ql_pcie_layer_beta())));
+        }
+        int pl_pin_rank = 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -6571,6 +6678,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
                     bool to_pcie = miss_rank >= nmiss - m;
+                    if (pl_on) {   // E-B2: among the pinned misses only, the last m of them
+                        const bool pin = d.src->pinned(d.layers, e);
+                        to_pcie = pin && pl_pin_rank >= pl_mv - m;
+                        if (pin) ++pl_pin_rank;
+                    }
                     if (pf_npf > 0) {   // STRATA_QL_PREFETCH_MODE=B: the prefetched first, then the last of the others
                         if (pf_find(e) >= 0) to_pcie = true;
                         else to_pcie = pf_rank++ >= (nmiss - pf_npf) - std::max(0, m - pf_npf);

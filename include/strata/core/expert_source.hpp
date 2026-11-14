@@ -211,6 +211,9 @@ public:
     /// Plan v0.3 P5: whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD: whether the expert has a copy in RAM (pinned or not); false = it is read
+    /// from the files when the CPU or PCIe needs it.  A source without a file tier: always true.
+    virtual bool in_ram(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
 
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
@@ -624,6 +627,7 @@ struct ExpertDispatch {
     /// and the distinct experts behind them (neither copied nor computed)
     int64_t tail_skipped = 0;
     int64_t tail_experts = 0;
+    int64_t ql_tail_cold = 0;   ///< QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD: experts skipped by the file-only rank only
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// QuantLab (11/12) STRATA_QL_LAYER_CPU=1: per layer the pool's wall time (ms, the cold batches included), the jobs
     /// (distinct CPU experts) and the dispatches; over all layers the jobs by token count (1..7, 8 = 8 or more; the
@@ -724,6 +728,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
+int ql_tail_skip_cold_rank();   ///< QuantLab (11/15) STRATA_QL_TAIL_SKIP_COLD (0 = off)
 void set_tail_skip_rank(int r);
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
@@ -1029,6 +1034,7 @@ public:
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
     uint64_t release(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;
+    bool in_ram(int64_t layer, int64_t expert) const override;   // QuantLab (11/15)
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
