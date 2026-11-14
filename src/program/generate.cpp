@@ -55,6 +55,7 @@
 // STRATA_QL_PCIE_AUTO_LO and _HI (0.2 .. 1.0); the share is remembered across requests (a request's own pcie_frac wins).
 // Single GPU only.  STRATA_QL_PCIE_AUTO_VERBOSE=1 prints each move.
 namespace strata::core {   // QuantLab (11/15) E-B2 (expert_source.cpp)
+void ql_apply_priority();   // STRATA_QL_PRIO_CPU / _GPU
 bool ql_pcie_layer_on();
 double ql_pcie_layer_beta();
 void ql_pcie_layer_beta_add(double d);
@@ -13075,6 +13076,7 @@ int main(int argc, char** argv) {
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        strata::core::ql_apply_priority();   // QuantLab (11/15) STRATA_QL_PRIO_CPU / _GPU (nothing unless set)
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;

@@ -5954,6 +5954,44 @@ void ql_pcie_layer_beta_add(double d) {
     g_ql_pl_beta.store(b, std::memory_order_relaxed);
 }
 
+// QuantLab (11/15) STRATA_QL_PRIO_CPU=high|above and STRATA_QL_PRIO_GPU=high|above (Windows; off by default): once the engine
+// is loaded (serve's READY), the process's CPU priority class (SetPriorityClass) and its GPU scheduling priority class
+// (gdi32's D3DKMTSetProcessSchedulingPriorityClass: 3 above normal, 4 high), each read back and printed.  Elsewhere: nothing.
+void ql_apply_priority() {
+#if defined(_WIN32)
+    auto pick = [](const char* name) -> int {   // 0 off, 1 above, 2 high
+        const char* v = std::getenv(name);
+        if (v == nullptr) return 0;
+        const std::string s(v);
+        return s == "high" ? 2 : s == "above" ? 1 : 0;
+    };
+    const int cpu = pick("STRATA_QL_PRIO_CPU"), gpu = pick("STRATA_QL_PRIO_GPU");
+    if (cpu > 0) {
+        const BOOL ok = SetPriorityClass(GetCurrentProcess(), cpu == 2 ? HIGH_PRIORITY_CLASS : ABOVE_NORMAL_PRIORITY_CLASS);
+        const DWORD now = GetPriorityClass(GetCurrentProcess());
+        std::fprintf(stderr, "strata: QuantLab STRATA_QL_PRIO_CPU=%s: SetPriorityClass %s (error %lu), the class now 0x%lx\n",
+                     cpu == 2 ? "high" : "above", ok ? "ok" : "failed", ok ? 0ul : (unsigned long) GetLastError(), (unsigned long) now);
+    }
+    if (gpu > 0) {
+        typedef long (WINAPI* SetFn)(HANDLE, int);
+        typedef long (WINAPI* GetFn)(HANDLE, int*);
+        HMODULE g = LoadLibraryW(L"gdi32.dll");
+        SetFn set = g ? (SetFn) GetProcAddress(g, "D3DKMTSetProcessSchedulingPriorityClass") : nullptr;
+        GetFn get = g ? (GetFn) GetProcAddress(g, "D3DKMTGetProcessSchedulingPriorityClass") : nullptr;
+        if (set == nullptr) {
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_PRIO_GPU: gdi32 has no D3DKMTSetProcessSchedulingPriorityClass\n");
+        } else {
+            const long st = set(GetCurrentProcess(), gpu == 2 ? 4 : 3);
+            int back = -1;
+            const long gst = get ? get(GetCurrentProcess(), &back) : -1;
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_PRIO_GPU=%s: D3DKMTSetProcessSchedulingPriorityClass NTSTATUS 0x%08lx, "
+                                 "read back %d (NTSTATUS 0x%08lx)\n", gpu == 2 ? "high" : "above", (unsigned long) st, back,
+                         (unsigned long) gst);
+        }
+    }
+#endif
+}
+
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
