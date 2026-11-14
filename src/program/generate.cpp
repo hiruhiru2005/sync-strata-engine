@@ -18053,23 +18053,24 @@ int main(int argc, char** argv) {
                         const double cw = ((s1.wait - pa_snap.wait) - (double) (l1.post_ns - pa_lag.post_ns) / 1e6) / nw;   // CPU for the GPU
                         auto& A = ql_pcie_auto();
                         int num = drive.d.pcie_num;
+                        // E-G (11/15): a large imbalance moves several steps at once (|gap| / band, 1 .. 4), so a load that
+                        // takes the CPU or the GPU away is followed within a few decisions (16 windows ~ 0.3-0.4 s each)
+                        const double gap = gw - cw;
+                        const int mult = A.band > 0.0 ? std::max(1, std::min(4, (int) (std::fabs(gap) / A.band))) : 1;
                         if (strata::core::ql_pcie_layer_on()) {   // E-B2: the share stays, the per-layer offset moves
-                            if (gw - cw > A.band) strata::core::ql_pcie_layer_beta_add(-0.125);      // the GPU waits: more over PCIe
-                            else if (cw - gw > A.band) strata::core::ql_pcie_layer_beta_add(0.125);  // the CPU waits: fewer
-                            if (A.verbose)
-                                std::fprintf(stderr, "strata ql pcie layer: GPU waited %.2f, CPU waited %.2f ms/window -> beta %.3f\n",
-                                             gw, cw, strata::core::ql_pcie_layer_beta());
+                            if (gap > A.band) strata::core::ql_pcie_layer_beta_add(-0.125 * mult);      // the GPU waits: more over PCIe
+                            else if (-gap > A.band) strata::core::ql_pcie_layer_beta_add(0.125 * mult);  // the CPU waits: fewer
                         } else {
-                        if (gw - cw > A.band) num += A.step;        // the CPU is late: more of the missed experts over PCIe
-                        else if (cw - gw > A.band) num -= A.step;   // the GPU is late: more of them on the CPU
+                        if (gap > A.band) num += A.step * mult;        // the CPU is late: more of the missed experts over PCIe
+                        else if (-gap > A.band) num -= A.step * mult;  // the GPU is late: more of them on the CPU
                         }
                         num = std::max(A.lo, std::min(A.hi, num));
-                        if (num != drive.d.pcie_num) {
-                            ++pa_moves;
-                            if (A.verbose)
-                                std::fprintf(stderr, "strata ql pcie auto: GPU waited %.2f, CPU waited %.2f ms/window -> share %.3f\n",
-                                             gw, cw, num / 256.0);
-                        }
+                        if (A.verbose)   // every decision (E-G: the load arms read how the share follows)
+                            std::fprintf(stderr, "strata ql pcie auto: GPU waited %.2f, CPU waited %.2f ms/window over %d windows -> "
+                                                 "share %.3f%s%.3f\n", gw, cw, pa_n, num / 256.0,
+                                         strata::core::ql_pcie_layer_on() ? ", beta " : "",
+                                         strata::core::ql_pcie_layer_on() ? strata::core::ql_pcie_layer_beta() : 0.0);
+                        if (num != drive.d.pcie_num) ++pa_moves;
                         drive.d.pcie_num = num;
                         split_drive.pcie_num[0] = num;
                         A.num = num;
