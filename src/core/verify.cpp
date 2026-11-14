@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
+#include "strata/kernels/ql_lag.hpp"   // QuantLab (11/15) STRATA_QL_LAG
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -949,6 +950,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
+    strata::kernels::ql_lag_set_flags(m_flagA_, m_flagB_, m_flag_);   // QuantLab (11/15) STRATA_QL_LAG (null when off)
     // QuantLab (11/13) STRATA_QL_PREDICT_STATS=2: the early routing's logits per layer, read by the plan (expert_source.cpp)
     // and the step whose E0 logits have landed (`h_qe_flag_`, the doorbell's step numbering), for the lead time
     if (ql_predict_stats_level() >= 2 &&

@@ -47,6 +47,36 @@
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/ql_lag.hpp"   // QuantLab (11/15) STRATA_QL_LAG
+
+// QuantLab (11/15) STRATA_QL_PCIE_AUTO=1 (E-B): --pcie-frac moved by the measured lag (STRATA_QL_LAG's counters): every
+// STRATA_QL_PCIE_AUTO_EVERY windows (default 16) the side that waited more than STRATA_QL_PCIE_AUTO_BAND ms/window
+// (default 0.8) longer than the other gets 1/32 of the missed experts moved away from the late side, between
+// STRATA_QL_PCIE_AUTO_LO and _HI (0.2 .. 1.0); the share is remembered across requests (a request's own pcie_frac wins).
+// Single GPU only.  STRATA_QL_PCIE_AUTO_VERBOSE=1 prints each move.
+struct QlPcieAuto {
+    bool on = false, verbose = false;
+    int every = 16, step = 8, lo = 51, hi = 256, num = -1;
+    double band = 0.8;
+};
+static QlPcieAuto& ql_pcie_auto() {
+    static QlPcieAuto a = [] {
+        QlPcieAuto x;
+        const char* v = std::getenv("STRATA_QL_PCIE_AUTO");
+        x.on = v != nullptr && v[0] == '1';
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_EVERY")) x.every = std::max(2, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_BAND")) x.band = std::max(0.0, std::atof(e));
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_LO")) x.lo = std::max(0, std::min(256, (int) (std::atof(e) * 256.0 + 0.5)));
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_HI")) x.hi = std::max(x.lo, std::min(256, (int) (std::atof(e) * 256.0 + 0.5)));
+        const char* vb = std::getenv("STRATA_QL_PCIE_AUTO_VERBOSE");
+        x.verbose = vb != nullptr && vb[0] == '1';
+        if (x.on)
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_PCIE_AUTO=1: the PCIe share follows the measured lag every %d "
+                                 "windows, band %.2f ms, %.3f .. %.3f, step 1/32\n", x.every, x.band, x.lo / 256.0, x.hi / 256.0);
+        return x;
+    }();
+    return a;
+}
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -16694,6 +16724,11 @@ int main(int argc, char** argv) {
             }
             ver.pause_pcie_balance(req_pcie_set);   // the measured costs keep across requests
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            // QuantLab (11/15) STRATA_QL_PCIE_AUTO=1 (E-B): the share the last request ended with, unless this one sets its own
+            if (ql_pcie_auto().on && !req_pcie_set && split_drive.n <= 1) {
+                if (ql_pcie_auto().num < 0) ql_pcie_auto().num = drive.d.pcie_num;
+                drive.d.pcie_num = ql_pcie_auto().num;
+            }
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
@@ -16955,6 +16990,13 @@ int main(int argc, char** argv) {
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
+            strata::kernels::QlLag lag0{};   // QuantLab (11/15) STRATA_QL_LAG: the counters as this request's decode starts
+            if (strata::kernels::QlLag* L = strata::kernels::ql_lag_host()) std::memcpy(&lag0, (const void*) L, sizeof lag0);
+            // QuantLab (11/15) STRATA_QL_PCIE_AUTO=1 (E-B): the share moves by the measured lag, every few windows
+            strata::kernels::QlLag pa_lag = lag0;
+            DecSnap pa_snap = ds0;
+            int pa_n = 0, pa_moves = 0;
+            const int pa_start = drive.d.pcie_num;
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
@@ -17948,6 +17990,36 @@ int main(int argc, char** argv) {
                     STRATA_QL_PROFILER_START();
                     std::fprintf(stderr, "strata: QuantLab profiler range on at decode window %lld\n", ql_pw_n);
                 }
+                strata::kernels::ql_lag_window_begin();   // QuantLab (11/15) STRATA_QL_LAG (nothing when off)
+                if (ql_pcie_auto().on && !req_pcie_set && split_drive.n <= 1 && ++pa_n >= ql_pcie_auto().every) {
+                    // E-B: the GPU's wait for the CPU rows against the host's wait for the GPU's experts over the last
+                    // windows (both per window); the slower side gives up 1/32 of the missed experts, inside a dead band
+                    if (strata::kernels::QlLag* L = strata::kernels::ql_lag_host()) {
+                        strata::kernels::QlLag l1{};
+                        std::memcpy(&l1, (const void*) L, sizeof l1);
+                        const DecSnap s1 = dec_snap();
+                        const double nw = (double) pa_n;
+                        const double gw = (double) (l1.ns[2] - pa_lag.ns[2]) / 1e6 / nw;          // GPU waited for the CPU
+                        const double cw = ((s1.wait - pa_snap.wait) - (double) (l1.post_ns - pa_lag.post_ns) / 1e6) / nw;   // CPU for the GPU
+                        auto& A = ql_pcie_auto();
+                        int num = drive.d.pcie_num;
+                        if (gw - cw > A.band) num += A.step;        // the CPU is late: more of the missed experts over PCIe
+                        else if (cw - gw > A.band) num -= A.step;   // the GPU is late: more of them on the CPU
+                        num = std::max(A.lo, std::min(A.hi, num));
+                        if (num != drive.d.pcie_num) {
+                            ++pa_moves;
+                            if (A.verbose)
+                                std::fprintf(stderr, "strata ql pcie auto: GPU waited %.2f, CPU waited %.2f ms/window -> share %.3f\n",
+                                             gw, cw, num / 256.0);
+                        }
+                        drive.d.pcie_num = num;
+                        split_drive.pcie_num[0] = num;
+                        A.num = num;
+                        pa_lag = l1;
+                        pa_snap = s1;
+                    }
+                    pa_n = 0;
+                }
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -18144,6 +18216,22 @@ int main(int argc, char** argv) {
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);
+                if (strata::kernels::QlLag* L = strata::kernels::ql_lag_host()) {   // QuantLab (11/15) STRATA_QL_LAG
+                    strata::kernels::QlLag l1{};
+                    std::memcpy(&l1, (const void*) L, sizeof l1);
+                    auto ms = [&](int k) { return (double) (l1.ns[k] - lag0.ns[k]) / 1e6 / w; };
+                    const double nrows = (double) (l1.n[2] - lag0.n[2]), spun = (double) (l1.spun[2] - lag0.spun[2]);
+                    const double post = (double) (l1.post_ns - lag0.post_ns) / 1e6 / w, reach = (d1.wait - ds0.wait) / w;
+                    std::fprintf(stderr, "strata ql lag (ms/window): the GPU waited for the CPU rows %.2f (%.0f%% of %.0f waits spun "
+                                         "> 20 us), for the plan %.2f, for the PCIe share %.2f, other %.2f; the GPU from the rows' "
+                                         "release to the next router %.2f (%.1f per window: combine + dense); host GPU-reach wait "
+                                         "%.2f -> the CPU waited for the GPU's experts about %.2f\n",
+                                 ms(2), nrows > 0 ? 100.0 * spun / nrows : 0.0, nrows / w, ms(0), ms(1), ms(3), post,
+                                 (double) (l1.n_post - lag0.n_post) / w, reach, reach - post > 0 ? reach - post : 0.0);
+                    if (ql_pcie_auto().on && !req_pcie_set)
+                        std::fprintf(stderr, "strata ql pcie auto: the share %.3f -> %.3f over this request (%d moves)\n",
+                                     pa_start / 256.0, drive.d.pcie_num / 256.0, pa_moves);
+                }
                 if (!drive.d.ql_lrun.empty()) {   // QuantLab (11/12) STRATA_QL_LAYER_CPU=1 (expert_source.cpp)
                     auto& dd = drive.d;
                     std::string s = "strata ql layer cpu (layer: pool ms / jobs per dispatch):";

@@ -1,5 +1,6 @@
 // src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/ql_lag.hpp"   // QuantLab (11/15) STRATA_QL_LAG
 #include "strata/kernels/dp4a.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
@@ -206,8 +207,31 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// **THE STORE IS VOLATILE**, like `doorbell_publish_kernel`'s.  On RDNA4 (gfx1201) a plain store to mapped pinned
 /// memory stays in the GPU's L2 until the stream is synchronized - the host never saw the ring (tests/hip/handoff:
 /// 0 of 100 rings seen without a sync; volatile, a system-scope atomic store or a fence after the store: 100 of 100).
+// QuantLab (11/15) STRATA_QL_LAG=1 (ql_lag.hpp; set by verify_kernels.cu's ql_lag_host): null = off
+__device__ strata::kernels::QlLag* g_ql_lag_e = nullptr;
+__device__ __forceinline__ unsigned long long ql_lag_now() {
+    unsigned long long t = 0;
+#if !defined(__HIPCC__)
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+#endif
+    return t;
+}
+// the router's publish: the GPU time since the last CPU-rows release (the combine and this layer's dense part)
+__device__ __forceinline__ void ql_lag_router() {
+    strata::kernels::QlLag* L = g_ql_lag_e;
+    if (L == nullptr) return;
+    const unsigned long long go = *(volatile unsigned long long*) &L->last_go;
+    if (go == 0ull) return;
+    const unsigned long long now = ql_lag_now();
+    if (now > go) {
+        atomicAdd(&L->post_ns, now - go);
+        atomicAdd(&L->n_post, 1ull);
+    }
+    *(volatile unsigned long long*) &L->last_go = 0ull;
+}
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
+    ql_lag_router();   // QuantLab (11/15) STRATA_QL_LAG
     *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
 #if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
     __threadfence_system();
@@ -242,8 +266,17 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
     __shared__ int hit;
     if (threadIdx.x == 0) {
         if (wait_flag != nullptr) {   // 143-amdk: the wait_flag_ge launch folded in
+            strata::kernels::QlLag* L = row == 0 ? g_ql_lag_e : nullptr;   // QuantLab (11/15): one block counts it
+            const unsigned long long t0 = L != nullptr ? ql_lag_now() : 0ull;
             while (*wait_flag < wait_value) strata_spin_pause();
             __threadfence_system();
+            if (L != nullptr) {
+                const unsigned long long t1 = ql_lag_now(), d = t1 - t0;
+                atomicAdd(&L->ns[2], d);
+                atomicAdd(&L->n[2], 1ull);
+                if (d > 20000ull) atomicAdd(&L->spun[2], 1ull);
+                *(volatile unsigned long long*) &L->last_go = t1;
+            }
         }
         int h = 0;
         const int c = *count;
@@ -326,6 +359,7 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
+        ql_lag_router();   // QuantLab (11/15) STRATA_QL_LAG
         *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
 #if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
         __threadfence_system();
@@ -352,6 +386,7 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
     if (threadIdx.x == 0) {
         // QuantLab (11/13) STRATA_QL_MAPPED_WIDE=1: value != 0 is the step's own ring number (known at capture) - one store,
         // no read of host memory over PCIe; the steps publish in order from 0, so it is the number the increment writes
+        ql_lag_router();   // QuantLab (11/15) STRATA_QL_LAG
         *(volatile uint32_t*) seq = value != 0u ? value : *(volatile uint32_t*) seq + 1u;
 #if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
         __threadfence_system();
@@ -370,6 +405,7 @@ __global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
+        ql_lag_router();   // QuantLab (11/15) STRATA_QL_LAG
         *(volatile uint32_t*) seq = value;
         __threadfence_system();
     }
@@ -483,6 +519,11 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     rms_norm_weighted_kernel<<<grid, warps_per_block * 32, 0, (cudaStream_t) stream>>>(x, w, rows, cols, eps);
     check_launch("rms_norm_weighted");
     sync_if_needed(stream, "rms_norm_weighted");
+}
+
+// QuantLab (11/15) STRATA_QL_LAG: this file's device pointer to the shared counters (verify_kernels.cu's ql_lag_host)
+void ql_lag_bind_elementwise(QlLag* dev) {
+    if (cudaMemcpyToSymbol(g_ql_lag_e, &dev, sizeof dev) != cudaSuccess) cudaGetLastError();
 }
 
 }  // namespace strata::kernels

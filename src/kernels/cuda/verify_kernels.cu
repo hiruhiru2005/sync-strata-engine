@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/ql_lag.hpp"   // QuantLab (11/15) STRATA_QL_LAG
 #include "strata/core/geometry.hpp"
 #include "strata/core/emulate.hpp"
 #define STRATA_Q81_FASTMATH_DIV 1   // #3948: the q8_1 stores divide as native_mmvq.cu (--use_fast_math) does, see q8_1_finite.hpp
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>   // QuantLab (11/15) STRATA_QL_LAG
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -1292,9 +1294,25 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
+__device__ __forceinline__ unsigned long long strata_now_ns();
+// QuantLab (11/15) STRATA_QL_LAG=1 (ql_lag.hpp): null = off (one load of a global pointer per wait)
+__device__ strata::kernels::QlLag* g_ql_lag_v = nullptr;
+__device__ __forceinline__ unsigned long long ql_lag_t0() { return g_ql_lag_v != nullptr ? strata_now_ns() : 0ull; }
+__device__ __forceinline__ void ql_lag_note(const volatile uint32_t* flag, unsigned long long t0) {
+    strata::kernels::QlLag* L = g_ql_lag_v;
+    if (L == nullptr) return;
+    const unsigned long long t1 = strata_now_ns(), d = t1 - t0, a = (unsigned long long) (uintptr_t) flag;
+    const int k = a == L->fA ? 0 : a == L->fB ? 1 : a == L->fC ? 2 : 3;
+    atomicAdd(&L->ns[k], d);
+    atomicAdd(&L->n[k], 1ull);
+    if (d > 20000ull) atomicAdd(&L->spun[k], 1ull);
+    if (k == 2) *(volatile unsigned long long*) &L->last_go = t1;
+}
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+    const unsigned long long t0 = ql_lag_t0();
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
+    ql_lag_note(flag, t0);
 }
 
 // the GPU's clock in ns (the same sources as gpu_stamp_kernel)
@@ -1361,10 +1379,12 @@ __global__ void set_flag_kernel(volatile uint32_t* flag, uint32_t value) {
 // wait_flag_ge, with the GPU's clock as it arrives (t_in) and as it leaves (t_out), either may be null
 __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint32_t value, volatile unsigned long long* t_in,
                                             volatile unsigned long long* t_out) {
+    const unsigned long long t0 = ql_lag_t0();
     if (t_in != nullptr) *t_in = strata_now_ns();
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
     if (t_out != nullptr) *t_out = strata_now_ns();
+    ql_lag_note(flag, t0);
 }
 }  // namespace
 
@@ -1568,8 +1588,10 @@ __global__ void resident_plan_par_kernel(const int32_t* __restrict__ ids, int n,
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
+    const unsigned long long t0 = ql_lag_t0();
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
+    ql_lag_note(flag, t0);
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
                                        const uint32_t* skip, uint32_t value) {
@@ -1615,8 +1637,10 @@ namespace {
 __global__ void wait_copy_i32_kernel(const volatile uint32_t* flag, uint32_t value, int32_t* __restrict__ dst,
                                      const volatile int32_t* src, int n) {
     if (threadIdx.x == 0) {
+        const unsigned long long t0 = ql_lag_t0();
         while (*flag < value) strata_spin_pause();
         __threadfence_system();
+        ql_lag_note(flag, t0);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
@@ -1626,6 +1650,47 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
                                void* stream) {
     wait_copy_i32_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(flag, value, dst, src, (int) n);
     check("wait_copy_i32_from_mapped");
+}
+
+// QuantLab (11/15) STRATA_QL_LAG (ql_lag.hpp): the host side.  elementwise.cu keeps its own device pointer (the router's
+// publish counts the post-wait time there); both get the same mapped block.
+void ql_lag_bind_elementwise(QlLag* dev);   // elementwise.cu
+QlLag* ql_lag_host() {
+#if defined(__HIPCC__)
+    return nullptr;
+#else
+    static QlLag* h = [] () -> QlLag* {
+        const char* v = std::getenv("STRATA_QL_LAG");
+        const char* pa = std::getenv("STRATA_QL_PCIE_AUTO");   // E-B: the share follows these counters
+        if ((v == nullptr || v[0] != '1') && (pa == nullptr || pa[0] != '1')) return nullptr;
+        QlLag* p = nullptr;
+        QlLag* d = nullptr;
+        if (cudaHostAlloc((void**) &p, sizeof(QlLag), cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d, p, 0) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_LAG: no mapped memory - off\n");
+            return nullptr;
+        }
+        std::memset((void*) p, 0, sizeof(QlLag));
+        if (cudaMemcpyToSymbol(g_ql_lag_v, &d, sizeof d) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+        ql_lag_bind_elementwise(d);
+        std::fprintf(stderr, "strata: QuantLab STRATA_QL_LAG=1: the GPU counts its waits on the host flags by kind and the "
+                             "time from the CPU rows' release to the next router (decode line 'strata ql lag')\n");
+        return p;
+    }();
+    return h;
+#endif
+}
+void ql_lag_set_flags(const void* flag_a, const void* flag_b, const void* flag_rows) {
+    QlLag* L = ql_lag_host();
+    if (L == nullptr) return;
+    L->fA = (unsigned long long) (uintptr_t) flag_a;
+    L->fB = (unsigned long long) (uintptr_t) flag_b;
+    L->fC = (unsigned long long) (uintptr_t) flag_rows;
+}
+void ql_lag_window_begin() {
+    QlLag* L = ql_lag_host();
+    if (L != nullptr) *(volatile unsigned long long*) &L->last_go = 0ull;
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
