@@ -42,6 +42,16 @@
 #include <utility>
 #include <vector>
 
+// Windows build of the 11/14 bench (strata-desktop): MSVC has no __builtin_ctzll / __builtin_popcountll (used by the
+// STRATA_QL_PRED counters below).  Same results: the lowest set bit and the bit count of a 64-bit word.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static inline int ql_msvc_ctzll(unsigned long long x) { unsigned long i = 0; _BitScanForward64(&i, x); return (int) i; }
+static inline int ql_msvc_popcountll(unsigned long long x) { return (int) __popcnt64(x); }
+#define __builtin_ctzll ql_msvc_ctzll
+#define __builtin_popcountll ql_msvc_popcountll
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
