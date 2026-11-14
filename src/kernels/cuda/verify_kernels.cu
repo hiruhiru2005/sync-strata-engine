@@ -1744,22 +1744,46 @@ std::string ql_probe_gpu() {
     j += b;
     num("gpu_mem_total_gib", tot / 1073741824.0);
     num("gpu_mem_free_gib", fr / 1073741824.0);
-    const size_t B = fr > (256ull << 20) ? (64ull << 20) : (16ull << 20);
-    num("probe_copy_mib", (double) (B >> 20));
+    // the start script locks most of the RAM and the engine takes most of the card: 64 MiB buffers first, then smaller
+    size_t B = 0;
     void *d = nullptr, *hp = nullptr, *hm = nullptr, *hmd = nullptr, *pm = nullptr, *pmd = nullptr;
     unsigned int* sink = nullptr;
     cudaStream_t st = nullptr;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
-    void* hpg = std::malloc(B);
-    const bool ok = hpg != nullptr && cudaMalloc(&d, B) == cudaSuccess && cudaMalloc((void**) &sink, 4) == cudaSuccess &&
-                    cudaHostAlloc(&hp, B, cudaHostAllocDefault) == cudaSuccess &&
-                    cudaHostAlloc(&hm, B, cudaHostAllocMapped) == cudaSuccess && cudaHostGetDevicePointer(&hmd, hm, 0) == cudaSuccess &&
+    void* hpg = nullptr;
+    const char* failed = "";
+    auto drop = [&] {
+        if (d) cudaFree(d);
+        if (hp) cudaFreeHost(hp);
+        if (hm) cudaFreeHost(hm);
+        std::free(hpg);
+        d = hp = hm = hmd = hpg = nullptr;
+        cudaGetLastError();
+    };
+    for (size_t mib : {64, 32, 16, 8, 4}) {
+        B = mib << 20;
+        hpg = std::malloc(B);
+        if (hpg == nullptr) { failed = "malloc"; drop(); continue; }
+        if (cudaMalloc(&d, B) != cudaSuccess) { failed = "cudaMalloc"; drop(); continue; }
+        if (cudaHostAlloc(&hp, B, cudaHostAllocDefault) != cudaSuccess) { failed = "cudaHostAlloc (pinned)"; drop(); continue; }
+        if (cudaHostAlloc(&hm, B, cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer(&hmd, hm, 0) != cudaSuccess) {
+            failed = "cudaHostAlloc (mapped)";
+            drop();
+            continue;
+        }
+        failed = "";
+        break;
+    }
+    num("probe_copy_mib", d != nullptr ? (double) (B >> 20) : -1);
+    const bool ok = d != nullptr && cudaMalloc((void**) &sink, 4) == cudaSuccess &&
                     cudaHostAlloc(&pm, 4096, cudaHostAllocMapped) == cudaSuccess && cudaHostGetDevicePointer(&pmd, pm, 0) == cudaSuccess &&
                     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess && cudaEventCreate(&e0) == cudaSuccess &&
                     cudaEventCreate(&e1) == cudaSuccess;
     if (!ok) {
         cudaGetLastError();
-        j += ", \"gpu_probe\": \"no memory for the buffers\"";
+        j += ", \"gpu_probe\": \"no memory for the buffers (";
+        j += failed[0] != 0 ? failed : "the flag or the stream";
+        j += " failed even at 4 MiB)\"";
     } else {
         std::memset(hpg, 1, B);
         std::memset(hp, 2, B);
