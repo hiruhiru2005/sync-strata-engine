@@ -3334,6 +3334,11 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
+bool ql_hostsplit_on();                      // QuantLab (11/15) STRATA_QL_HOSTSPLIT (expert_source.cpp)
+void ql_hostsplit_add(int k, long long ns);
+static long long ql_hs_ns(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     const bool measure = spec_measure_;
@@ -3704,7 +3709,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
 #endif
     trace_ev("SYNC", -1, -1, 0);
+    const auto ql_hs_s0 = std::chrono::steady_clock::now();   // QuantLab (11/15) STRATA_QL_HOSTSPLIT
     const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (ql_hostsplit_on()) ql_hostsplit_add(4, ql_hs_ns(ql_hs_s0));
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
@@ -3715,11 +3722,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
+    const auto ql_hs_d0 = std::chrono::steady_clock::now();   // QuantLab (11/15) STRATA_QL_HOSTSPLIT
     if (copy_used_) {
         ql_dma_drain();
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
         copy_used_ = false;
     }
+    if (ql_hostsplit_on()) ql_hostsplit_add(5, ql_hs_ns(ql_hs_d0));
     if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
@@ -3731,6 +3740,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    const auto ql_hs_h0 = std::chrono::steady_clock::now();   // QuantLab (11/15) STRATA_QL_HOSTSPLIT
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
@@ -3778,6 +3788,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 return false;
             }
     }
+    if (ql_hostsplit_on()) { ql_hostsplit_add(6, ql_hs_ns(ql_hs_h0)); ql_hostsplit_add(7, 1); }   // QuantLab (11/15)
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     if (tap_file_ != nullptr && !batch_rec_) tap_write(T, tokens, pos0);
     note_nonfinite(T, nullptr);

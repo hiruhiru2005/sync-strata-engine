@@ -5805,6 +5805,22 @@ bool FileExpertSource::in_ram(int64_t layer, int64_t expert) const {
     return at_index < complement_offsets_.size() && complement_offsets_[at_index] != kNoComplement;
 }
 
+// QuantLab (11/15) STRATA_QL_HOSTSPLIT=1 (measure only, nothing else changes): where the host's fixed part of a decode window
+// goes.  ns sums: 0 the plan up to the GPU plan's publish, 1 the PCIe fetch call (the DMA submits), 2 after the fetch up to
+// the activation quantization, 3 dispatch calls (layers); in Verifier::run 4 the window's end sync (the GPU's tail after
+// the last layer), 5 the expert copies' drain, 6 the head sampling (launch + sync), 7 windows.
+bool ql_hostsplit_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_HOSTSPLIT"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+static std::atomic<long long> g_ql_hs[8];
+void ql_hostsplit_add(int k, long long ns) {
+    if (k >= 0 && k < 8) g_ql_hs[k].fetch_add(ns, std::memory_order_relaxed);
+}
+void ql_hostsplit_get(double* out) {
+    for (int k = 0; k < 8; ++k) out[k] = (double) g_ql_hs[k].load(std::memory_order_relaxed);
+}
+
 std::string FileExpertSource::ql_probe_host() const {   // QuantLab (11/15) STRATA_QL_PROBE (E-F)
     std::string j;
     char b[256];
@@ -6719,6 +6735,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
     const auto c0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point ql_hs_fe{};   // QuantLab (11/15) STRATA_QL_HOSTSPLIT: the fetch call's end
     const FileExpertSource::DecodeScope decode_scope;   // 149 STRATA_IO_PF_GATE: this thread reads for the decode
     // 149-cold STRATA_COLD_OVERLAP: 0 off, 1 overlap, 2 measure only, 3 overlap + zero-copy, 4 zero-copy only.
     // 0.2.0: unset, 4 for the GGUF read in place on Linux (zero-copy needs the page cache's residency query), else 0
@@ -6964,10 +6981,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
+        const auto ql_hs_f0 = std::chrono::steady_clock::now();   // QuantLab (11/15) STRATA_QL_HOSTSPLIT
+        if (ql_hostsplit_on()) ql_hostsplit_add(0, std::chrono::duration_cast<std::chrono::nanoseconds>(ql_hs_f0 - c0).count());
         pt("fetch", fetches);
         P.fetch_sizes = mixed && fetches > 0 ? (pf_here ? pf_fsz : fsz) : nullptr;   // QuantLab: read by the fetch call only
         if (P.fetch) P.fetch(P.ctx, pf_here ? pf_dma : dma_src, P.pcie_mode != 0 ? 0 : (pf_here ? pf_ndma : fetches),
                              (size_t) bb);   // the copy engine, beside the CPU's work
+        if (ql_hostsplit_on()) {
+            ql_hs_fe = std::chrono::steady_clock::now();
+            ql_hostsplit_add(1, std::chrono::duration_cast<std::chrono::nanoseconds>(ql_hs_fe - ql_hs_f0).count());
+        }
         P.fetch_sizes = nullptr;
         if (pf_on) tl_pf_layer = -1;   // QuantLab (11/13) STRATA_QL_PREFETCH: this layer's slots are spoken for
     } else {
@@ -7013,6 +7036,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (!published) ++d.stale_x;
     }
     const auto c1 = std::chrono::steady_clock::now();
+    if (ql_hostsplit_on()) {   // QuantLab (11/15) STRATA_QL_HOSTSPLIT
+        if (ql_hs_fe.time_since_epoch().count() != 0)
+            ql_hostsplit_add(2, std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - ql_hs_fe).count());
+        ql_hostsplit_add(3, 1);
+    }
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();

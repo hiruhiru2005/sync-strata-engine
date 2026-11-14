@@ -56,6 +56,8 @@
 // Single GPU only.  STRATA_QL_PCIE_AUTO_VERBOSE=1 prints each move.
 namespace strata::core {   // QuantLab (11/15) E-B2 (expert_source.cpp)
 void ql_apply_priority();   // STRATA_QL_PRIO_CPU / _GPU
+bool ql_hostsplit_on();     // QuantLab (11/15) STRATA_QL_HOSTSPLIT (expert_source.cpp)
+void ql_hostsplit_get(double* out);
 bool ql_pcie_layer_on();
 double ql_pcie_layer_beta();
 void ql_pcie_layer_beta_add(double d);
@@ -18326,6 +18328,16 @@ int main(int argc, char** argv) {
                                      pa_start / 256.0, drive.d.pcie_num / 256.0, pa_moves,
                                      strata::core::ql_pcie_layer_on() ? ", layer mode beta " : "",
                                      strata::core::ql_pcie_layer_on() ? strata::core::ql_pcie_layer_beta() : 0.0);
+                }
+                if (strata::core::ql_hostsplit_on()) {   // QuantLab (11/15) STRATA_QL_HOSTSPLIT (since the start)
+                    double h[8];
+                    strata::core::ql_hostsplit_get(h);
+                    const double wn = h[7] > 0 ? h[7] : 1.0;
+                    std::fprintf(stderr, "strata ql hostsplit (ms/window since the start, %.0f windows, %.1f dispatches/window): "
+                                         "plan to the GPU plan's publish %.3f, PCIe fetch call %.3f, after the fetch to actq %.3f; "
+                                         "window end: the GPU's tail (sync) %.3f, expert copies' drain %.3f, head sampling %.3f\n",
+                                 h[7], h[3] / wn, h[0] / 1e6 / wn, h[1] / 1e6 / wn, h[2] / 1e6 / wn, h[4] / 1e6 / wn,
+                                 h[5] / 1e6 / wn, h[6] / 1e6 / wn);
                 }
                 if (!drive.d.ql_lrun.empty()) {   // QuantLab (11/12) STRATA_QL_LAYER_CPU=1 (expert_source.cpp)
                     auto& dd = drive.d;
