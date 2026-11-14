@@ -5639,7 +5639,7 @@ void FileExpertSource::commit_copies() {
     if (exchange_storage_.active()) return;   // STRATA_EXCHANGE_ROTATE: ownership moves in commit_flip, nothing to copy
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at != UINT64_MAX ? x.at : complement_offsets_[x.in];   // QuantLab (11/15): a retire's saved place
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr)
             std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
@@ -5660,10 +5660,17 @@ int64_t FileExpertSource::commit_flip() {
             override_[x.out] = nullptr;
             continue;
         }
-        const uint64_t at = complement_offsets_[x.in];
+        const uint64_t at = x.at != UINT64_MAX ? x.at : complement_offsets_[x.in];   // QuantLab (11/15): a retire's saved place
         // the same test as commit_copies: an exchange whose bytes were copied is the one that flips
-        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
+        if (x.at != UINT64_MAX) {   // a retire: the victim left the table at its stage; out takes the place
+            if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
+                complement_host_ != nullptr && complement_offsets_[x.out] == kNoComplement) {
+                complement_offsets_[x.out] = at;
+                ql_rot_verify(x, at);
+                ++n;
+            }
+        } else if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
+                   complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
             ++n;
         override_[x.out] = nullptr;
     }
