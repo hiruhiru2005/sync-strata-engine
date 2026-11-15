@@ -1308,9 +1308,9 @@ __device__ __forceinline__ void ql_lag_note(const volatile uint32_t* flag, unsig
     if (L == nullptr) return;
     const unsigned long long t1 = strata_now_ns(), d = t1 - t0, a = (unsigned long long) (uintptr_t) flag;
     const int k = a == L->fA ? 0 : a == L->fB ? 1 : a == L->fC ? 2 : 3;
-    atomicAdd(&L->ns[k], d);
-    atomicAdd(&L->n[k], 1ull);
-    if (d > 20000ull) atomicAdd(&L->spun[k], 1ull);
+    STRATA_QL_LAG_ADD(&L->ns[k], d);
+    STRATA_QL_LAG_ADD(&L->n[k], 1ull);
+    if (d > 20000ull) STRATA_QL_LAG_ADD(&L->spun[k], 1ull);
     if (k == 2) *(volatile unsigned long long*) &L->last_go = t1;
 }
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
@@ -1674,16 +1674,18 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
 // publish counts the post-wait time there); both get the same mapped block.
 void ql_lag_bind_elementwise(QlLag* dev);   // elementwise.cu
 QlLag* ql_lag_host() {
-#if defined(__HIPCC__)
-    return nullptr;
-#else
     static QlLag* h = [] () -> QlLag* {
         const char* v = std::getenv("STRATA_QL_LAG");
         const char* pa = std::getenv("STRATA_QL_PCIE_AUTO");   // E-B: the share follows these counters
         if ((v == nullptr || v[0] != '1') && (pa == nullptr || pa[0] != '1')) return nullptr;
         QlLag* p = nullptr;
         QlLag* d = nullptr;
-        if (cudaHostAlloc((void**) &p, sizeof(QlLag), cudaHostAllocMapped) != cudaSuccess ||
+#if defined(__HIPCC__)   // QuantLab (11/16): fine-grained (coherent) host memory, which the GPU's system-scope atomics reach
+        const unsigned alloc_flags = cudaHostAllocMapped | hipHostMallocCoherent;
+#else
+        const unsigned alloc_flags = cudaHostAllocMapped;
+#endif
+        if (cudaHostAlloc((void**) &p, sizeof(QlLag), alloc_flags) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, p, 0) != cudaSuccess) {
             cudaGetLastError();
             std::fprintf(stderr, "strata: QuantLab STRATA_QL_LAG: no mapped memory - off\n");
@@ -1697,7 +1699,6 @@ QlLag* ql_lag_host() {
         return p;
     }();
     return h;
-#endif
 }
 void ql_lag_set_flags(const void* flag_a, const void* flag_b, const void* flag_rows) {
     QlLag* L = ql_lag_host();
@@ -1712,7 +1713,7 @@ void ql_lag_window_begin() {
 }
 
 // QuantLab (11/15) STRATA_QL_PROBE (E-F, ql_lag.hpp): the GPU half of the start-up probe.
-#if !defined(__HIPCC__)
+// (QuantLab 11/16: HIP too - clock64, volatile host flags and __threadfence_system, as upstream's doorbell; never run on AMD)
 __global__ void ql_probe_read_kernel(const uint4* p, size_t n, unsigned int* sink) {
     uint32_t acc = 0;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
@@ -1731,12 +1732,8 @@ __global__ void ql_probe_pong_kernel(const volatile int* h2d, volatile int* d2h,
         __threadfence_system();
     }
 }
-#endif
 
 std::string ql_probe_gpu() {
-#if defined(__HIPCC__)
-    return "\"gpu_probe\": \"skipped\"";
-#else
     std::string j;
     char b[512];
     auto num = [&](const char* k, double v) {
@@ -1755,6 +1752,14 @@ std::string ql_probe_gpu() {
     std::snprintf(b, sizeof b, "\"gpu_name\": \"%s\", \"gpu_sm\": %d, \"gpu_cc\": \"%d.%d\"", name.c_str(),
                   pr.multiProcessorCount, pr.major, pr.minor);
     j += b;
+#if defined(__HIPCC__)   // QuantLab (11/16): AMD's major.minor is the gfx number's; the arch name says which card
+    {
+        std::string arch;
+        for (const char* c = pr.gcnArchName; *c != 0 && arch.size() < 60; ++c) if (*c != '"' && *c != '\\') arch += *c;
+        std::snprintf(b, sizeof b, ", \"gpu_arch\": \"%s\"", arch.c_str());
+        j += b;
+    }
+#endif
     num("gpu_mem_total_gib", tot / 1073741824.0);
     num("gpu_mem_free_gib", fr / 1073741824.0);
     // the start script locks most of the RAM and the engine takes most of the card: 64 MiB buffers first, then smaller
@@ -1866,7 +1871,6 @@ std::string ql_probe_gpu() {
     if (pm) cudaFreeHost(pm);
     std::free(hpg);
     return j;
-#endif
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {

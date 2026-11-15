@@ -23,7 +23,9 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
     // both packed operands signed to preserve CUDA __dp4a semantics; keep the
     // portable path for other HIP compilers/targets.
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
-#elif (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)) && __has_builtin(__builtin_amdgcn_sdot4)
+#elif (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1036__)) && \
+    __has_builtin(__builtin_amdgcn_sdot4)   // (QuantLab 11/16: gfx1034 = RX 6500 / 6400 and gfx1036 = the Ryzen 7000 iGPU: the
+                                            // ROCm 10.2 clang emits v_dot4c_i32_i8 for them as for gfx1030 / 1032)
     // RDNA2 has no sudot4 (that is gfx11+), but it has the plain signed v_dot4_i32_i8 (dot1-insts): the same
     // signed x signed byte products accumulated modulo 2^32, no clamp.
     return __builtin_amdgcn_sdot4(a, b, c, false);
@@ -142,6 +144,12 @@ __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
 }
 
 }  // namespace strata::hip_compat
+
+// QuantLab (11/16): CUDA's __ldcg (cached in L2 only, never a stale L1 line), which the fork's cross-block sums of
+// src/kernels/cuda/fused_gr.cu read with; HIP declares it for __half and __half2 only.  Volatile 32-bit loads, as
+// upstream's ld_fresh (src/dsv41/ds4_kernels.cu) reads such memory on AMD.
+__device__ __forceinline__ float __ldcg(const float* p) { return *reinterpret_cast<const volatile float*>(p); }
+__device__ __forceinline__ uint32_t __ldcg(const uint32_t* p) { return *reinterpret_cast<const volatile uint32_t*>(p); }
 
 #define __dp4a(a, b, c) (::strata::hip_compat::dp4a((a), (b), (c)))
 #define __byte_perm(x, y, s) (::strata::hip_compat::byte_perm((x), (y), (s)))

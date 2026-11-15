@@ -197,11 +197,17 @@ static __device__ __forceinline__ void tqp_states8(const uint8_t * qs, const int
 // 384) / 128, to int8 as q = round_half_even(sum / 4) - 96 (-96..95) with the scale d / 32 (strata-desktop's rounding: the
 // weights to 1/32, about the int8 codebook's own error).  The decode kernels read the points exactly; only the prompt
 // path rounds.
-#if defined(__CUDACC__) && !defined(__HIPCC__) && !defined(__HIP__)
+// QuantLab (11/16): HIP too (__byte_perm / __vsub4 are HIP's own; the symbol copy by hipMemcpyToSymbol: these ggml TUs do
+// not take the engine's HIP shim, which maps cudaMemcpyToSymbol); never run on AMD
+#if defined(__CUDACC__) || defined(__HIPCC__)
 static __constant__ uint32_t tq_mmq_bih3 = 0u;
 #include "tq_lut_registry.h"
 static const ::strata_tq_lut::RegisterBih3 strata_tq_mmq_bih3_register([](uint32_t on) -> int {
+#if defined(__HIPCC__)
+    return (int) hipMemcpyToSymbol(HIP_SYMBOL(tq_mmq_bih3), &on, sizeof(on));
+#else
     return (int) cudaMemcpyToSymbol(tq_mmq_bih3, &on, sizeof(on));
+#endif
 });
 #define STRATA_TQ_MMQ_BIH3 1
 #endif

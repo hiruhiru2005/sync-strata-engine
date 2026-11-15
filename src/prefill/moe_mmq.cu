@@ -17,7 +17,12 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "tq_lut_registry.h"   // QuantLab (11/12): the tile loaders' bih3 switches (tq.cuh)
+// QuantLab (11/12): the tile loaders' bih3 switches (tq.cuh).  11/16: the header is the overlay's copy, so a build without
+// the overlay (e.g. -DSTRATA_MMQ_TQ_OVERLAY=OFF on HIP) has neither it nor bih3 tiles: set_bih3 says so
+#if __has_include("tq_lut_registry.h")
+#include "tq_lut_registry.h"
+#define STRATA_HAVE_TQ_REGISTRY 1
+#endif
 
 namespace strata::prefill::mmq {
 namespace {
@@ -415,11 +420,11 @@ size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
 
 bool set_bih3(bool on, std::string& err) {
     int copies = 0;
-#if defined(GGML_USE_HIP)
+#if !defined(STRATA_HAVE_TQ_REGISTRY)
     (void) copies;
-    err = "the bih3 MMQ tiles are CUDA only";
+    err = "the bih3 MMQ tiles come with the trellis MMQ overlay, which this build does not have";
     return false;
-#else
+#else   // (QuantLab 11/16: HIP too, when the overlay is on)
     for (::strata_tq_lut::FlagSet f : ::strata_tq_lut::bih3_sets()) {
         const int rc = f(on ? 1u : 0u);
         if (rc != 0) {

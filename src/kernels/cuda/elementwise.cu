@@ -211,7 +211,11 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 __device__ strata::kernels::QlLag* g_ql_lag_e = nullptr;
 __device__ __forceinline__ unsigned long long ql_lag_now() {
     unsigned long long t = 0;
-#if !defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)   // QuantLab (11/16): the same clocks as verify_kernels.cu's strata_now_ns
+    t = wall_clock64() * 40ull;
+#elif defined(__HIPCC__)
+    t = wall_clock64() * 10ull;
+#else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
 #endif
     return t;
@@ -224,8 +228,8 @@ __device__ __forceinline__ void ql_lag_router() {
     if (go == 0ull) return;
     const unsigned long long now = ql_lag_now();
     if (now > go) {
-        atomicAdd(&L->post_ns, now - go);
-        atomicAdd(&L->n_post, 1ull);
+        STRATA_QL_LAG_ADD(&L->post_ns, now - go);
+        STRATA_QL_LAG_ADD(&L->n_post, 1ull);
     }
     *(volatile unsigned long long*) &L->last_go = 0ull;
 }
@@ -272,9 +276,9 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
             __threadfence_system();
             if (L != nullptr) {
                 const unsigned long long t1 = ql_lag_now(), d = t1 - t0;
-                atomicAdd(&L->ns[2], d);
-                atomicAdd(&L->n[2], 1ull);
-                if (d > 20000ull) atomicAdd(&L->spun[2], 1ull);
+                STRATA_QL_LAG_ADD(&L->ns[2], d);
+                STRATA_QL_LAG_ADD(&L->n[2], 1ull);
+                if (d > 20000ull) STRATA_QL_LAG_ADD(&L->spun[2], 1ull);
                 *(volatile unsigned long long*) &L->last_go = t1;
             }
         }
