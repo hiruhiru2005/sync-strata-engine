@@ -3186,6 +3186,25 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // QuantLab (11/16): --pcie-mode dma on AMD.  Its copies raise flag B, which the window's graph waits on; on one hardware
+    // queue with that graph they wait behind it (verify.cpp: a timeout at layer 1).  The verifiers' copy stream is made
+    // before --pcie-mode reaches them, so the copy stream's own queue (upstream's STRATA_COPY_HIP_PRIO=1) is asked here,
+    // before anything else; STRATA_COPY_HIP_PRIO=0 keeps the shared queue.  Never run on an AMD card.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) != "--pcie-mode" || std::string(argv[i + 1]) != "dma") continue;
+        if (std::getenv("STRATA_COPY_HIP_PRIO") == nullptr) {
+#if defined(_WIN32)
+            _putenv_s("STRATA_COPY_HIP_PRIO", "1");
+#else
+            setenv("STRATA_COPY_HIP_PRIO", "1", 0);
+#endif
+            std::fprintf(stderr, "strata generate: --pcie-mode dma on AMD: the copy stream gets a hardware queue of its own "
+                                 "(STRATA_COPY_HIP_PRIO=1; =0 keeps the shared one)\n");
+        }
+        break;
+    }
+#endif
 #if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
