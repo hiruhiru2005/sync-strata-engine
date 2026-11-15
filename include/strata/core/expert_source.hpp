@@ -1496,6 +1496,9 @@ private:
     std::vector<uint8_t> el_inflight_;                           ///< per expert: a read into the copy is queued
     uint64_t el_live_ = 0, el_start_live_ = 0, el_page0_ = 0;
     int64_t el_reads_inflight_ = 0, el_released_ = 0, el_refilled_ = 0, el_skipped_ = 0;
+    int64_t el_acc_n_ = 0, el_acc_skip_ = 0;                     ///< a take-back's installs so far (one line when it ends)
+    uint64_t el_acc_b_ = 0;
+    bool el_acc_short_ = false;
     std::atomic<int64_t> el_decommit_jobs_{0};
     std::atomic<uint64_t> el_avail_{0}, el_commit_{0};
     std::atomic<int64_t> el_low_since_{0}, el_high_since_{0};   ///< steady ms of the first sample of the run, 0 = not in it

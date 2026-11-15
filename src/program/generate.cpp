@@ -58,6 +58,8 @@ namespace strata::core {   // QuantLab (11/15) E-B2 (expert_source.cpp)
 void ql_apply_priority();   // STRATA_QL_PRIO_CPU / _GPU
 bool ql_hostsplit_on();     // QuantLab (11/15) STRATA_QL_HOSTSPLIT (expert_source.cpp)
 void ql_hostsplit_get(double* out);
+bool ql_flagb_skip0_enabled();                                  // QuantLab (11/15) STRATA_QL_FLAGB_SKIP0 (verify.cpp)
+void ql_flagb_skip0_counts(long long& calls, long long& skips);
 bool ql_pcie_layer_on();
 double ql_pcie_layer_beta();
 void ql_pcie_layer_beta_add(double d);
@@ -18360,6 +18362,12 @@ int main(int argc, char** argv) {
                                      pa_start / 256.0, drive.d.pcie_num / 256.0, pa_moves,
                                      strata::core::ql_pcie_layer_on() ? ", layer mode beta " : "",
                                      strata::core::ql_pcie_layer_on() ? strata::core::ql_pcie_layer_beta() : 0.0);
+                }
+                if (strata::core::ql_flagb_skip0_enabled()) {   // QuantLab (11/15) (B): since the start
+                    long long fc = 0, fs = 0;
+                    strata::core::ql_flagb_skip0_counts(fc, fs);
+                    std::fprintf(stderr, "strata ql flagb skip0 (since the start): %lld of %lld layer fetches sent no PCIe expert "
+                                         "and raised no flag B (%.1f%%)\n", fs, fc, fc > 0 ? 100.0 * (double) fs / (double) fc : 0.0);
                 }
                 if (strata::core::ql_hostsplit_on()) {   // QuantLab (11/15) STRATA_QL_HOSTSPLIT (since the start)
                     double h[8];

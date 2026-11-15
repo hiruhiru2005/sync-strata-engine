@@ -119,6 +119,8 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
+/// QuantLab (11/15) STRATA_QL_FLAGB_SKIP0: wait_flag_ge unless *count == 0 (device memory: the group's plan's PCIe count).
+void wait_flag_ge_unless0(const uint32_t* flag, uint32_t value, const int32_t* count, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream);

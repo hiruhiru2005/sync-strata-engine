@@ -478,6 +478,17 @@ bool ql_dma_thread_on() {
     return on;
 }
 
+// QuantLab (11/15) STRATA_QL_FLAGB_SKIP0=1 (B): a layer that sends no PCIe expert raises no flag B (with
+// STRATA_QL_DMA_GPUFLAG and --pcie-mode dma that is a set_flag kernel on the copy stream, ~14 us of host time a layer, and
+// a GPU wait for the copy stream to run it); the window's wait for flag B is skipped when the group's plan sends none
+// (wait_flag_ge_unless0).  Only on the plain path (no device plan, no PCIe balance), the same test on both sides.
+bool ql_flagb_skip0_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_FLAGB_SKIP0"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+static std::atomic<long long> g_ql_flagb_calls{0}, g_ql_flagb_skips{0};
+void ql_flagb_counts(long long& calls, long long& skips) { calls = g_ql_flagb_calls.load(); skips = g_ql_flagb_skips.load(); }
+
 bool fuse_wait_on() {
 #if defined(STRATA_USE_HIP)
     static const int env = [] {
@@ -594,6 +605,11 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
 }
 
 }  // namespace
+
+// QuantLab (11/15) STRATA_QL_FLAGB_SKIP0 (B), for generate.cpp's stats line: whether it is on, and the layer dispatches
+// that called the fetch / of those, the ones that raised no flag B
+bool ql_flagb_skip0_enabled() { return ql_flagb_skip0_on(); }
+void ql_flagb_skip0_counts(long long& calls, long long& skips) { ql_flagb_counts(calls, skips); }
 
 namespace {
 std::atomic<const Verifier*> g_diag_verifier{nullptr};
@@ -2531,6 +2547,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
+            else if (ql_flagb_skip0_on()) wait_flag_ge_unless0(m_flagB_, ring, pl + 2, cs);   // QuantLab (11/15): pl[2] = the PCIe count
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
@@ -3912,7 +3929,18 @@ void Verifier::raise_flagB(uint32_t want) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { v->raise_flagB(want); return; }
+    if (n <= 0) {
+        if (ql_flagb_skip0_on()) {   // QuantLab (11/15) (B): the window's wait is skipped for this group (the same test there)
+            g_ql_flagb_calls.fetch_add(1, std::memory_order_relaxed);
+            if (v->sink_.counts[2] == 0 && !v->device_plan_ && v->m_bal_ == nullptr && !v->ar_on()) {
+                g_ql_flagb_skips.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        v->raise_flagB(want);
+        return;
+    }
+    if (ql_flagb_skip0_on()) g_ql_flagb_calls.fetch_add(1, std::memory_order_relaxed);
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     if (ql_dma_gpuflag() && ql_dma_thread_on() && n <= 16) {       // QuantLab (11/9): the DMA thread submits them

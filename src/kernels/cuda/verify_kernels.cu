@@ -1598,6 +1598,15 @@ __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t v
     __threadfence_system();
     ql_lag_note(flag, t0);
 }
+// QuantLab (11/15) STRATA_QL_FLAGB_SKIP0=1 (B): flag B's wait, unless the group's plan - already copied to the device on
+// this stream - sends no PCIe expert (count == its counts[2]); the host raises no flag B for such a layer
+__global__ void wait_flag_ge_unless0_kernel(const volatile uint32_t* flag, uint32_t value, const int32_t* count) {
+    if (*count == 0) return;
+    const unsigned long long t0 = ql_lag_t0();
+    while (*flag < value) strata_spin_pause();
+    __threadfence_system();
+    ql_lag_note(flag, t0);
+}
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
                                        const uint32_t* skip, uint32_t value) {
     if (*skip == value) return;
@@ -1621,6 +1630,10 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
     check("wait_flag_ge_or");
+}
+void wait_flag_ge_unless0(const uint32_t* flag, uint32_t value, const int32_t* count, void* stream) {   // QuantLab (11/15)
+    wait_flag_ge_unless0_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, count);
+    check("wait_flag_ge_unless0");
 }
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream) {

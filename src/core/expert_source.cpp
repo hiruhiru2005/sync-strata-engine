@@ -5577,11 +5577,21 @@ bool FileExpertSource::ql_el_tick(const float* usage, const int32_t* host_res, b
         el_refilled_ += in_n;
         el_skipped_ += skip_n;
         changed = in_n > 0;
-        std::fprintf(stderr, "strata ql ram elastic: %s%s took back %lld experts (%.2f GiB) into the RAM copy, %lld not (%s); "
-                             "the copy holds %.2f GiB (%.2f at the start); available %.2f GiB\n",
-                     el_clock().c_str(), when, (long long) in_n, (double) in_b / kElGiB, (long long) skip_n,
-                     short_now ? "the RAM ran short meanwhile" : "the GPU or the copy took them meanwhile, or a read failed",
-                     (double) el_live_ / kElGiB, (double) el_start_live_ / kElGiB, (double) el_avail_.load() / kElGiB);
+        // one line per take-back, when its last read has landed (the reads land over several windows while decoding)
+        el_acc_n_ += in_n;
+        el_acc_skip_ += skip_n;
+        el_acc_b_ += in_b;
+        el_acc_short_ = el_acc_short_ || short_now;
+        if (el_reads_inflight_ == 0) {
+            std::fprintf(stderr, "strata ql ram elastic: %s%s took back %lld experts (%.2f GiB) into the RAM copy, %lld not (%s); "
+                                 "the copy holds %.2f GiB (%.2f at the start); available %.2f GiB\n",
+                         el_clock().c_str(), when, (long long) el_acc_n_, (double) el_acc_b_ / kElGiB, (long long) el_acc_skip_,
+                         el_acc_short_ ? "the RAM ran short meanwhile" : "the GPU or the copy took them meanwhile, or a read failed",
+                         (double) el_live_ / kElGiB, (double) el_start_live_ / kElGiB, (double) el_avail_.load() / kElGiB);
+            el_acc_n_ = el_acc_skip_ = 0;
+            el_acc_b_ = 0;
+            el_acc_short_ = false;
+        }
     }
     if (low) {   // the least used experts of the pageable part go back to the files (one in VRAM as well first)
         const double avail = (double) el_avail_.load() / kElGiB;
@@ -7487,8 +7497,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
+        // QuantLab (11/15) STRATA_QL_ACTQ_CPU_ROWS=1 (A): only the rows (tokens) with a CPU expert (kind -1, a cold one being
+        // read included) - the others' activations were quantized and never read (the jobs take a row's act per CPU entry)
+        static const bool actq_rows = [] { const char* v = std::getenv("STRATA_QL_ACTQ_CPU_ROWS"); return v != nullptr && v[0] == '1'; }();
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
+            if (actq_rows && std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
             else if (native)
