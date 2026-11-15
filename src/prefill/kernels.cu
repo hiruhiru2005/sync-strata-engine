@@ -853,12 +853,25 @@ bool gdn_keyhead_ok() {
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
     if (known[dev] == 0) {
         int major = 0, sms = 0, per_sm = 0;
+#if defined(STRATA_EXPERIMENTAL_SM60)
+        // QuantLab (11/16): STRATA_QL_GDN_KH_SM6X=1 lets a Pascal card (cc 6.x, the CUDA 12 build) run this kernel too, with
+        // the plain copies its sm_6x code has (STRATA_GDN_CP_ASYNC 0): every q/k value it reads still feeds three value
+        // heads, which is where the kernel before spends its time.  The same bits as gdn_rec_cols_pipe_kernel (above); the
+        // occupancy test below still asks for all 64 blocks at once.  Not measured on a Pascal card (off unless set).
+        static const bool sm6x = [] { const char* v = std::getenv("STRATA_QL_GDN_KH_SM6X"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+        constexpr bool sm6x = false;
+#endif
         const bool yes = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && major >= 8 &&
+                         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess &&
+                         (major >= 8 || (sm6x && major == 6)) &&
                          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_rec_kh_kernel, CB * RG, 0) ==
                              cudaSuccess &&
                          (int64_t) per_sm * sms >= (int64_t) HK * NCB;
         if (!yes) cudaGetLastError();
+        if (sm6x && major == 6)
+            std::fprintf(stderr, "strata: GDN prompt recurrence on cc 6.x: %s (STRATA_QL_GDN_KH_SM6X, %d blocks a SM x %d SMs)\n",
+                         yes ? "the key-head kernel" : "the column kernel (the key-head kernel does not fit at once)", per_sm, sms);
         known[dev] = yes ? 1 : 2;
     }
     return known[dev] == 1;
