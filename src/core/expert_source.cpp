@@ -73,6 +73,8 @@ static inline int ql_msvc_popcountll(unsigned long long x) { return (int) __popc
 #include <linux/aio_abi.h>   // the kernel's own asynchronous reads (io_submit): no library, allowed by Docker's seccomp
 #include <sched.h>
 #include <sys/syscall.h>
+#include <dirent.h>          // QuantLab (11/16) STRATA_QL_PRIO_CPU on Linux: /proc/self/task
+#include <sys/resource.h>    // setpriority / RLIMIT_NICE
 #endif
 
 // a 64-bit seek (as in pinned.cu): the 32-bit `fseek` wraps past 4 GiB, and the spelling differs per platform
@@ -6610,6 +6612,89 @@ void ql_apply_priority() {
                                  "read back %d (NTSTATUS 0x%08lx)\n", gpu == 2 ? "high" : "above", (unsigned long) st, back,
                          (unsigned long) gst);
         }
+    }
+#elif defined(__linux__)
+    // QuantLab (11/16) the Linux reading of STRATA_QL_PRIO_CPU: a nice value (above -5, high -10) on every thread of the
+    // process (nice is per thread on Linux; threads made later inherit their maker's) and, when the scheduler groups by
+    // session (sched_autogroup_enabled 1: Ubuntu's default; the launcher starts the engine in a session of its own), on
+    // that group too - a thread's nice only weighs against its own group, the group's nice against the other sessions.
+    // An ordinary user may lower nice only down to 20 - RLIMIT_NICE (0 on a stock Ubuntu: nothing allowed); the soft
+    // limit is raised to the hard one first, the best value allowed is used, and a refusal is printed (output unchanged).
+    // STRATA_QL_PRIO_GPU has no Linux counterpart.
+    auto pick = [](const char* name) -> int {   // 0 off, 1 above, 2 high
+        const char* v = std::getenv(name);
+        if (v == nullptr) return 0;
+        const std::string s(v);
+        return s == "high" ? 2 : s == "above" ? 1 : 0;
+    };
+    const int cpu = pick("STRATA_QL_PRIO_CPU");
+    if (pick("STRATA_QL_PRIO_GPU") > 0)
+        std::fprintf(stderr, "strata: QuantLab STRATA_QL_PRIO_GPU: no Linux counterpart (nothing changed)\n");
+    if (cpu > 0) {
+        const int want = cpu == 2 ? -10 : -5;
+        int floor_nice = 0;   // the lowest nice this process may set
+        struct rlimit rl{};
+        if (getrlimit(RLIMIT_NICE, &rl) == 0) {
+            if (rl.rlim_cur < rl.rlim_max) {
+                struct rlimit up = rl;
+                up.rlim_cur = rl.rlim_max;
+                if (setrlimit(RLIMIT_NICE, &up) == 0) rl = up;
+            }
+            const long long cur = rl.rlim_cur == RLIM_INFINITY ? 40 : (long long) rl.rlim_cur;
+            floor_nice = (int) std::max<long long>(-20, std::min<long long>(19, 20 - cur));
+        }
+        errno = 0;
+        const int before = getpriority(PRIO_PROCESS, 0);
+        const int target = std::max(want, floor_nice);
+        int set = 0, refused = 0, err = 0;
+        if (target < before) {
+            if (DIR* d = opendir("/proc/self/task")) {
+                while (dirent* e = readdir(d)) {
+                    const int tid = std::atoi(e->d_name);
+                    if (tid <= 0) continue;
+                    if (setpriority(PRIO_PROCESS, (id_t) tid, target) == 0) ++set;
+                    else { ++refused; err = errno; }
+                }
+                closedir(d);
+            }
+        }
+        // the session's group (only where the scheduler groups by session)
+        std::string ag = "not grouped";
+        if (std::FILE* f = std::fopen("/proc/sys/kernel/sched_autogroup_enabled", "r")) {
+            int on = 0;
+            if (std::fscanf(f, "%d", &on) == 1 && on == 1) {
+                ag = "unchanged";
+                if (target < before) {
+                    if (std::FILE* w = std::fopen("/proc/self/autogroup", "w")) {
+                        const bool ok = std::fprintf(w, "%d", target) > 0;
+                        ag = (std::fclose(w) == 0 && ok) ? "set" : "refused";
+                    } else {
+                        ag = "refused";
+                    }
+                }
+                if (std::FILE* r = std::fopen("/proc/self/autogroup", "r")) {
+                    char line[96] = {0};
+                    if (std::fgets(line, sizeof line, r) != nullptr) {
+                        std::string s(line);
+                        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+                        ag += " (" + s + ")";
+                    }
+                    std::fclose(r);
+                }
+            }
+            std::fclose(f);
+        }
+        errno = 0;
+        const int now = getpriority(PRIO_PROCESS, 0);
+        if (target >= before)
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_PRIO_CPU=%s: not allowed here (RLIMIT_NICE lets this user go down to "
+                                 "nice %d, now %d): nothing changed.  To allow it, give the user a nice limit (for example a "
+                                 "line '<user> - nice %d' in /etc/security/limits.d/, then log in again)\n",
+                         cpu == 2 ? "high" : "above", floor_nice, before, want);
+        else
+            std::fprintf(stderr, "strata: QuantLab STRATA_QL_PRIO_CPU=%s: nice %d -> %d (asked %d) on %d threads%s%s, the session "
+                                 "group %s\n", cpu == 2 ? "high" : "above", before, now, want, set,
+                         refused > 0 ? ", refused on some: " : "", refused > 0 ? std::strerror(err) : "", ag.c_str());
     }
 #endif
 }
