@@ -10,7 +10,8 @@
 //   0  one cudaMemcpyAsync per blob: exactly the loop the engine always ran
 //   1  cudaMemcpyBatchAsync (CUDA 13+, groups of 2..128), the copies in any order, the batch in the stream's
 //   2  as 1, plus CUDA 13.4's cudaMemcpyFlagPreferOverlapWithCompute (a hint)
-// Every other build (HIP, CUDA before 13) and every single copy or group over 128 takes the loop.  A batch the
+// QuantLab (11/16): HIP on ROCm 7+ batches too (hipMemcpyBatchAsync).  Every other build (CUDA before 13, older ROCm)
+// and every single copy or group over 128 takes the loop.  A batch the
 // runtime refuses is redone as the loop (with one warning), never dropped: readiness is signalled only for
 // uploads that were submitted.
 #include <cuda_runtime.h>
@@ -92,6 +93,28 @@ inline cudaError_t copy_blobs(void* const* dst, const void* const* src, const si
             }
             (void) cudaGetLastError();
         }
+    }
+#elif defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && defined(HIP_VERSION_MAJOR) && HIP_VERSION_MAJOR >= 7
+    // QuantLab (11/16): ROCm 7+ has the batch with CUDA 12.8's signature (the failing index).  The sources go as they are:
+    // on Windows the HIP runtime gives a registered pointer's "device pointer" as the same address, and it tells host
+    // memory by the pointer itself.  A refused batch is redone as the loop (one warning).  Never run on an AMD card.
+    constexpr size_t cap = 128;
+    if (batch_mode != 0 && n > 1 && n <= cap) {
+        hipMemcpyAttributes attr{};
+        attr.srcAccessOrder = hipMemcpySrcAccessOrderStream;
+        if (batch_mode == 2) attr.flags = hipMemcpyFlagPreferOverlapWithCompute;
+        size_t first = 0, fail = 0;
+        std::array<void*, cap> dsts{}, srcs{};
+        std::array<size_t, cap> sizes{};
+        for (size_t i = 0; i < n; ++i) { dsts[i] = dst[i]; srcs[i] = const_cast<void*>(src[i]); sizes[i] = bytes[i]; }
+        const hipError_t e = hipMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), n, &attr, &first, 1, &fail, stream);
+        if (e == hipSuccess) return cudaSuccess;
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "strata: hipMemcpyBatchAsync failed (%s); the uploads go one copy at a time\n", hipGetErrorString(e));
+        }
+        (void) hipGetLastError();
     }
 #else
     (void) batch_mode;
