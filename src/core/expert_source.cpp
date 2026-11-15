@@ -1708,8 +1708,8 @@ void FileExpertSource::close() {
         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
         else {
             if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
-            if (complement_locked_ > 0)
-                strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+            if (complement_locked_ > 0)   // (QuantLab 11/16: the start-up's offset; plan B of RAM_ELASTIC moves lock_off)
+                strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_unlock_off_, complement_locked_);
             std::free(complement_arena_);
         }
     }
@@ -1736,6 +1736,9 @@ void FileExpertSource::close() {
     complement_registered_ = false;
     complement_pin_limit_ = 0;
     complement_lock_off_ = 0;
+    complement_unlock_off_ = 0;
+    el_unpin_ = false;
+    el_pin0_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
     complement_lent_slots_ = 0;
@@ -5086,6 +5089,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes);
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
+    complement_unlock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region
     complement_lent_slots_ += stage_lent;   // and the split stages' regions: pairs the copy kept of them
     complement_ready_ = true;
@@ -5361,11 +5365,16 @@ void FileExpertSource::el_start() {
     if (!complement_ready_ || complement_host_ == nullptr || complement_arena_ == nullptr || n_expert_ <= 0) why = "no RAM copy";
     else if (exchange_storage_.active()) why = "not with STRATA_EXCHANGE_ROTATE";
     else if (complement_pinned_ && !complement_registered_) why = "the whole copy is page-locked by the driver";
-    else if (complement_lock_off_ >= complement_bytes_) why = "the copy has no pageable part";
+    // QuantLab (11/16) plan B: STRATA_QL_RAM_ELASTIC_UNPIN=1 lets the registration itself shrink, so a copy registered in
+    // full (Linux: no WDDM cap) can still give back
+    const char* uv = std::getenv("STRATA_QL_RAM_ELASTIC_UNPIN");
+    const bool unpin = why == nullptr && uv != nullptr && uv[0] == '1' && complement_registered_ && complement_pinned_ &&
+                       complement_device_ != nullptr && complement_pin_limit_ > 0;
+    if (why == nullptr && !unpin && complement_lock_off_ >= complement_bytes_) why = "the copy has no pageable part";
 #if defined(_WIN32)
     if (why == nullptr) {   // the pageable part must be one private allocation (the decommits stay inside it)
         MEMORY_BASIC_INFORMATION a{}, b{};
-        const uint8_t* s = complement_host_ + complement_lock_off_;
+        const uint8_t* s = complement_host_ + (unpin ? 0 : complement_lock_off_);   // plan B: all of it may become pageable
         const uint8_t* e = complement_host_ + complement_bytes_ - 1;
         if (VirtualQuery(s, &a, sizeof a) == 0 || VirtualQuery(e, &b, sizeof b) == 0 || a.AllocationBase != b.AllocationBase ||
             a.Type != MEM_PRIVATE || b.Type != MEM_PRIVATE)
@@ -5384,10 +5393,18 @@ void FileExpertSource::el_start() {
     for (size_t i = 0; i < complement_offsets_.size(); ++i)
         if (complement_offsets_[i] != kNoComplement) el_live_ += blob_len((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_));
     el_start_live_ = el_live_;
+    el_unpin_ = unpin;
+    el_pin0_ = complement_pin_limit_;
+    if (unpin) complement_partial_ = true;   // pinned() then always tests the limit (the same answer while it is unchanged)
     el_on_ = true;
     el_quit_ = false;
     el_th_ = std::thread([this] { el_worker(); });
     const ElCfg& c = el_cfg();
+    if (unpin)
+        std::fprintf(stderr, "strata ql ram elastic: plan B on (STRATA_QL_RAM_ELASTIC_UNPIN=1): when the part not registered for the "
+                             "GPU has too little to give, the registration (%.2f GiB) is made shorter at a window boundary (the decode "
+                             "stops while the driver registers it again); between requests it grows back as the places fill\n",
+                     (double) complement_pin_limit_ / kElGiB);
     std::fprintf(stderr, "strata ql ram elastic: on (STRATA_QL_RAM_ELASTIC=1): the RAM copy holds %.2f GiB of experts, the %.2f GiB "
                          "past the %.2f GiB registered for the GPU can go; below %.2f GiB available for %.1f s it gives back up "
                          "to %.2f GiB at a time (to %.2f GiB available), above %.2f GiB for %.0f s it takes back up to %.2f GiB "
@@ -5492,6 +5509,66 @@ void FileExpertSource::el_take_dead(uint64_t at, uint64_t cap) {
     if (at + cap < e) el_iv_[at + cap] = e;
 }
 
+// QuantLab (11/16) plan B (STRATA_QL_RAM_ELASTIC_UNPIN=1): w moved down to the start of a live expert that spans it, so no
+// expert is half registered (a copy of it would be refused as not page-locked, a GPU read would run past the mapping)
+uint64_t FileExpertSource::el_cut(uint64_t w) const {
+    uint64_t cut = w;
+    for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+        const uint64_t off = complement_offsets_[i];
+        if (off == kNoComplement || off >= cut) continue;
+        uint64_t cap = blob_len((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_));
+        if (const auto it = el_cap_.find(off); it != el_cap_.end()) cap = it->second;
+        if (off + cap > cut) cut = off;
+    }
+    return cut;
+}
+
+// QuantLab (11/16) plan B: the copy registered for the GPU again as [0, w).  Called from ql_el_tick only (a window boundary:
+// the window's GPU work and copies have finished, no exchange round is staged; or between requests), so nothing on the GPU
+// reads the copy meanwhile.  The limit goes down first, so no later plan picks the tail (pinned(), device_alias()).  A
+// refused registration leaves none at all: every RAM expert is then computed by the CPU (the same output, slower).
+bool FileExpertSource::el_reregister(uint64_t w, const char* why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t old = complement_pin_limit_;
+    const uint64_t base = (uint64_t) (uintptr_t) complement_host_;
+    complement_pin_limit_ = std::min(old, w);
+    (void) cudaHostUnregister(complement_arena_);
+    (void) cudaGetLastError();
+    if (w > old) {   // the part joining the registration leaves the working-set lock first (locked twice, the next device
+#if defined(_WIN32)  // allocation failed on Windows: the comment at the start-up registration)
+        (void) VirtualUnlock((void*) (base + old), (SIZE_T) (w - old));
+#else
+        (void) munlock((void*) (base + old), (size_t) (w - old));
+#endif
+    }
+    const uint8_t* dev = nullptr;
+    if (w > 0) {
+        if (cudaHostRegister(complement_arena_, (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+            void* alias = nullptr;
+            if (cudaHostGetDevicePointer(&alias, complement_arena_, 0) == cudaSuccess && alias != nullptr) {
+                dev = (const uint8_t*) alias;
+            } else {
+                (void) cudaGetLastError();
+                (void) cudaHostUnregister(complement_arena_);
+                (void) cudaGetLastError();
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    const uint64_t now_w = dev != nullptr ? w : 0;
+    complement_device_ = dev;
+    complement_pin_limit_ = now_w;
+    complement_lock_off_ = now_w;   // the part ELASTIC may give back starts here
+    if (now_w < old) el_lock(base + now_w, old - now_w);   // as the start-up locked the pageable part (best effort)
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (now_w < old) ++el_unpins_; else if (now_w > old) ++el_repins_;
+    std::fprintf(stderr, "strata ql ram elastic unpin: %s the GPU-registered part of the RAM copy %.2f -> %.2f GiB in %.0f ms (%s)%s\n",
+                 el_clock().c_str(), (double) old / kElGiB, (double) now_w / kElGiB, ms, why,
+                 dev == nullptr && w > 0 ? "; the driver REFUSED the registration: every RAM expert goes to the CPU now" : "");
+    return dev != nullptr || w == 0;
+}
+
 // the whole pages inside the free range [s, e) of the copy that are still committed: marked given back, added to `runs`
 void FileExpertSource::el_release_runs(uint64_t s, uint64_t e, std::vector<std::pair<uint64_t, uint64_t>>& runs) {
     const uint64_t base = (uint64_t) (uintptr_t) complement_host_;
@@ -5534,7 +5611,12 @@ bool FileExpertSource::ql_el_tick(const float* usage, const int32_t* host_res, b
     const bool low = ls != 0 && now - ls >= c.low_ms && el_decommit_jobs_.load() == 0;
     const bool high = !low && hs != 0 && now - hs >= c.high_ms && now - el_last_release_ >= c.cool_ms && !el_dead_.empty() &&
                       el_reads_inflight_ == 0 && usage != nullptr;
-    if (!done_any && !low && !high) return false;
+    // QuantLab (11/16) plan B: between requests, with the RAM plentiful and no page work or read in flight, the registration
+    // grows back over the places that hold experts again (up to the first free place, at most its start-up size)
+    const bool repin = el_unpin_ && idle && !low && complement_pin_limit_ < el_pin0_ && ls == 0 && el_reads_inflight_ == 0 &&
+                       el_decommit_jobs_.load() == 0 && now - el_last_release_ >= c.cool_ms &&
+                       (double) el_avail_.load() / kElGiB > c.high_gib;
+    if (!done_any && !low && !high && !repin) return false;
     // nothing may read or move a place meanwhile: no exchange staged (its `in` / victim keeps its place until the commit),
     // none committing on the ASYNC_COMMIT thread, no soft commit, no RAM_ADAPT2 promotion queued
     if (!staged_.empty()) return false;
@@ -5595,10 +5677,35 @@ bool FileExpertSource::ql_el_tick(const float* usage, const int32_t* host_res, b
             el_acc_short_ = false;
         }
     }
+    if (repin && !done_any) {
+        const auto it = el_iv_.lower_bound(complement_pin_limit_);
+        const uint64_t w = el_cut(std::min(el_pin0_, it == el_iv_.end() ? el_pin0_ : it->first));
+        if (w >= complement_pin_limit_ + (64ull << 20) || (w == el_pin0_ && w > complement_pin_limit_))
+            changed = el_reregister(w, "between requests: the places are filled again") || changed;
+    }
     if (low) {   // the least used experts of the pageable part go back to the files (one in VRAM as well first)
         const double avail = (double) el_avail_.load() / kElGiB;
         const double want = std::min(c.step_gib, std::max(c.target_gib - avail, 0.0625));
         const uint64_t need = (uint64_t) (want * kElGiB);
+        if (el_unpin_ && complement_pin_limit_ > 0) {   // plan B: too little outside the registration - make it shorter
+            uint64_t givable = 0;
+            for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+                const uint64_t off = complement_offsets_[i];
+                if (off == kNoComplement || off < complement_lock_off_) continue;
+                if (!override_.empty() && override_[i] != nullptr) continue;
+                uint64_t cap = blob_len((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_));
+                if (const auto it = el_cap_.find(off); it != el_cap_.end()) cap = it->second;
+                givable += cap;
+            }
+            if (givable < need) {
+                const uint64_t more = std::max<uint64_t>(need - givable, 2ull << 30);   // 2 GiB at least: fewer re-registrations
+                const uint64_t w = el_cut(complement_lock_off_ > more ? complement_lock_off_ - more : 0);
+                char why[160];
+                std::snprintf(why, sizeof why, "available %.2f GiB; the part not registered had %.2f GiB to give, %.2f needed",
+                              avail, (double) givable / kElGiB, (double) need / kElGiB);
+                if (w < complement_lock_off_) changed = el_reregister(w, why) || changed;
+            }
+        }
         struct Cand { double key; size_t i; };
         std::vector<Cand> cand;
         cand.reserve(complement_offsets_.size() / 4);

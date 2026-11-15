@@ -1504,6 +1504,15 @@ private:
     std::atomic<int64_t> el_low_since_{0}, el_high_since_{0};   ///< steady ms of the first sample of the run, 0 = not in it
     int64_t el_last_release_ = 0;                                ///< steady ms
     std::atomic<int64_t> el_ok_{0}, el_bad_{0};                  ///< STRATA_QL_RAM_ELASTIC_VERIFY
+    // QuantLab (11/16) STRATA_QL_RAM_ELASTIC_UNPIN=1 (plan B, off by default): when the part of the copy not registered for
+    // the GPU has too little to give back, the registration is made shorter (cut at an expert's start) and the freed tail
+    // joins that part; between requests it grows back to its start-up size as far as the places are filled again.
+    bool el_unpin_ = false;                                      ///< plan B is on for this start (a cudaHostRegister'd copy)
+    uint64_t el_pin0_ = 0;                                       ///< the registered bytes at the start (the most it grows back to)
+    int64_t el_unpins_ = 0, el_repins_ = 0;
+    bool el_reregister(uint64_t w, const char* why);             ///< register [0, w) again; false: nothing registered now
+    uint64_t el_cut(uint64_t w) const;                           ///< w moved down to the start of the expert that spans it
+    uint64_t complement_unlock_off_ = 0;                         ///< close(): where the start-up working-set lock began
     std::vector<Exchange> staged_;
     std::atomic<ForesightSwap*> fs_swap_{nullptr};   ///< set_foresight_swap
     void fs_hold_staged(bool hold);
