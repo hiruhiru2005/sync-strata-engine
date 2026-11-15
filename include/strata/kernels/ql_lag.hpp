@@ -42,7 +42,7 @@ void ql_lag_window_begin();
 
 /// QuantLab (11/15) STRATA_QL_PROBE (E-F): the GPU half of the start-up probe - the card, the H2D copies (pinned and
 /// pageable) and D2H, the GPU's read of VRAM and of mapped host memory (the PCIe share's path), and the round trip of a
-/// host flag to a spinning kernel and back.  JSON members without the braces ("gpu_probe": "skipped" on HIP builds).
+/// host flag to a spinning kernel and back.  JSON members without the braces (HIP too since 11/16, with "gpu_arch").
 std::string ql_probe_gpu();
 
 }  // namespace strata::kernels

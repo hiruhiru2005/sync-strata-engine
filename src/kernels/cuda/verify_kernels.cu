@@ -1713,7 +1713,7 @@ void ql_lag_window_begin() {
 }
 
 // QuantLab (11/15) STRATA_QL_PROBE (E-F, ql_lag.hpp): the GPU half of the start-up probe.
-#if !defined(__HIPCC__)
+// (QuantLab 11/16: HIP too - clock64, volatile host flags and __threadfence_system, as upstream's doorbell; never run on AMD)
 __global__ void ql_probe_read_kernel(const uint4* p, size_t n, unsigned int* sink) {
     uint32_t acc = 0;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
@@ -1732,12 +1732,8 @@ __global__ void ql_probe_pong_kernel(const volatile int* h2d, volatile int* d2h,
         __threadfence_system();
     }
 }
-#endif
 
 std::string ql_probe_gpu() {
-#if defined(__HIPCC__)
-    return "\"gpu_probe\": \"skipped\"";
-#else
     std::string j;
     char b[512];
     auto num = [&](const char* k, double v) {
@@ -1756,6 +1752,14 @@ std::string ql_probe_gpu() {
     std::snprintf(b, sizeof b, "\"gpu_name\": \"%s\", \"gpu_sm\": %d, \"gpu_cc\": \"%d.%d\"", name.c_str(),
                   pr.multiProcessorCount, pr.major, pr.minor);
     j += b;
+#if defined(__HIPCC__)   // QuantLab (11/16): AMD's major.minor is the gfx number's; the arch name says which card
+    {
+        std::string arch;
+        for (const char* c = pr.gcnArchName; *c != 0 && arch.size() < 60; ++c) if (*c != '"' && *c != '\\') arch += *c;
+        std::snprintf(b, sizeof b, ", \"gpu_arch\": \"%s\"", arch.c_str());
+        j += b;
+    }
+#endif
     num("gpu_mem_total_gib", tot / 1073741824.0);
     num("gpu_mem_free_gib", fr / 1073741824.0);
     // the start script locks most of the RAM and the engine takes most of the card: 64 MiB buffers first, then smaller
@@ -1867,7 +1871,6 @@ std::string ql_probe_gpu() {
     if (pm) cudaFreeHost(pm);
     std::free(hpg);
     return j;
-#endif
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
