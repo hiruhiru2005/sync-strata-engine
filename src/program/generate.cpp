@@ -496,6 +496,11 @@ static bool ql_adapt_in_prompt() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_ADAPT_IN_PROMPT"); return v && std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (11/15) STRATA_QL_RAM_ELASTIC=1 (E1): the RAM copy's size follows the available RAM (FileExpertSource::ql_el_tick)
+static bool ql_ram_elastic_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QL_RAM_ELASTIC"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 // QuantLab (11/9): STRATA_QL_SESSION_ROOT=1 - a saved session (the streamed save, STRATA_QL_SESSION_STREAM=1) also keeps
 // the chain's root checkpoint (the end of the system prompt), so a new chat restored from it reuses the system prompt.
 static bool ql_session_root() {
@@ -12869,6 +12874,27 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        // QuantLab (11/15) STRATA_QL_RAM_ELASTIC=1 (E1): between requests the RAM copy follows the available RAM too.  The wait
+        // for the next line wakes every 0.5 s, lands what is still in flight (as the next request does first anyway) and
+        // ticks the copy - nothing reads it then.
+        auto next_line_el = [&](std::string& out) -> bool {
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk(in_mu);
+                    if (in_cv.wait_for(lk, std::chrono::milliseconds(500), [&] { return !in_lines.empty() || in_eof; })) {
+                        if (in_lines.empty()) return false;
+                        out = std::move(in_lines.front());
+                        in_lines.pop_front();
+                        return true;
+                    }
+                }
+                if (!src.complement_ready()) continue;
+                if (!pending.empty()) apply_pending(true);
+                if (ajob && astate != AState::Idle && !adapt_tick(true)) continue;   // (the next request reports a failure)
+                if (!pending.empty() || (ajob && astate != AState::Idle)) continue;
+                (void) src.ql_el_tick(drive.d.usage.empty() ? nullptr : drive.d.usage.data(), host_res.data(), true);
+            }
+        };
         sp.should_stop = [&] { return stop_req.load(); };
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
@@ -14237,7 +14263,8 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-            } else if (!next_line(line)) {
+            } else if (!(ql_ram_elastic_env() && o.batch == 0 && !piped && srcp == &src && !multi_gpu && !peer.valid() && !remote_opt
+                             ? next_line_el(line) : next_line(line))) {
                 break;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
@@ -18028,6 +18055,11 @@ int main(int argc, char** argv) {
                         if (file_left > 0) { --file_left; src.replace_resident(x.layer, x.in, x.out); }
                     }
                 }
+                // QuantLab (11/15) STRATA_QL_RAM_ELASTIC=1 (E1): the window boundary, before the round moves on - nothing reads
+                // the RAM copy now (as for STRATA_RAM_ADAPT2's install); a tick without work is two loads and a lock
+                if (ql_ram_elastic_env() && pending.empty() && (!ajob || astate == AState::Idle) && srcp == &src &&
+                    src.complement_ready() && !multi_gpu && !peer.valid() && !remote_opt && o.batch == 0)
+                    (void) src.ql_el_tick(drive.d.usage.empty() ? nullptr : drive.d.usage.data(), host_res.data(), false);
                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;

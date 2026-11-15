@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <filesystem>
@@ -1698,6 +1699,7 @@ void FileExpertSource::close() {
     if (split_h_ != nullptr) { CloseHandle((HANDLE) split_h_); split_h_ = nullptr; }   // QuantLab 11/8 STRATA_QL_SPLIT
 #endif
     ram_stop();
+    el_stop();   // QuantLab (11/15) STRATA_QL_RAM_ELASTIC: its page work and reads end before the copy is freed
     io_stop();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
@@ -5273,6 +5275,447 @@ void FileExpertSource::ql_rot_verify(const Exchange& x, uint64_t at) {
         std::fprintf(stderr, "strata ql ram rotate verify: %lld ok, %lld BAD%s\n", (long long) ql_rot_ok_.load(),
                      (long long) ql_rot_bad_.load(), ok ? "" : " (this one: layer, expert below)");
     if (!ok) std::fprintf(stderr, "strata ql ram rotate verify: BAD layer %lld expert %lld (%lld)\n", (long long) layer, (long long) e, (long long) n);
+}
+
+// ---- QuantLab (11/15) STRATA_QL_RAM_ELASTIC=1 (E1): the RAM copy's size follows the available RAM (see the header).
+namespace {
+struct ElCfg {
+    double low_gib = 1.0, target_gib = 2.0, step_gib = 1.0, high_gib = 3.0, grow_gib = 0.5, min_use = 0.0;
+    int64_t low_ms = 2000, high_ms = 20000, repeat_ms = 5000, cool_ms = 30000, poll_ms = 500;
+    bool verify = false;
+};
+const ElCfg& el_cfg() {
+    static const ElCfg c = [] {
+        auto f = [](const char* n, double d) { const char* v = std::getenv(n); return v != nullptr && *v != 0 ? std::atof(v) : d; };
+        ElCfg k;
+        k.low_gib = f("STRATA_QL_RAM_ELASTIC_LOW_GIB", 1.0);         // give back below this much available RAM ...
+        k.low_ms = (int64_t) (f("STRATA_QL_RAM_ELASTIC_LOW_S", 2.0) * 1000.0);   // ... for this long
+        k.target_gib = f("STRATA_QL_RAM_ELASTIC_TARGET_GIB", 2.0);   // as much as brings it back to this
+        k.step_gib = f("STRATA_QL_RAM_ELASTIC_STEP_GIB", 1.0);       // at most this much at a time
+        k.high_gib = f("STRATA_QL_RAM_ELASTIC_HIGH_GIB", 3.0);       // take back above this ...
+        k.high_ms = (int64_t) (f("STRATA_QL_RAM_ELASTIC_HIGH_S", 20.0) * 1000.0);   // ... for this long
+        // then again every REPEAT_S while it stays so (e1a, 11/15: one take-back per HIGH_S left the copy 3.5 GiB short 240 s on)
+        k.repeat_ms = (int64_t) (f("STRATA_QL_RAM_ELASTIC_REPEAT_S", 5.0) * 1000.0);
+        k.grow_gib = f("STRATA_QL_RAM_ELASTIC_GROW_GIB", 0.5);       // at most this much at a time, leaving high - 0.5 GiB
+        k.cool_ms = (int64_t) (f("STRATA_QL_RAM_ELASTIC_COOL_S", 30.0) * 1000.0);   // no taking back this soon after a give-back
+        // taken back: the most used first, down to this decayed count (0: every free place is filled while the RAM is plentiful;
+        // e1a with 1.0 found too few experts that hot, 0.07-0.24 GiB a take-back)
+        k.min_use = f("STRATA_QL_RAM_ELASTIC_MIN_USE", 0.0);
+        k.poll_ms = std::max<int64_t>(50, (int64_t) f("STRATA_QL_RAM_ELASTIC_POLL_MS", 500.0));
+        k.verify = f("STRATA_QL_RAM_ELASTIC_VERIFY", 0.0) != 0.0;     // every refilled place (and 16 others a move) read back
+        return k;
+    }();
+    return c;
+}
+constexpr uint64_t kElPage = 4096;
+constexpr double kElGiB = 1073741824.0;
+int64_t el_now_ms() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+std::string el_clock() {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char b[16];
+    std::strftime(b, sizeof b, "%H:%M:%S", &tm);
+    return b;
+}
+// the pages' RAM back to the OS (their bytes are gone), and again (zeroed) before a read fills them
+bool el_decommit(uint64_t addr, uint64_t n) {
+#if defined(_WIN32)
+    (void) VirtualUnlock((void*) addr, (SIZE_T) n);   // (pages the start-up lock did not reach: ERROR_NOT_LOCKED, ignored)
+    return VirtualFree((void*) addr, (SIZE_T) n, MEM_DECOMMIT) != 0;
+#else
+    (void) munlock((void*) addr, (size_t) n);
+    return madvise((void*) addr, (size_t) n, MADV_DONTNEED) == 0;
+#endif
+}
+bool el_recommit(uint64_t addr, uint64_t n) {
+#if defined(_WIN32)
+    return VirtualAlloc((void*) addr, (SIZE_T) n, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+#else
+    (void) addr; (void) n;
+    return true;
+#endif
+}
+void el_lock(uint64_t addr, uint64_t n) {   // as the start-up locked the pageable part (best effort)
+#if defined(_WIN32)
+    (void) VirtualLock((void*) addr, (SIZE_T) n);
+#else
+    (void) mlock((void*) addr, (size_t) n);
+#endif
+}
+}  // namespace
+
+void FileExpertSource::el_start() {
+    el_tried_ = true;
+    const char* v = std::getenv("STRATA_QL_RAM_ELASTIC");
+    if (v == nullptr || v[0] != '1') return;
+    const char* why = nullptr;
+    if (!complement_ready_ || complement_host_ == nullptr || complement_arena_ == nullptr || n_expert_ <= 0) why = "no RAM copy";
+    else if (exchange_storage_.active()) why = "not with STRATA_EXCHANGE_ROTATE";
+    else if (complement_pinned_ && !complement_registered_) why = "the whole copy is page-locked by the driver";
+    else if (complement_lock_off_ >= complement_bytes_) why = "the copy has no pageable part";
+#if defined(_WIN32)
+    if (why == nullptr) {   // the pageable part must be one private allocation (the decommits stay inside it)
+        MEMORY_BASIC_INFORMATION a{}, b{};
+        const uint8_t* s = complement_host_ + complement_lock_off_;
+        const uint8_t* e = complement_host_ + complement_bytes_ - 1;
+        if (VirtualQuery(s, &a, sizeof a) == 0 || VirtualQuery(e, &b, sizeof b) == 0 || a.AllocationBase != b.AllocationBase ||
+            a.Type != MEM_PRIVATE || b.Type != MEM_PRIVATE)
+            why = "the copy is not one private allocation";
+    }
+#endif
+    if (why != nullptr) {
+        std::fprintf(stderr, "strata ql ram elastic: off (%s)\n", why);
+        return;
+    }
+    const uint64_t base = (uint64_t) (uintptr_t) complement_host_;
+    el_page0_ = base / kElPage;
+    el_page_.assign((size_t) ((base + complement_bytes_ + kElPage - 1) / kElPage - el_page0_), 1);
+    el_inflight_.assign(complement_offsets_.size(), 0);
+    el_live_ = 0;
+    for (size_t i = 0; i < complement_offsets_.size(); ++i)
+        if (complement_offsets_[i] != kNoComplement) el_live_ += blob_len((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_));
+    el_start_live_ = el_live_;
+    el_on_ = true;
+    el_quit_ = false;
+    el_th_ = std::thread([this] { el_worker(); });
+    const ElCfg& c = el_cfg();
+    std::fprintf(stderr, "strata ql ram elastic: on (STRATA_QL_RAM_ELASTIC=1): the RAM copy holds %.2f GiB of experts, the %.2f GiB "
+                         "past the %.2f GiB registered for the GPU can go; below %.2f GiB available for %.1f s it gives back up "
+                         "to %.2f GiB at a time (to %.2f GiB available), above %.2f GiB for %.0f s it takes back up to %.2f GiB "
+                         "at a time%s\n",
+                 (double) el_live_ / kElGiB, (double) (complement_bytes_ - complement_lock_off_) / kElGiB,
+                 (double) complement_lock_off_ / kElGiB, c.low_gib, (double) c.low_ms / 1000.0, c.step_gib, c.target_gib, c.high_gib,
+                 (double) c.high_ms / 1000.0, c.grow_gib, c.verify ? "; every refilled place is read back (VERIFY)" : "");
+}
+
+void FileExpertSource::el_stop() {
+    if (!el_th_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(el_mu_);
+        el_quit_ = true;
+    }
+    el_cv_.notify_all();
+    el_th_.join();
+}
+
+void FileExpertSource::el_worker() {
+    strata::platform::name_this_thread("strata-ram-elastic");
+    const ElCfg& c = el_cfg();
+    int64_t last = 0;
+    auto sample = [&] {
+        last = el_now_ms();
+        uint64_t phys = 0, commit = std::numeric_limits<uint64_t>::max();
+        if (!available_memory_bytes(phys, &commit)) return;
+        const uint64_t avail = std::min(phys, commit);
+        el_avail_.store(avail, std::memory_order_relaxed);
+        el_commit_.store(commit, std::memory_order_relaxed);
+        const double g = (double) avail / kElGiB;
+        if (g < c.low_gib) { int64_t z = 0; el_low_since_.compare_exchange_strong(z, last); }
+        else el_low_since_.store(0);
+        if (g > c.high_gib) { int64_t z = 0; el_high_since_.compare_exchange_strong(z, last); }
+        else el_high_since_.store(0);
+    };
+    std::unique_lock<std::mutex> lk(el_mu_);
+    for (;;) {
+        if (el_quit_) return;
+        if (el_now_ms() - last >= c.poll_ms) {
+            lk.unlock();
+            sample();
+            lk.lock();
+            continue;
+        }
+        if (el_q_.empty()) {
+            el_cv_.wait_for(lk, std::chrono::milliseconds(std::max<int64_t>(1, c.poll_ms - (el_now_ms() - last))));
+            continue;
+        }
+        ElJob j = std::move(el_q_.front());
+        el_q_.pop_front();
+        lk.unlock();
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t n = 0;
+        bool ok = true;
+        if (j.kind == 0) {
+            for (const auto& r : j.runs) { ok = el_decommit(r.first, r.second - r.first) && ok; n += r.second - r.first; }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            sample();
+            if (n >= (1ull << 20) || !ok)   // (the few pages a skipped take-back leaves are not worth a line)
+                std::fprintf(stderr, "strata ql ram elastic: %s gave %.2f GiB back to the OS in %.0f ms%s; available now %.2f GiB\n",
+                             el_clock().c_str(), (double) n / kElGiB, ms, ok ? "" : " (a decommit FAILED)",
+                             (double) el_avail_.load() / kElGiB);
+            el_decommit_jobs_.fetch_sub(1);
+        } else {
+            for (const auto& r : j.runs) ok = ok && el_recommit(r.first, r.second - r.first);
+            const int64_t layer = (int64_t) (j.index / (size_t) n_expert_), e = (int64_t) (j.index % (size_t) n_expert_);
+            ok = ok && copy_from_files(layer, e, (uint8_t*) complement_host_ + (size_t) j.at);
+            if (ok) {
+                el_lock((uint64_t) (uintptr_t) complement_host_ + j.at, j.cap);
+                file_read_bytes_.fetch_add(blob_len(layer, e), std::memory_order_relaxed);
+            }
+            j.state = ok ? 2 : 3;
+        }
+        lk.lock();
+        if (j.kind == 1) el_done_.push_back(std::move(j));
+    }
+}
+
+void FileExpertSource::el_add_dead(uint64_t at, uint64_t cap, uint64_t& s, uint64_t& e) {
+    el_dead_.push_back({at, cap});
+    s = at;
+    e = at + cap;
+    auto it = el_iv_.lower_bound(s);
+    if (it != el_iv_.begin()) {
+        auto p = std::prev(it);
+        if (p->second >= s) { s = p->first; e = std::max(e, p->second); el_iv_.erase(p); }
+    }
+    it = el_iv_.lower_bound(s);
+    while (it != el_iv_.end() && it->first <= e) { e = std::max(e, it->second); it = el_iv_.erase(it); }
+    el_iv_[s] = e;
+}
+
+void FileExpertSource::el_take_dead(uint64_t at, uint64_t cap) {
+    auto it = el_iv_.upper_bound(at);
+    if (it == el_iv_.begin()) return;
+    --it;
+    const uint64_t s = it->first, e = it->second;
+    if (at < s || at + cap > e) return;
+    el_iv_.erase(it);
+    if (s < at) el_iv_[s] = at;
+    if (at + cap < e) el_iv_[at + cap] = e;
+}
+
+// the whole pages inside the free range [s, e) of the copy that are still committed: marked given back, added to `runs`
+void FileExpertSource::el_release_runs(uint64_t s, uint64_t e, std::vector<std::pair<uint64_t, uint64_t>>& runs) {
+    const uint64_t base = (uint64_t) (uintptr_t) complement_host_;
+    const uint64_t p0 = (base + s + kElPage - 1) / kElPage, p1 = (base + e) / kElPage;
+    for (uint64_t p = p0; p < p1; ++p) {
+        uint8_t& m = el_page_[(size_t) (p - el_page0_)];
+        if (m == 0) continue;
+        m = 0;
+        if (!runs.empty() && runs.back().second == p * kElPage) runs.back().second += kElPage;
+        else runs.emplace_back(p * kElPage, (p + 1) * kElPage);
+    }
+}
+
+bool FileExpertSource::el_verify(size_t index) {
+    const uint64_t at = complement_offsets_[index];
+    if (at == kNoComplement) return true;
+    const int64_t layer = (int64_t) (index / (size_t) n_expert_), e = (int64_t) (index % (size_t) n_expert_);
+    thread_local std::vector<uint8_t> buf;
+    buf.resize((size_t) blob_len(layer, e));
+    const bool ok = copy_from_files(layer, e, buf.data()) && std::memcmp(buf.data(), complement_host_ + (size_t) at, buf.size()) == 0;
+    const int64_t n = (ok ? el_ok_ : el_bad_).fetch_add(1) + 1;
+    (void) n;
+    if (!ok || (el_ok_.load() + el_bad_.load()) % 200 == 0)
+        std::fprintf(stderr, "strata ql ram elastic verify: %lld ok, %lld BAD%s\n", (long long) el_ok_.load(), (long long) el_bad_.load(),
+                     ok ? "" : (" (this one: layer " + std::to_string(layer) + " expert " + std::to_string(e) + ")").c_str());
+    return ok;
+}
+
+bool FileExpertSource::ql_el_tick(const float* usage, const int32_t* host_res, bool idle) {
+    if (!el_tried_) el_start();
+    if (!el_on_) return false;
+    const ElCfg& c = el_cfg();
+    const int64_t now = el_now_ms();
+    bool done_any = false;
+    {
+        std::lock_guard<std::mutex> lk(el_mu_);
+        done_any = !el_done_.empty();
+    }
+    const int64_t ls = el_low_since_.load(), hs = el_high_since_.load();
+    const bool low = ls != 0 && now - ls >= c.low_ms && el_decommit_jobs_.load() == 0;
+    const bool high = !low && hs != 0 && now - hs >= c.high_ms && now - el_last_release_ >= c.cool_ms && !el_dead_.empty() &&
+                      el_reads_inflight_ == 0 && usage != nullptr;
+    if (!done_any && !low && !high) return false;
+    // nothing may read or move a place meanwhile: no exchange staged (its `in` / victim keeps its place until the commit),
+    // none committing on the ASYNC_COMMIT thread, no soft commit, no RAM_ADAPT2 promotion queued
+    if (!staged_.empty()) return false;
+    ql_commit_wait();
+    if (!soft_in_.empty() && std::any_of(soft_in_.begin(), soft_in_.end(), [](size_t x) { return x != SIZE_MAX; })) return false;
+    {
+        std::lock_guard<std::mutex> lk(ram_mu_);
+        if (!ram_jobs_.empty()) return false;
+    }
+    const char* when = idle ? " (between requests)" : "";
+    bool changed = false;
+    std::vector<std::pair<uint64_t, uint64_t>> runs;
+    if (done_any) {   // the reads that have landed take their places, unless the GPU or the copy has the expert now
+        std::vector<ElJob> done;
+        {
+            std::lock_guard<std::mutex> lk(el_mu_);
+            done.swap(el_done_);
+        }
+        int64_t in_n = 0, skip_n = 0;
+        uint64_t in_b = 0;
+        const bool short_now = el_low_since_.load() != 0;
+        for (ElJob& j : done) {
+            --el_reads_inflight_;
+            el_inflight_[j.index] = 0;
+            const bool fine = j.state == 2 && !short_now && complement_offsets_[j.index] == kNoComplement &&
+                              (host_res == nullptr || host_res[j.index] < 0) && (override_.empty() || override_[j.index] == nullptr);
+            if (fine) {
+                complement_offsets_[j.index] = j.at;
+                const int64_t layer = (int64_t) (j.index / (size_t) n_expert_), e = (int64_t) (j.index % (size_t) n_expert_);
+                if (j.cap != blob_len(layer, e)) el_cap_[j.at] = j.cap;
+                el_live_ += j.cap;
+                in_b += j.cap;
+                ++in_n;
+                if (c.verify) (void) el_verify(j.index);
+            } else {
+                uint64_t s = 0, e = 0;
+                el_add_dead(j.at, j.cap, s, e);
+                el_release_runs(s, e, runs);
+                ++skip_n;
+            }
+        }
+        el_refilled_ += in_n;
+        el_skipped_ += skip_n;
+        changed = in_n > 0;
+        std::fprintf(stderr, "strata ql ram elastic: %s%s took back %lld experts (%.2f GiB) into the RAM copy, %lld not (%s); "
+                             "the copy holds %.2f GiB (%.2f at the start); available %.2f GiB\n",
+                     el_clock().c_str(), when, (long long) in_n, (double) in_b / kElGiB, (long long) skip_n,
+                     short_now ? "the RAM ran short meanwhile" : "the GPU or the copy took them meanwhile, or a read failed",
+                     (double) el_live_ / kElGiB, (double) el_start_live_ / kElGiB, (double) el_avail_.load() / kElGiB);
+    }
+    if (low) {   // the least used experts of the pageable part go back to the files (one in VRAM as well first)
+        const double avail = (double) el_avail_.load() / kElGiB;
+        const double want = std::min(c.step_gib, std::max(c.target_gib - avail, 0.0625));
+        const uint64_t need = (uint64_t) (want * kElGiB);
+        struct Cand { double key; size_t i; };
+        std::vector<Cand> cand;
+        cand.reserve(complement_offsets_.size() / 4);
+        for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+            const uint64_t off = complement_offsets_[i];
+            if (off == kNoComplement || off < complement_lock_off_) continue;
+            if (!override_.empty() && override_[i] != nullptr) continue;
+            const double key = host_res != nullptr && host_res[i] >= 0 ? -1e30 : usage != nullptr ? (double) usage[i] : -(double) off;
+            cand.push_back({key, i});
+        }
+        std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.key < b.key; });
+        uint64_t got = 0;
+        int64_t n = 0, n_vram = 0;
+        std::vector<uint64_t> placed;
+        const uint64_t before = el_live_;
+        for (const Cand& k : cand) {
+            if (got >= need) break;
+            const uint64_t off = complement_offsets_[k.i];
+            uint64_t cap = blob_len((int64_t) (k.i / (size_t) n_expert_), (int64_t) (k.i % (size_t) n_expert_));
+            if (const auto it = el_cap_.find(off); it != el_cap_.end()) { cap = it->second; el_cap_.erase(it); }
+            complement_offsets_[k.i] = kNoComplement;   // read from the files from the next window on
+            el_live_ -= cap;
+            got += cap;
+            ++n;
+            if (k.key <= -1e29) ++n_vram;
+            uint64_t s = 0, e = 0;
+            el_add_dead(off, cap, s, e);
+            placed.push_back(off);
+        }
+        for (const uint64_t off : placed) {   // the pages wholly inside the merged free ranges
+            auto it = el_iv_.upper_bound(off);
+            if (it == el_iv_.begin()) continue;
+            --it;
+            el_release_runs(it->first, it->second, runs);
+        }
+        el_released_ += n;
+        el_last_release_ = now;
+        el_low_since_.store(now);   // another LOW_S of short RAM before the next give-back
+        el_high_since_.store(0);
+        changed = changed || n > 0;
+        static bool said_empty = false;
+        if (n == 0 && said_empty) {}
+        else std::fprintf(stderr, "strata ql ram elastic: %s%s available %.2f GiB (commit %.2f) for %.1f s: %lld experts (%.2f GiB, %lld of "
+                             "them in VRAM too) go back to the files; the copy holds %.2f -> %.2f GiB (%.2f at the start)\n",
+                     el_clock().c_str(), when, avail, (double) el_commit_.load() / kElGiB, (double) (now - ls) / 1000.0,
+                     (long long) n, (double) got / kElGiB, (long long) n_vram, (double) before / kElGiB, (double) el_live_ / kElGiB,
+                     (double) el_start_live_ / kElGiB);
+        if (n == 0) said_empty = true;
+        if (c.verify) {   // the table still points every holder at its own bytes (16 places spread over the copy)
+            size_t seen = 0, step = std::max<size_t>(1, complement_offsets_.size() / 16);
+            for (size_t i = (size_t) (now % (int64_t) step); i < complement_offsets_.size() && seen < 16; i += step)
+                if (complement_offsets_[i] != kNoComplement) { (void) el_verify(i); ++seen; }
+        }
+    } else if (high) {   // the most used experts only the files hold are read into free places
+        const double avail = (double) el_avail_.load() / kElGiB;
+        const double room = std::min(c.grow_gib, avail - (c.high_gib - 0.5));
+        if (room >= 1.0 / 32.0) {
+            const uint64_t amount = (uint64_t) (room * kElGiB);
+            struct Cand { float use; size_t i; };
+            std::vector<Cand> cand;
+            for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+                if (complement_offsets_[i] != kNoComplement || el_inflight_[i]) continue;
+                if (host_res != nullptr && host_res[i] >= 0) continue;
+                if (!override_.empty() && override_[i] != nullptr) continue;
+                if (usage[i] < (float) c.min_use) continue;
+                cand.push_back({usage[i], i});
+            }
+            std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.use != b.use ? a.use > b.use : a.i < b.i; });
+            uint64_t got = 0;
+            int64_t n = 0;
+            std::vector<ElJob> jobs;
+            for (const Cand& k : cand) {
+                if (got >= amount || el_dead_.empty()) break;
+                const uint64_t b = blob_len((int64_t) (k.i / (size_t) n_expert_), (int64_t) (k.i % (size_t) n_expert_));
+                size_t best = SIZE_MAX;
+                for (size_t d = 0; d < el_dead_.size(); ++d)
+                    if (el_dead_[d].cap >= b && (best == SIZE_MAX || el_dead_[d].cap < el_dead_[best].cap)) {
+                        best = d;
+                        if (el_dead_[d].cap == b) break;
+                    }
+                if (best == SIZE_MAX) continue;
+                const ElSlot sl = el_dead_[best];
+                el_dead_[best] = el_dead_.back();
+                el_dead_.pop_back();
+                el_take_dead(sl.at, sl.cap);
+                ElJob j;
+                j.kind = 1;
+                j.index = k.i;
+                j.at = sl.at;
+                j.cap = sl.cap;
+                const uint64_t base = (uint64_t) (uintptr_t) complement_host_;
+                for (uint64_t p = (base + sl.at) / kElPage; p < (base + sl.at + sl.cap + kElPage - 1) / kElPage; ++p) {
+                    uint8_t& m = el_page_[(size_t) (p - el_page0_)];
+                    if (m != 0) continue;
+                    m = 1;
+                    if (!j.runs.empty() && j.runs.back().second == p * kElPage) j.runs.back().second += kElPage;
+                    else j.runs.emplace_back(p * kElPage, (p + 1) * kElPage);
+                }
+                el_inflight_[k.i] = 1;
+                ++el_reads_inflight_;
+                got += sl.cap;
+                ++n;
+                jobs.push_back(std::move(j));
+            }
+            if (!jobs.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(el_mu_);
+                    for (ElJob& j : jobs) el_q_.push_back(std::move(j));
+                }
+                el_cv_.notify_one();
+                std::fprintf(stderr, "strata ql ram elastic: %s%s available %.2f GiB for %.0f s: reading %lld experts (%.2f GiB) from the "
+                                     "files back into the RAM copy\n",
+                             el_clock().c_str(), when, avail, (double) (now - hs) / 1000.0, (long long) n, (double) got / kElGiB);
+            }
+        }
+        el_high_since_.store(now - std::max<int64_t>(0, c.high_ms - c.repeat_ms));   // the next one REPEAT_S on, if it stays so
+    }
+    if (!runs.empty()) {
+        ElJob j;
+        j.kind = 0;
+        j.runs = std::move(runs);
+        el_decommit_jobs_.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(el_mu_);
+            el_q_.push_back(std::move(j));
+        }
+        el_cv_.notify_one();
+    }
+    return changed;
 }
 
 bool FileExpertSource::soft_commit_exchanges() {

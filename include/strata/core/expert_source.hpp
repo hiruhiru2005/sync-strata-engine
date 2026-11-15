@@ -41,6 +41,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <map>
 #include <utility>
 #include <string>
 #include <vector>
@@ -936,6 +937,18 @@ public:
     bool ql_swap_pin(int64_t layer, int64_t a, int64_t b);
     /// The copy is registered only in part (CS-T: complement_pin_limit_ < its bytes): STRATA_QL_PIN_SWAP has work to do.
     bool ql_partial_pin() const { return complement_ready_ && complement_partial_ && complement_pin_limit_ < complement_bytes_; }
+    // ---- QuantLab (11/15) STRATA_QL_RAM_ELASTIC=1 (E1): the RAM copy's size follows the PC's available RAM.  A thread reads
+    // the available RAM (and commit) every STRATA_QL_RAM_ELASTIC_POLL_MS (500); `ql_el_tick` - the caller's thread, at a
+    // window boundary (nothing reads the RAM copy: no window, no adaptive round, no exchange staged or committing) or
+    // between requests - gives the least used experts of the pageable part (past the GPU-registered prefix) back to the
+    // files while the RAM stays short (their places' whole pages are decommitted: the RAM goes back to the OS), and, while
+    // it stays plentiful, reads the most used experts that only the files hold into the freed places (the copy never grows
+    // past its start-up size).  Only places change; every expert's bytes are the files'.  Off by default.
+    /// `usage`: the decayed routing count (n_layers x n_expert; null: the copy's order), `host_res`: >= 0 = in VRAM.
+    /// `idle`: between requests.  Returns whether the table changed.
+    bool ql_el_tick(const float* usage, const int32_t* host_res, bool idle);
+    bool ql_el_on() const { return el_on_; }
+    uint64_t ql_el_live_bytes() const { return el_live_; }   ///< the bytes of the copy's places that hold an expert
     /// QuantLab (11/15) STRATA_QL_PROBE (E-F): the host half of the start-up probe - the pack's shape, the RAM copy's read
     /// bandwidth (1 thread, half and all the logical cores) and the drive's unbuffered expert reads (one at a time, 8 at
     /// once).  JSON members without the braces.
@@ -1452,6 +1465,42 @@ private:
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; uint64_t at = UINT64_MAX; };   ///< at: a retire's place (QuantLab 11/15)
     std::atomic<int64_t> ql_rot_ok_{0}, ql_rot_bad_{0};   ///< QuantLab (11/15) STRATA_QL_RAM_ROTATE_VERIFY
     void ql_rot_verify(const Exchange& x, uint64_t at);
+    // QuantLab (11/15) STRATA_QL_RAM_ELASTIC (ql_el_tick).  The table side (places, free places, the page map) belongs to
+    // the caller's thread; the worker only samples the RAM and runs the queued page work and file reads.
+    struct ElSlot { uint64_t at, cap; };                         ///< a place of the copy no expert holds
+    struct ElJob {                                               ///< the worker's queue, in order
+        int kind = 0;                                            ///< 0 decommit `runs`, 1 recommit `runs` then read `index` into `at`
+        std::vector<std::pair<uint64_t, uint64_t>> runs;         ///< page-aligned arena byte ranges [first, second)
+        size_t index = 0;
+        uint64_t at = 0, cap = 0;
+        int state = 0;                                           ///< 0 queued, 2 read, 3 failed
+    };
+    bool el_tried_ = false, el_on_ = false;
+    void el_start();
+    void el_stop();
+    void el_worker();
+    void el_release_runs(uint64_t at, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>& runs);
+    void el_add_dead(uint64_t at, uint64_t cap, uint64_t& s, uint64_t& e);   ///< s, e: the merged free range it joined
+    void el_take_dead(uint64_t at, uint64_t cap);
+    bool el_verify(size_t index);
+    std::thread el_th_;
+    std::mutex el_mu_;
+    std::condition_variable el_cv_;
+    bool el_quit_ = false;
+    std::deque<ElJob> el_q_;                                     ///< (el_mu_)
+    std::vector<ElJob> el_done_;                                 ///< finished reads (el_mu_)
+    std::vector<ElSlot> el_dead_;
+    std::map<uint64_t, uint64_t> el_iv_;                         ///< the free places merged: start -> end
+    std::vector<uint8_t> el_page_;                               ///< per arena page: 1 = committed (as the queue will leave it)
+    std::unordered_map<uint64_t, uint64_t> el_cap_;              ///< a place refilled by a smaller expert: its bytes
+    std::vector<uint8_t> el_inflight_;                           ///< per expert: a read into the copy is queued
+    uint64_t el_live_ = 0, el_start_live_ = 0, el_page0_ = 0;
+    int64_t el_reads_inflight_ = 0, el_released_ = 0, el_refilled_ = 0, el_skipped_ = 0;
+    std::atomic<int64_t> el_decommit_jobs_{0};
+    std::atomic<uint64_t> el_avail_{0}, el_commit_{0};
+    std::atomic<int64_t> el_low_since_{0}, el_high_since_{0};   ///< steady ms of the first sample of the run, 0 = not in it
+    int64_t el_last_release_ = 0;                                ///< steady ms
+    std::atomic<int64_t> el_ok_{0}, el_bad_{0};                  ///< STRATA_QL_RAM_ELASTIC_VERIFY
     std::vector<Exchange> staged_;
     std::atomic<ForesightSwap*> fs_swap_{nullptr};   ///< set_foresight_swap
     void fs_hold_staged(bool hold);
