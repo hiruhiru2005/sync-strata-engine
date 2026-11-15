@@ -105,6 +105,12 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
+// QuantLab (11/16): used by the fork's kernels (iq_kernels.cu's tq launchers, verify.cpp's STRATA_QL_ROUTE_KEEP)
+#define cudaMemset2DAsync hipMemset2DAsync
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+// QuantLab (11/16): STRATA_QL_HC_BW_INFO's register / shared-memory report (src/kernels/cuda/fused_gr.cu)
+#define cudaFuncAttributes hipFuncAttributes
+#define cudaFuncGetAttributes hipFuncGetAttributes
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaSetDevice hipSetDevice

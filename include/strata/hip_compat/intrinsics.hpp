@@ -143,6 +143,12 @@ __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
 
 }  // namespace strata::hip_compat
 
+// QuantLab (11/16): CUDA's __ldcg (cached in L2 only, never a stale L1 line), which the fork's cross-block sums of
+// src/kernels/cuda/fused_gr.cu read with; HIP declares it for __half and __half2 only.  Volatile 32-bit loads, as
+// upstream's ld_fresh (src/dsv41/ds4_kernels.cu) reads such memory on AMD.
+__device__ __forceinline__ float __ldcg(const float* p) { return *reinterpret_cast<const volatile float*>(p); }
+__device__ __forceinline__ uint32_t __ldcg(const uint32_t* p) { return *reinterpret_cast<const volatile uint32_t*>(p); }
+
 #define __dp4a(a, b, c) (::strata::hip_compat::dp4a((a), (b), (c)))
 #define __byte_perm(x, y, s) (::strata::hip_compat::byte_perm((x), (y), (s)))
 #define __vsub4(a, b) (::strata::hip_compat::vsub4((a), (b)))
