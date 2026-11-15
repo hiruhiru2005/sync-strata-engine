@@ -5769,6 +5769,22 @@ static bool ql_bih3_fast() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_BIH3_FAST"); return !(v && v[0] == '0'); }();
     return on;
 }
+// QuantLab (11/16): the int8 m16n8k32 mma kernels (tq_mma_mmvq, v6..v9) have empty bodies below sm_80 and under HIP, so
+// a launch there writes nothing (the output stays the memset 0, no trap).  Route by the device: sm_61/sm_75 and AMD take
+// the dp4a kernels.  (11/15: launch_tq_bih3 sent bih3 K 8 with 2..8 columns to v9 without looking at the device.)
+static bool tq_mma_cc_ok() {
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
+    return false;
+#else
+    static const bool ok = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 8;
+    }();
+    return ok;
+#endif
+}
 void launch_tq_bih3(int t, const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                     cudaStream_t s) {
     if (ncols < 1 || ncols > 8 || n_in % 128 != 0) {
@@ -5777,7 +5793,7 @@ void launch_tq_bih3(int t, const uint8_t* W, size_t rb, const block_q8_1* X, flo
         std::exit(1);
     }
     // K 8, 2..8 columns: v9's tensor-core kernel (bytes unsigned - 128) on the planar activations
-    if (t == 188 && ql_bih3_fast() && ncols >= 2 && n_in % 1024 == 0 && n_in <= kTqxMaxIn &&
+    if (t == 188 && ql_bih3_fast() && tq_mma_cc_ok() && ncols >= 2 && n_in % 1024 == 0 && n_in <= kTqxMaxIn &&
         rb == (size_t) (n_in / 128) * 34u) {
         const int xb = n_in / 32;
         tq_x_planar_kernel<<<(unsigned) ((xb * ncols + 127) / 128), 128, 0, s>>>(X, xb, ncols);
@@ -5818,13 +5834,13 @@ bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* 
     tq_x_planar_kernel<<<(unsigned) ((xb * ncols + 127) / 128), 128, 0, s>>>(X, xb, ncols);
     if constexpr (TY == 144) {   // QuantLab (11/11): strata-desktop's v3 (above), opt-in
         static const int v9 = [] { const char* v = std::getenv("STRATA_QL_TQ_V9"); return v ? std::atoi(v) : 0; }();
-        if (v9 && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v9 (speed probe, above)
+        if (v9 && tq_mma_cc_ok() && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v9 (speed probe, above)
             if (v9 == 2) launch_tq_v9_k8<true>(W, rb, y, n_in, n_out, ncols, s);
             else launch_tq_v9_k8<false>(W, rb, y, n_in, n_out, ncols, s);
             return true;
         }
         static const int v8 = [] { const char* v = std::getenv("STRATA_QL_TQ_V8"); return v ? std::atoi(v) : 0; }();
-        if (v8 && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v8 (speed probe, above)
+        if (v8 && tq_mma_cc_ok() && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v8 (speed probe, above)
             static const int minb = [] { const char* v = std::getenv("STRATA_QL_TQ_V8_MINB"); return v && v[0] == '6' ? 6 : 4; }();
             if (v8 == 2) {
                 if (minb == 6) launch_tq_v8_k8<true, 6>(W, rb, y, n_in, n_out, ncols, s);
@@ -5836,13 +5852,13 @@ bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* 
             return true;
         }
         static const int v7 = [] { const char* v = std::getenv("STRATA_QL_TQ_V7"); return v ? std::atoi(v) : 0; }();
-        if (v7 && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v7 (speed probe, above)
+        if (v7 && tq_mma_cc_ok() && n_in % 1024 == 0 && rb == (size_t) (n_in / 128) * 34u) {   // v7 (speed probe, above)
             if (v7 == 2) launch_tq_v7_k8<true>(W, rb, y, n_in, n_out, ncols, s);
             else launch_tq_v7_k8<false>(W, rb, y, n_in, n_out, ncols, s);
             return true;
         }
         static const int v6 = [] { const char* v = std::getenv("STRATA_QL_TQ_V6"); return v ? std::atoi(v) : 0; }();
-        if (v6 && rb == (size_t) (n_in / 128) * 34u) {   // v6 (speed probe, above): 1 signed, 2 unsigned - 128
+        if (v6 && tq_mma_cc_ok() && rb == (size_t) (n_in / 128) * 34u) {   // v6 (speed probe, above): 1 signed, 2 unsigned - 128
             if (v6 == 2) launch_tq_v6_k8<true>(W, rb, y, n_in, n_out, ncols, s);
             else launch_tq_v6_k8<false>(W, rb, y, n_in, n_out, ncols, s);
             return true;
@@ -5910,12 +5926,7 @@ bool launch_tq_lanelut(const uint8_t* W, size_t rb, const block_q8_1* X, float* 
             return true;
         }
     }
-    static const bool mma_ok = [] {   // sm_80+: the int8 m16n8k32 mma
-        int dev = 0, major = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        return major >= 8;
-    }();
+    static const bool mma_ok = tq_mma_cc_ok();   // sm_80+: the int8 m16n8k32 mma (false under HIP)
     if (mma_ok && ql_tq_mma_min() > 0 && ncols >= ql_tq_mma_min()) {
         static const int mblocks = [] {
             int dev = 0, sms = 0, per = 0;
