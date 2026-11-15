@@ -9,6 +9,17 @@
 #include <cstdint>
 #include <string>
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+// QuantLab (11/16): the counters are mapped host memory.  On AMD a device-scope atomic or a plain store can stay in the
+// GPU's L2 until the stream syncs (upstream #697, elementwise.cu's doorbell), so HIP adds with system scope; CUDA keeps
+// the device-scope atomicAdd it was measured with.
+#if defined(__HIPCC__)
+#define STRATA_QL_LAG_ADD(p, v) atomicAdd_system((p), (v))
+#else
+#define STRATA_QL_LAG_ADD(p, v) atomicAdd((p), (v))
+#endif
+#endif
+
 namespace strata::kernels {
 
 struct QlLag {
@@ -22,7 +33,7 @@ struct QlLag {
 };
 
 /// The shared counters (host pointer), allocated and handed to the kernels on the first call; null unless STRATA_QL_LAG=1
-/// (and on HIP builds).
+/// or STRATA_QL_PCIE_AUTO=1 (HIP too since 11/16: coherent mapped memory, system-scope adds).
 QlLag* ql_lag_host();
 /// The three flags' device addresses (verify's m_flagA_, m_flagB_, m_flag_), so a wait is counted by its kind.
 void ql_lag_set_flags(const void* flag_a, const void* flag_b, const void* flag_rows);

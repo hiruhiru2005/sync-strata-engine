@@ -1308,9 +1308,9 @@ __device__ __forceinline__ void ql_lag_note(const volatile uint32_t* flag, unsig
     if (L == nullptr) return;
     const unsigned long long t1 = strata_now_ns(), d = t1 - t0, a = (unsigned long long) (uintptr_t) flag;
     const int k = a == L->fA ? 0 : a == L->fB ? 1 : a == L->fC ? 2 : 3;
-    atomicAdd(&L->ns[k], d);
-    atomicAdd(&L->n[k], 1ull);
-    if (d > 20000ull) atomicAdd(&L->spun[k], 1ull);
+    STRATA_QL_LAG_ADD(&L->ns[k], d);
+    STRATA_QL_LAG_ADD(&L->n[k], 1ull);
+    if (d > 20000ull) STRATA_QL_LAG_ADD(&L->spun[k], 1ull);
     if (k == 2) *(volatile unsigned long long*) &L->last_go = t1;
 }
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
@@ -1674,16 +1674,18 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
 // publish counts the post-wait time there); both get the same mapped block.
 void ql_lag_bind_elementwise(QlLag* dev);   // elementwise.cu
 QlLag* ql_lag_host() {
-#if defined(__HIPCC__)
-    return nullptr;
-#else
     static QlLag* h = [] () -> QlLag* {
         const char* v = std::getenv("STRATA_QL_LAG");
         const char* pa = std::getenv("STRATA_QL_PCIE_AUTO");   // E-B: the share follows these counters
         if ((v == nullptr || v[0] != '1') && (pa == nullptr || pa[0] != '1')) return nullptr;
         QlLag* p = nullptr;
         QlLag* d = nullptr;
-        if (cudaHostAlloc((void**) &p, sizeof(QlLag), cudaHostAllocMapped) != cudaSuccess ||
+#if defined(__HIPCC__)   // QuantLab (11/16): fine-grained (coherent) host memory, which the GPU's system-scope atomics reach
+        const unsigned alloc_flags = cudaHostAllocMapped | hipHostMallocCoherent;
+#else
+        const unsigned alloc_flags = cudaHostAllocMapped;
+#endif
+        if (cudaHostAlloc((void**) &p, sizeof(QlLag), alloc_flags) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, p, 0) != cudaSuccess) {
             cudaGetLastError();
             std::fprintf(stderr, "strata: QuantLab STRATA_QL_LAG: no mapped memory - off\n");
@@ -1697,7 +1699,6 @@ QlLag* ql_lag_host() {
         return p;
     }();
     return h;
-#endif
 }
 void ql_lag_set_flags(const void* flag_a, const void* flag_b, const void* flag_rows) {
     QlLag* L = ql_lag_host();
