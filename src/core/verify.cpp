@@ -536,7 +536,13 @@ bool fuse_convab_on() {
 // 143-amdk: STRATA_FUSE_HITS - moe_hit_add folded into the combine (gfx12 default; =0 / 1 forces off / on)
 bool fuse_hits_on() {
 #if defined(STRATA_USE_HIP)
-    static const int env = [] { const char* v = std::getenv("STRATA_FUSE_HITS"); return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_FUSE_HITS");
+        if (v != nullptr) return std::atoi(v) != 0 ? 1 : 0;
+        // QuantLab (11/16): the CUDA build's STRATA_QL_FUSE_HITS=1 turns the same fold on here (one launch setting for both)
+        const char* q = std::getenv("STRATA_QL_FUSE_HITS");
+        return q != nullptr && q[0] == '1' ? 1 : -1;
+    }();
     if (env >= 0) return env != 0;
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
