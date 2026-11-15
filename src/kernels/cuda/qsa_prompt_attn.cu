@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>   // (QuantLab 11/16: std::conditional, the HIP K8V4 prompt attention's shared memory)
 #include <type_traits>
 
 namespace strata::kernels {
@@ -1926,6 +1927,11 @@ struct alignas(16) SmemW {
     float lsum[16];
     float mrow[16];
 };
+// QuantLab (11/16) STRATA_QL_PA_WMMA_K8V4=1: the same kernel for the K8V4 cache (INT8 K, V rotated Q4_0 in blocks of 32):
+// a wave's 64 dims of V are two q4_0 blocks, so a second V scale per (group, cell)
+struct alignas(16) SmemW4 : SmemW {
+    float vs2[4][WCH];
+};
 
 __device__ __forceinline__ wf8 wmma_f16(wh8 a, wh8 b, wf8 c) {
 #if STRATA_PA_WMMA && STRATA_PA_GFX11
@@ -1948,14 +1954,17 @@ __device__ __forceinline__ wh8 i8_to_h(const uint32_t* x) {   // PA_KL codes, ex
 // SPLIT = true (default): q and p carried as FP16 hi + lo pairs (two WMMAs each: FP32-level). S23 (opt-in
 // STRATA_PA_FAST=1): SPLIT = false, one FP16 image each - half the matrix work, rounding-level (FP16 attention as the
 // usual flash-attention kernels), quality-gated
-template <bool SPLIT>
+// VQ4 (QuantLab 11/16, STRATA_QL_PA_WMMA_K8V4=1): V from the K8V4 cache's rotated q4_0 blocks - a wave's 64 dims are two
+// blocks, each unpacked to its codes (-8..7, exact in FP16) with its own scale; the output stays rotated, as the decode
+// kernel's (the caller rotates it back).  Never run on an AMD card.
+template <bool SPLIT, bool VQ4 = false>
 __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                    const int32_t* __restrict__ ids,
                                                                    const int32_t* __restrict__ steps, int n_kv_heads,
                                                                    int page_size, float scale_log2,
                                                                    float* __restrict__ attn, int cap) {
 #if STRATA_PA_WMMA
-    __shared__ SmemW S;
+    __shared__ typename std::conditional<VQ4, SmemW4, SmemW>::type S;
     const int qi = blockIdx.x, kvh = blockIdx.y;
     const int n_head = n_kv_heads * G;
     q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
@@ -2024,17 +2033,49 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     struct Chunk {
         long long row;
         uint4 v[4];
-        float vsc, ksc[2];
+        float vsc, vsc2, ksc[2];   // (vsc2: VQ4's second block's scale)
         uint32_t kx[2][4][PA_KL / 4];
     };
     auto fetch = [&](long long row, Chunk& d) {
         d.row = row;
         d.v[0] = d.v[1] = d.v[2] = d.v[3] = make_uint4(0, 0, 0, 0);
         d.vsc = 0.0f;
+        d.vsc2 = 0.0f;
         if (row >= 0) {
-            const uint4* src = reinterpret_cast<const uint4*>(p.v_q + row * HD + dim0);
-            d.v[0] = __ldg(src); d.v[1] = __ldg(src + 1); d.v[2] = __ldg(src + 2); d.v[3] = __ldg(src + 3);
-            d.vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + warp)));
+            if constexpr (VQ4) {
+                // this wave's two q4_0 blocks (dims dim0 .. dim0 + 63): 36 bytes at row * 144 + 36 * warp (4-aligned).
+                // A block is fp16 d + 16 bytes, element j in the low nibble of qs[j] and j + 16 in the high one
+                // (kv_q4.hpp); the codes go to the staged row as int8 (nibble - 8), dim by dim
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(p.v_q4 + row * (HD / 32 * 18) + warp * 36);
+                uint32_t w[9];
+#pragma unroll
+                for (int i = 0; i < 9; ++i) w[i] = __ldg(src + i);
+                auto byte_at = [&](int k) -> uint32_t { return (w[k >> 2] >> (8 * (k & 3))) & 0xFFu; };
+                uint32_t out[16];
+#pragma unroll
+                for (int blk = 0; blk < 2; ++blk) {
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        uint32_t lo = 0, hi = 0;
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            const uint32_t x = byte_at(blk * 18 + 2 + 4 * g + b);
+                            lo |= (((x & 15u) - 8u) & 0xFFu) << (8 * b);
+                            hi |= (((x >> 4) - 8u) & 0xFFu) << (8 * b);
+                        }
+                        out[blk * 8 + g] = lo;       // dims blk * 32 + 4g .. + 3
+                        out[blk * 8 + 4 + g] = hi;   // dims blk * 32 + 16 + 4g .. + 3
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) d.v[i] = make_uint4(out[4 * i], out[4 * i + 1], out[4 * i + 2], out[4 * i + 3]);
+                d.vsc = __half2float(__ushort_as_half((unsigned short) (byte_at(0) | (byte_at(1) << 8))));
+                d.vsc2 = __half2float(__ushort_as_half((unsigned short) (byte_at(18) | (byte_at(19) << 8))));
+            } else {
+                const uint4* src = reinterpret_cast<const uint4*>(p.v_q + row * HD + dim0);
+                d.v[0] = __ldg(src); d.v[1] = __ldg(src + 1); d.v[2] = __ldg(src + 2); d.v[3] = __ldg(src + 3);
+                d.vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + warp)));
+            }
         }
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
@@ -2064,6 +2105,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
             uint4* dst = reinterpret_cast<uint4*>(&S.v[warp][lane][0]);
             dst[0] = cd.v[0]; dst[1] = cd.v[1]; dst[2] = cd.v[2]; dst[3] = cd.v[3];
             S.vs[warp][lane] = cd.vsc;
+            if constexpr (VQ4) S.vs2[warp][lane] = cd.vsc2;
             if (warp == 0) S.valid[lane] = cd.row >= 0;
         }
         // q.k over this wave's 64 dims for two 16-cell tiles, times the cell's K scale for this group
@@ -2116,6 +2158,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
         // p.v over this wave's 64 dims: 4 tiles of 16 dims, 2 k-steps of 16 cells
         {
             float vmax = S.vs[warp][lane];
+            if constexpr (VQ4) vmax = fmaxf(fabsf(vmax), fabsf(S.vs2[warp][lane]));   // (a q4_0 d can be negative)
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
             const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
@@ -2133,14 +2176,25 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                     ah[i] = hi;
                     al[i] = (_Float16) (pv - (float) hi);
                 }
+                wh8 ah2 = ah, al2 = al;   // VQ4: p times the second q4_0 block's scale (dims 32..63 of this wave)
+                if constexpr (VQ4) {
+#pragma unroll
+                    for (int i = 0; i < PA_KL; ++i) {
+                        const float pv = S.p[col][cb + i] * (S.vs2[warp][cb + i] * vup);
+                        const _Float16 hi = (_Float16) pv;
+                        ah2[i] = hi;
+                        al2[i] = (_Float16) (pv - (float) hi);
+                    }
+                }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const int d = j * 16 + col;
                     wh8 b;
 #pragma unroll
                     for (int i = 0; i < PA_KL; ++i) b[i] = (_Float16) (int) (int8_t) S.v[warp][cb + i][d];
-                    tmp[j] = wmma_f16(ah, b, tmp[j]);
-                    if constexpr (SPLIT) tmp[j] = wmma_f16(al, b, tmp[j]);
+                    const bool second = VQ4 && j >= 2;   // tiles 2, 3 = dims 32..63 = the second block
+                    tmp[j] = wmma_f16(second ? ah2 : ah, b, tmp[j]);
+                    if constexpr (SPLIT) tmp[j] = wmma_f16(second ? al2 : al, b, tmp[j]);
                 }
             }
             float a[8];
@@ -2241,14 +2295,36 @@ bool hip_wmma_usable(int64_t n_q, int64_t cap) {
     return arch == 2 && strata::core::kGfx12PromptDefaultsOn;   // unset: the gfx12 default (Linux; Windows is opt-in until tested there)
 }
 
+// QuantLab (11/16) STRATA_QL_PA_WMMA_K8V4=1 (default off: never run on an AMD card; the RX 7000 / 9000 kits' experimental
+// switch): the K8V4 cache's prompt attention on the matrix cores (prompt_attn_wmma_kernel<., true>) on gfx11 / gfx12,
+// independent of STRATA_HIP_WMMA (which picks the INT8-KV kernel).  A failed launch switches it off as the INT8 one.
+bool ql_pa_wmma_k8v4_usable() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_QL_PA_WMMA_K8V4"); return e != nullptr && e[0] == '1'; }();
+    if (!on || g_wmma_failed.load(std::memory_order_relaxed)) return false;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+    static bool told = false;
+    const bool ok = hip_wmma_arch(dev) != 3;
+    if (!told) {
+        told = true;
+        std::fprintf(stderr, "strata: QuantLab STRATA_QL_PA_WMMA_K8V4=1: the K8V4 prompt attention on matrix cores %s\n",
+                     ok ? "on (experimental)" : "unavailable on this card (gfx11 / gfx12 only)");
+    }
+    return ok;
+}
+
 bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                 const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+                 const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st, bool vq4 = false) {
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
         static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
-        if (fast && n_q >= min_t)
+        if (vq4) {   // (QuantLab 11/16) the K8V4 cache: always the FP32-level split form
+            prompt_attn_wmma_kernel<true, true><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
+                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+        } else if (fast && n_q >= min_t)
             prompt_attn_wmma_kernel<false><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
                 q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
                 (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
@@ -2379,6 +2455,11 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
         return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    // QuantLab (11/16) STRATA_QL_PA_WMMA_K8V4=1: the K8V4 cache (INT8 K with its scales, V rotated Q4_0) on the matrix cores
+    if (pools.k_q != nullptr && pools.k_scale != nullptr && pools.v_q4 != nullptr && pools.k_q4 == nullptr &&
+        pools.v_q == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv && cap > 0 && ids && steps &&
+        pools.page_table && ql_pa_wmma_k8v4_usable())
+        return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream, true);
     return false;
 #endif
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
