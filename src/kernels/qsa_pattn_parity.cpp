@@ -15,6 +15,7 @@
 // 2051 / 2112 (1, 3 and 33 chunks), widths 0 .. cap, n_q up to 40 with a scratch that holds only 2 queries of the
 // decode layout (so qsa_pattn_batch runs several batches).  The pattn scratch and the output are filled with
 // junk before each call, so a read of a block that was not written shows up as a difference.
+// QuantLab (11/16): every case runs twice, with int8 K/V and then with K8V4 (the same int8 K, random q4_0 V blocks).
 //
 //   qsa_pattn_parity [--device N]     exit 0: every case is bit-identical; 77: no GPU or a build without the kernels
 #include "strata/kernels/qsa.hpp"
@@ -118,6 +119,22 @@ struct Harness {
         scratch_new = keep(dalloc<float>(sf));
         attn_ref = keep(dalloc<float>((size_t) (max_q * s.n_head * D)));
         attn_new = keep(dalloc<float>((size_t) (max_q * s.n_head * D)));
+    }
+    // QuantLab (11/16): K8V4 - the same int8 K, V as random q4_0 blocks (fp16 d in [1/64, 1/32), random code bytes) and
+    // no int8 V: the decode kernels' kv mode 3
+    void use_k8v4(std::mt19937& rng) {
+        const int64_t PS = s.page_size, pages = kCells / PS, H = s.n_head_kv, D = s.head_dim;
+        const int64_t rows = pages * H * PS;
+        std::vector<uint8_t> b((size_t) (rows * (D / 32) * 18));
+        for (size_t i = 0; i < b.size(); i += 18) {
+            const uint16_t d = f16_scale_q8(rng());
+            b[i] = (uint8_t) (d & 0xFF);
+            b[i + 1] = (uint8_t) (d >> 8);
+            for (size_t j = 2; j < 18; ++j) b[i + j] = (uint8_t) (rng() & 0xFFu);
+        }
+        pools.v_q4 = keep(upload(b));
+        pools.v_q = nullptr;
+        pools.v_scale = nullptr;
     }
     ~Harness() {
         for (void* p : to_free) cudaFree(p);
@@ -233,6 +250,12 @@ int main(int argc, char** argv) {
     const int32_t base_widths[] = {0, 1, 63, 64, 65, 1023, 1024, 1025, 2051, 2112};
     const int n_base = (int) (sizeof(base_widths) / sizeof(base_widths[0]));
     long long cases = 0, failed = 0, nonzero_total = 0;
+    // QuantLab (11/16): every case with int8 K/V, then again with K8V4 (int8 K, q4_0 V)
+    for (int kv = 0; kv < 2; ++kv) {
+    if (kv == 1) {
+        std::printf("qsa_pattn_parity: int8 K/V: %lld cases, %lld differ; now K8V4 (int8 K, q4_0 V)\n", cases, failed);
+        hx.use_k8v4(rng);
+    }
     for (int64_t cap : {(int64_t) 64, (int64_t) 130, (int64_t) 2051, (int64_t) 2112}) {
         for (int n_q : {1, 2, 3, 7, 40}) {
             for (int scr_q : {n_q, 2}) {
@@ -253,6 +276,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+    }
     }
     std::printf("qsa_pattn_parity: %lld cases, %lld differ, %lld nonzero output values in all -> %s\n", cases, failed,
                 nonzero_total, failed == 0 && nonzero_total > 0 ? "PASS" : "FAIL");

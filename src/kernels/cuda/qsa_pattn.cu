@@ -13,11 +13,13 @@
 // Only the default variant of the contributor's PR (#3943) is kept: ps_score_x_kernel + ps_value_d4_kernel.
 #include "strata/kernels/qsa_pattn.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/core/geometry.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cfloat>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,7 +41,8 @@ int pattn_mode() {
         if (x == 0) return 0;
 #if STRATA_PATTN_BUILT
         std::fprintf(stderr, "strata pattn: STRATA_PATTN_SM60=%d: the prompt path's QSA attention on the sm_6x score / "
-                             "value kernels (bit for bit qsa_decode_attn_batch; int8 K/V)\n", x);
+                             "value kernels (bit for bit qsa_decode_attn_batch; int8 K/V, and K8V4 unless "
+                             "STRATA_QL_PATTN_K8V4=0)\n", x);
         return 1;
 #else
         std::fprintf(stderr, "strata pattn: STRATA_PATTN_SM60 is set, but this build has no sm_6x kernels "
@@ -253,6 +256,10 @@ __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __r
 // ps_value_d4_kernel: the value kernel with four dims a thread (64 threads, one CTA per (KV head, query)): a cell's four
 // codes are one 32-bit load (a warp reads 128 contiguous bytes), its 12 weights three broadcast float4 reads for 48
 // fmaf.  V loads run four cells ahead.  Per (dim, head) the fold and the merge are ps_value_kernel's.
+// QuantLab (11/16) V4 = true: K8V4 (int8 K, q4_0 V - the decode kernels' kv mode 3): a thread's four dims are four
+// nibbles of one q4_0 block (dims 4t..4t+3 never cross a 32-dim block): two 16-bit loads of the bytes, the block's fp16
+// scale, and each value is load_v1<3>'s (float) (nibble - 8) * d, so the sums are the decode kernels' bit for bit.
+template <bool V4>
 __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const int32_t* __restrict__ steps,
                                                          const float* __restrict__ blocks, int n_kv_heads, int n_chunks,
                                                          float* __restrict__ attn) {
@@ -315,8 +322,17 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
 #pragma unroll
             for (int d = 0; d < 4; ++d) a[d][h] = 0.0f;
         const auto fold4 = [&](int cl, uint32_t codes, float sc) {
-            const float v0 = (float) (int8_t) (codes & 0xFF) * sc, v1 = (float) (int8_t) ((codes >> 8) & 0xFF) * sc;
-            const float v2 = (float) (int8_t) ((codes >> 16) & 0xFF) * sc, v3 = (float) (int8_t) (codes >> 24) * sc;
+            float v0, v1, v2, v3;
+            if constexpr (V4) {   // dims 0..15 of a block are the low nibbles, 16..31 the high ones (kv_q4.hpp)
+                const uint32_t nb = (d0 % QK4_0) < 16 ? codes & 0x0F0F0F0Fu : (codes >> 4) & 0x0F0F0F0Fu;
+                v0 = (float) ((int) (nb & 0xFF) - 8) * sc;
+                v1 = (float) ((int) ((nb >> 8) & 0xFF) - 8) * sc;
+                v2 = (float) ((int) ((nb >> 16) & 0xFF) - 8) * sc;
+                v3 = (float) ((int) (nb >> 24) - 8) * sc;
+            } else {
+                v0 = (float) (int8_t) (codes & 0xFF) * sc, v1 = (float) (int8_t) ((codes >> 8) & 0xFF) * sc;
+                v2 = (float) (int8_t) ((codes >> 16) & 0xFF) * sc, v3 = (float) (int8_t) (codes >> 24) * sc;
+            }
             const float4* w4 = reinterpret_cast<const float4*>(spt[cl]);
             const float4 w0 = w4[0], w1 = w4[1], w2 = w4[2];
             const float ww[G] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w, w2.x, w2.y, w2.z, w2.w};
@@ -331,8 +347,18 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
         const auto vld = [&](int cl, uint32_t& codes, float& sc) {
             const long long r = srow[cl];
             const long long rr = r >= 0 ? r : 0;
-            codes = __ldg(reinterpret_cast<const uint32_t*>(p.v_q + rr * HD + d0));
-            sc = __half2float(__ushort_as_half(__ldg(p.v_scale + rr * NSC + g)));
+            if constexpr (V4) {
+                // block d0 / 32 of the row: an fp16 d, then 16 code bytes; the row (8 blocks of 18 bytes), the block and
+                // the 4-byte run at (d0 % 16) all start on even bytes, so 16-bit loads
+                const uint8_t* blk = p.v_q4 + rr * (long long) ((HD / QK4_0) * sizeof(block_q4_0)) +
+                                     (d0 / QK4_0) * (int) sizeof(block_q4_0);
+                const unsigned short* qs = reinterpret_cast<const unsigned short*>(blk + offsetof(block_q4_0, qs) + (d0 % 16));
+                codes = (uint32_t) __ldg(qs) | ((uint32_t) __ldg(qs + 1) << 16);
+                sc = __half2float(__ushort_as_half(__ldg(reinterpret_cast<const unsigned short*>(blk + offsetof(block_q4_0, d)))));
+            } else {
+                codes = __ldg(reinterpret_cast<const uint32_t*>(p.v_q + rr * HD + d0));
+                sc = __half2float(__ushort_as_half(__ldg(p.v_scale + rr * NSC + g)));
+            }
         };
         if (!s_masked) {
             int cl = 0;
@@ -409,9 +435,13 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
                               int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn,
                               int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
+    // QuantLab (11/16): K8V4 (int8 K, q4_0 V: the decode kernels' mode 3, the kits' --kv k8v4) as well as int8 K/V.
+    // STRATA_QL_PATTN_K8V4=0: K8V4 is refused as upstream (the 32-query loop of the decode kernels runs).
+    static const bool k8v4_ok = [] { const char* v = std::getenv("STRATA_QL_PATTN_K8V4"); return v == nullptr || std::atoi(v) != 0; }();
+    const bool v4 = pools.v_q4 != nullptr;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || pools.k_q == nullptr || pools.v_q == nullptr || pools.k_q4 != nullptr ||
-        pools.v_q4 != nullptr || !pools.k_scale || !pools.v_scale)
+        !pools.page_table || pools.k_q == nullptr || pools.k_q4 != nullptr || !pools.k_scale ||
+        (v4 ? !k8v4_ok : (pools.v_q == nullptr || !pools.v_scale)))
         return false;
     const cudaStream_t st = (cudaStream_t) stream;
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
@@ -432,8 +462,12 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
         const int32_t* sb = steps + (size_t) t0 * kStepCount;
         ps_score_x_kernel<1><<<g1, THREADS, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale,
                                                      scratch, n_chunks, (int) cap);
-        ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
-                                              attn + (size_t) t0 * s.n_head * HD);
+        if (v4)
+            ps_value_d4_kernel<true><<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
+                                                        attn + (size_t) t0 * s.n_head * HD);
+        else
+            ps_value_d4_kernel<false><<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
+                                                         attn + (size_t) t0 * s.n_head * HD);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
