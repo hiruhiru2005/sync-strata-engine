@@ -10,12 +10,14 @@
 //   0  one cudaMemcpyAsync per blob: exactly the loop the engine always ran
 //   1  cudaMemcpyBatchAsync (CUDA 13+, groups of 2..128), the copies in any order, the batch in the stream's
 //   2  as 1, plus CUDA 13.4's cudaMemcpyFlagPreferOverlapWithCompute (a hint)
-// Every other build (HIP, CUDA before 13) and every single copy or group over 128 takes the loop.  A batch the
+// QuantLab (11/16): CUDA 12.8-12.9 batches too (12.8's signature) when the driver is 12.8+.
+// Every other build (HIP, CUDA before 12.8) and every single copy or group over 128 takes the loop.  A batch the
 // runtime refuses is redone as the loop (with one warning), never dropped: readiness is signalled only for
 // uploads that were submitted.
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -89,6 +91,53 @@ inline cudaError_t copy_blobs(void* const* dst, const void* const* src, const si
                 warned = true;
                 std::fprintf(stderr, "strata: cudaMemcpyBatchAsync failed (%s); the uploads go one copy at a time\n",
                              cudaGetErrorString(e));
+            }
+            (void) cudaGetLastError();
+        }
+    }
+#elif !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+    // QuantLab (11/16): CUDA 12.8-12.9 (the GTX 10 build) batches too: the same call with 12.8's signature (non-const
+    // sources and the failing index).  The 12.x runtime also runs on drivers older than 12.8 (minor-version
+    // compatibility): there the call is not available, so the driver version is read once and a batch is only tried on
+    // a 12.8+ driver; a refusal that says the driver or the device cannot do it turns the batch off for the run (one
+    // warning), any other refusal is redone as the loop as on CUDA 13.
+    constexpr size_t cap = 128;
+    static const bool driver_ok = [] {
+        int v = 0;
+        return cudaDriverGetVersion(&v) == cudaSuccess && v >= 12080;
+    }();
+    static std::atomic<bool> batch_off{false};
+    if (batch_mode != 0 && driver_ok && !batch_off && n > 1 && n <= cap) {
+        std::array<void*, cap> srcs{};
+        bool aliased = true;
+        for (size_t i = 0; i < n; ++i) {
+            const void* a = nullptr;
+            if (detail::host_alias(src[i], &a) != cudaSuccess) { aliased = false; break; }
+            srcs[i] = const_cast<void*>(a);
+        }
+        if (aliased) {
+            cudaMemcpyAttributes attr{};
+            attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            if (batch_mode == 2) attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+            size_t first = 0, fail = 0;
+            std::array<void*, cap> dsts{};
+            std::array<size_t, cap> sizes{};
+            for (size_t i = 0; i < n; ++i) { dsts[i] = dst[i]; sizes[i] = bytes[i]; }
+            const cudaError_t e = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), n, &attr, &first, 1, &fail, stream);
+            if (e == cudaSuccess) {
+                static std::atomic<bool> told{false};
+                if (!told.exchange(true))
+                    std::fprintf(stderr, "strata: uploads batched with cudaMemcpyBatchAsync (CUDA 12.8+ form, mode %d)\n", batch_mode);
+                return cudaSuccess;
+            }
+            const bool for_good = e == cudaErrorCallRequiresNewerDriver || e == cudaErrorNotSupported ||
+                                  e == cudaErrorNotYetImplemented;
+            if (for_good) batch_off.store(true);
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr, "strata: cudaMemcpyBatchAsync failed (%s); the uploads go one copy at a time%s\n",
+                             cudaGetErrorString(e), for_good ? " from now on" : "");
             }
             (void) cudaGetLastError();
         }
