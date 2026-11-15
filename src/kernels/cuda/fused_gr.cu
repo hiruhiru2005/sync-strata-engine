@@ -2810,7 +2810,8 @@ __global__ void __launch_bounds__(32) gr_up_i8_kernel(GrMulti m, const uint32_t*
 // The partial sums (xor tree over the 16 lanes of a half-warp) do not depend on how many values a lane carries, and
 // a max, a round to int and a dp4a sum have one result in any order: so the lane / block geometry may change; the
 // float sums (16-lane tree, 8-warp ssg / inject sums, the 20 partials, the 5 lo blocks, the token pair) keep theirs.
-#if !defined(__HIPCC__)
+// QuantLab (11/16): HIP builds these forms too (wave32: the half-warp trees are the same lanes; the L2 prefetch of =4 is
+// the target's own prefetch where it has one, else nothing; the =2/=3 wait sleeps with s_sleep).  Never run on an AMD card.
 __device__ unsigned g_i8f_cnt[I8_RG + 1];   // =2: per row group, the down blocks done (the last one resets it)
 __device__ unsigned g_i8f_done;             // =2: the row groups whose last block is done (the last up block resets it)
 __device__ unsigned g_i8f_up;               // =2: the up blocks past the wait
@@ -2895,7 +2896,9 @@ __device__ __forceinline__ bool i8h_down(const GrMulti& m, float* __restrict__ p
         const int g = ((int) (blockIdx.y * gridDim.x + blockIdx.x)) * THREADS + t, G = (int) (gridDim.x * gridDim.y) * THREADS;
         const char* up = reinterpret_cast<const char*>(m.a[0].q8_up);
         for (int l = g; l < LINES; l += G) {
-#if __CUDA_ARCH__ >= 800   // (the eviction-priority form is sm_80+; older cards take the plain prefetch)
+#if defined(__HIPCC__)   // QuantLab (11/16): no PTX on AMD; the compiler's prefetch (dropped where the target has none)
+            __builtin_prefetch(up + (size_t) l * 128, 0, 3);
+#elif __CUDA_ARCH__ >= 800   // (the eviction-priority form is sm_80+; older cards take the plain prefetch)
             if constexpr (PF == 2 || PF == 4) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(up + (size_t) l * 128));
             else asm volatile("prefetch.global.L2 [%0];" ::"l"(up + (size_t) l * 128));
 #else
@@ -3110,7 +3113,7 @@ __device__ __forceinline__ void i8h_up(const GrMulti& m, const uint32_t* __restr
     if constexpr (FUSED) {
         if (t == 0) {
             while (atomicAdd(&g_i8f_done, 0u) < (unsigned) nrg) {
-#if __CUDA_ARCH__ >= 700
+#if defined(__HIPCC__) || __CUDA_ARCH__ >= 700   // (HIP: the shim's __nanosleep, s_sleep 1)
                 __nanosleep(64);
 #endif
             }
@@ -3289,7 +3292,6 @@ __global__ void __launch_bounds__(THREADS, MINB) gr_i8_fused_kernel(GrMulti m, f
     }
     if (!UPFIRST) i8h_up<T, WARPS, true>(m, qlo, dlo, b - ndb, nrg);
 }
-#endif  // !__HIPCC__
 
 // scratch: part [T][324][20] + ssg [11][T][20] + qlo T x 320 int8 + dlo [T][10] floats (< T x 10240 floats)
 template <int T> void launch_i8_t(const GrMulti& m, float* scratch, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
@@ -3301,7 +3303,7 @@ template <int T> void launch_i8_t(const GrMulti& m, float* scratch, cudaStream_t
                   (size_t) T * D, "the int8 read's scratch fits xn_scratch");
     const bool inj = m.a[0].w_inject != nullptr;
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-#if !defined(__HIPCC__)
+    {   // (QuantLab 11/16: HIP too)
     // QuantLab (11/13) STRATA_QL_HC_BW=1|2: the same bits with the loads hoisted (=1) / down and up as one kernel (=2)
     const int bw = ql_hc_bw();
     static const bool info = [] { const char* v = std::getenv("STRATA_QL_HC_BW_INFO"); return v && v[0] == '1'; }();
@@ -3390,7 +3392,7 @@ template <int T> void launch_i8_t(const GrMulti& m, float* scratch, cudaStream_t
         }
         return;
     }
-#endif
+    }
     gr_down_i8_kernel<T><<<dim3(I8_RG + (inj ? 1 : 0), I8_NKC), THREADS, 0, st>>>(m, part, ssg, qlo, dlo);
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
     gr_up_i8_kernel<T><<<N / I8_UPD, 32, 0, st>>>(m, qlo, dlo);
@@ -3712,13 +3714,9 @@ bool fused_gr_q8_split(uint8_t* q8, int64_t n_blocks, void* stream) {
 void fused_gr_set_q8_i8(int on) { g_ql_q8_i8 = on; }
 int fused_gr_q8_i8() { return g_ql_q8_i8; }
 // QuantLab (11/13) STRATA_QL_HC_BW: the bench's switch (-1 = the environment); up_warps 0 = STRATA_QL_HC_BW_UPW
-void fused_gr_set_hc_bw(int mode, int up_warps) {
-#if !defined(__HIPCC__)
+void fused_gr_set_hc_bw(int mode, int up_warps) {   // (QuantLab 11/16: HIP too, with the forms above)
     g_ql_hc_bw = mode;
     g_ql_hc_bw_upw = up_warps;
-#else
-    (void) mode; (void) up_warps;
-#endif
 }
 
 void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream) {
