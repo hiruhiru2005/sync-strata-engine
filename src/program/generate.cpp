@@ -19757,7 +19757,9 @@ int main(int argc, char** argv) {
                                  "to the CPU). The MTP drafts instead.\n", err.c_str());
             use_df2 = false;
         }
-        if (use_df2 && !df2.prepare(ver.tap_dev(), err)) {
+        // QuantLab (11/16): the graphs on the drafter's own 8-row taps (prepare_own / draft_from): a window wider than 8 rows (--lookup-max-t,
+        // suffix drafts) puts its rows past the last 8 into the ring first instead of failing ("draft rows out of range", engine 2)
+        if (use_df2 && !df2.prepare_own(err)) {
             std::fprintf(stderr, "strata generate: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring "
                                  "0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about 2.5%% of its experts "
                                  "to the CPU). The MTP drafts instead.\n", err.c_str());
@@ -20115,7 +20117,7 @@ int main(int argc, char** argv) {
                 if (wait_commit_first && !ver.wait_commit(err)) return false;
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
-                if (!df2.draft(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;
+                if (!df2.draft_from(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 // what the MTP does while it drafts: the PLE rows of the tokens the next window will hold are read ahead
                 // (the window's gather would otherwise wait for them: 1.8 ms a round on strix)
