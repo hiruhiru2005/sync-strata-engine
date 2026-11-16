@@ -4655,10 +4655,26 @@ bool FileExpertSource::pin_cache_complement(
                     std::fprintf(stderr, "FileExpertSource: STRATA_PIN_GUARD=0 overridden: NUMA placement needs the "
                                          "paced path\n");
             }
+            // QuantLab (11/16) STRATA_QL_RAM_ELASTIC=1 with STRATA_PARTIAL_PIN=1 takes the paced path whatever the free RAM:
+            // with plenty free, the one-go cudaHostAlloc below page-locked the whole copy, so STRATA_PARTIAL_PIN_GIB (the
+            // launcher's band, plan A) was never applied and ELASTIC found nothing to give back ("the whole copy is page-locked
+            // by the driver"); plan B needs a registration it can redo shorter.  The paced path registers at most
+            // STRATA_PARTIAL_PIN_GIB of the copy and locks the rest in the working set.  Seen in WSL 11/16: the same config
+            // took one path or the other by the free RAM of the moment.  Windows never runs this block.
+            static const bool el_pace = [] {
+                const char* e = std::getenv("STRATA_QL_RAM_ELASTIC");
+                const char* pp = std::getenv("STRATA_PARTIAL_PIN");
+                return e != nullptr && e[0] == '1' && pp != nullptr && std::atoi(pp) != 0;
+            }();
             if (guard == 2 || numa.place) {
                 paced = true;
                 std::fprintf(stderr, "FileExpertSource: %s: page-locking the complement in steps\n",
                              guard == 2 ? "STRATA_PIN_GUARD=2" : "STRATA_NUMA_SPLIT");
+            } else if (guard != 0 && el_pace) {
+                paced = true;
+                std::fprintf(stderr, "FileExpertSource: QuantLab: STRATA_QL_RAM_ELASTIC with STRATA_PARTIAL_PIN: page-locking "
+                                     "the complement in steps (registered up to STRATA_PARTIAL_PIN_GIB; the rest can be given "
+                                     "back)\n");
             } else if (guard != 0 && free_memory_bytes(free_now) &&
                        detail::pin_depends_on_reclaim(free_now, bytes, pace_reserve)) {
                 drop_file_cache();
