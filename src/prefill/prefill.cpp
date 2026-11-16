@@ -6413,7 +6413,13 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
             if (lay.layer_mixed(l)) {
                 for (const auto& c : lay.cls_fmt[(size_t) l])
                     if (c.tail_off || mmq::fp4_activations(c.gu_type)) { why = "an NVFP4 class in a mixed layer"; return 0; }
-                if (mp.layer[(size_t) l]) { why = "a mixed (per-expert K) layer on MMQ (STRATA_QL_MMQ_MIXED)"; return 0; }
+                // on MMQ (STRATA_QL_MMQ_MIXED=1): the walk groups its experts by class (one type per launch), each class
+                // in its own region of grp_gu / grp_d, as run_impl's MixedGroups
+                if (mp.layer[(size_t) l] && (mp.mixed.size() <= (size_t) l || !mp.mixed[(size_t) l] ||
+                                             (int) lay.cls_fmt[(size_t) l].size() > mp.classes_max)) {
+                    why = "a mixed (per-expert K) layer on MMQ outside the class groups";
+                    return 0;
+                }
             } else if (mp.layer[(size_t) l] && f.r1q2) {
                 why = "an R1Q2 layer outside a mixed layer's MMQ groups";
                 return 0;
@@ -6714,7 +6720,25 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             if (e < 0 || e >= NE) { err = "prefill (layer-major): routed id out of range"; return false; }
             ++cnt[(size_t) e];
         }
-        for (int32_t e = 0; e < NE; ++e) off[(size_t) e + 1] = off[(size_t) e] + cnt[(size_t) e];
+        // pf-smooth: the rows' order.  Experts in id order (off[e]..off[e]+cnt[e] are expert e's rows), or on a mixed MMQ
+        // layer (QuantLab, STRATA_QL_MMQ_MIXED=1) in (class, id) order - run_impl's mmq_class_rows - so that a group of
+        // one class has contiguous rows.  Within an expert the rows stay in token order.  The walk below still stages
+        // the experts in id order.
+        const bool mixed_l = lay.native && lay.layer_mixed(l) && mmq_plan().layer[(size_t) l] &&
+                             (size_t) l < mmq_plan().mixed.size() && mmq_plan().mixed[(size_t) l];
+        auto cls_of = [&](int32_t e) -> int32_t { return (int32_t) lay.ecls[lay.eidx(l, e)]; };
+        std::vector<int32_t> eorder;
+        for (int32_t e = 0; e < NE; ++e)
+            if (cnt[(size_t) e] > 0) eorder.push_back(e);
+        if (mixed_l)
+            std::stable_sort(eorder.begin(), eorder.end(), [&](int32_t a, int32_t b) {
+                return cls_of(a) != cls_of(b) ? cls_of(a) < cls_of(b) : a < b;
+            });
+        {
+            int32_t cursor = 0;
+            for (int32_t e : eorder) { off[(size_t) e] = cursor; cursor += cnt[(size_t) e]; }
+            off[(size_t) NE] = cursor;
+        }
         // ---- the routed experts in id order: resident ones from the cache, the others staged once (run_impl's walk)
         // (started before the tables are built: the stager's threads read while the host builds them)
         std::vector<int32_t> uniq;
@@ -6763,9 +6787,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         }
         struct Entry { int32_t e, r0, nr; };
         std::vector<Entry> ents;
-        for (int32_t e = 0; e < NE; ++e)
-            for (int32_t r = off[(size_t) e]; r < off[(size_t) e + 1]; r += (int32_t) G)
-                ents.push_back({e, r, (int32_t) std::min<int64_t>(G, off[(size_t) e + 1] - r)});
+        for (int32_t e : eorder) {   // (id order unless mixed_l: then (class, id))
+            const int32_t r_end = off[(size_t) e] + cnt[(size_t) e];
+            for (int32_t r = off[(size_t) e]; r < r_end; r += (int32_t) G)
+                ents.push_back({e, r, (int32_t) std::min<int64_t>(G, r_end - r)});
+        }
         struct Grp { size_t j0, j1; int32_t r0, nr, maxr; int64_t b_at, u_at, uo_at, nu; };
         std::vector<Grp> grps;
         for (size_t j = 0; j < ents.size();) {
@@ -6773,7 +6799,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             gp.j0 = j;
             gp.r0 = ents[j].r0;
             int32_t nr = 0, maxr = 0;
-            while (j < ents.size() && j - gp.j0 < (size_t) MMQ_GROUP && nr + ents[j].nr <= G) {
+            while (j < ents.size() && j - gp.j0 < (size_t) MMQ_GROUP && nr + ents[j].nr <= G &&
+                   (!mixed_l || cls_of(ents[j].e) == cls_of(ents[gp.j0].e))) {   // pf-smooth: a mixed group is one class
                 nr += ents[j].nr;
                 maxr = std::max(maxr, ents[j].nr);
                 ++j;
@@ -6896,6 +6923,115 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         const uint8_t* blob_dev = nullptr;
         size_t gi = 0;
         int dq = -1;   // FP16 path: the dequant slot of the current expert
+        // ---- pf-smooth: a mixed MMQ layer (QuantLab, STRATA_QL_MMQ_MIXED=1).  Its groups are of one class (the rows are in
+        // (class, id) order, above), but the experts are still staged and met in id order.  Each expert is gathered,
+        // by its own format, into every entry slot it has in its class's region of grp_gu / grp_d (run_impl's
+        // MixedGroups layout); a group is launched as soon as its last entry is in.  A class's experts are met in
+        // increasing id, which is its groups' order, so at most one group of a class is filling at a time, and the
+        // launch is on the stream before the next gather into that region.  Products per group as run_impl's mixed
+        // groups: x as q8_1 of the layer's largest gate/up type (run_impl's Xq), gate/up and down of the class's types,
+        // H to q8_1 of the class's down type; the rows are then added per token (moe_scatter_add), in group order.
+        if (mixed_l) {
+            const MmqPlan& mpl = mmq_plan();
+            const auto& cls = lay.cls_fmt[(size_t) l];
+            std::vector<int32_t> efirst((size_t) NE, -1), elast((size_t) NE, -1);
+            for (size_t j = 0; j < ents.size(); ++j) {
+                const int32_t e = ents[j].e;
+                if (efirst[(size_t) e] < 0) efirst[(size_t) e] = (int32_t) j;
+                elast[(size_t) e] = (int32_t) j;
+            }
+            std::vector<int32_t> grp_of_ent(ents.size(), -1), gfill(grps.size(), 0);
+            for (size_t g2 = 0; g2 < grps.size(); ++g2)
+                for (size_t j = grps[g2].j0; j < grps[g2].j1; ++j) grp_of_ent[j] = (int32_t) g2;
+            size_t launched = 0;
+            auto launch = [&](size_t g2) -> bool {
+                const Grp& gp = grps[g2];
+                const int c = cls_of(ents[gp.j0].e);
+                if (c < 0 || (size_t) c >= cls.size() || c >= mpl.classes_max) {
+                    err = "prefill (layer-major): a mixed expert's class is out of range";
+                    return false;
+                }
+                const auto& fe = cls[(size_t) c];
+                const size_t gub = mmq::matrix_bytes(fe.gu_type, 1280, N), db = mmq::matrix_bytes(fe.d_type, N, 640);
+                uint8_t* bgu = m.grp_gu + (size_t) c * grp_gu_region(mpl);
+                uint8_t* bd = m.grp_d + (size_t) c * grp_d_region(mpl);
+                const int ngx = (int) (gp.j1 - gp.j0);
+                pt.mark(kPfGemmGU, cs);
+                cudaMemsetAsync(bgu + (size_t) ngx * gub, 0, MMQ_TAIL, cs);
+                cudaMemsetAsync(bd + (size_t) ngx * db, 0, MMQ_TAIL, cs);
+                mmq::quantize(lb.mixed, d_row_tok + gp.r0, m.Xq, mmq_gt, N, N, gp.nr, cs);   // (APR: rotated above)
+                mmq::Product gu;
+                gu.w = bgu; gu.type = fe.gu_type; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = gub;
+                gu.n = ngx; gu.xq = m.Xq; gu.bounds = d_bounds + gp.b_at; gu.ids = m.ids_identity;
+                gu.total_rows = gp.nr; gu.max_rows = gp.maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                m.mmq_ctx->run(gu, cs);
+                mmq::swiglu(m.GU, m.H, gp.nr, 640, false, cs);
+                if (had_d) strata::kernels::hadamard_rows(m.H, m.H, gp.nr, 640, had_block, had_sh, cs);
+                pt.mark(kPfGemmD, cs);
+                mmq::quantize(m.H, nullptr, m.Hq, fe.d_type, 640, 640, gp.nr, cs, m.Hscale);
+                mmq::Product dn;
+                dn.w = bd; dn.type = fe.d_type; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = db;
+                dn.n = ngx; dn.xq = m.Hq; dn.bounds = d_bounds + gp.b_at; dn.ids = m.ids_identity;
+                dn.total_rows = gp.nr; dn.max_rows = gp.maxr; dn.dst = m.Dm; dn.ld_dst = N;
+                m.mmq_ctx->run(dn, cs);
+                pt.mark(kPfCombine, cs);
+                moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0, d_u_w + gp.r0, gp.nu,
+                                lb.acc, cs);
+                ++lm_groups;
+                ++stats_.ql_mixed_groups;
+                ++launched;
+                core::progress_beat();
+                return true;
+            };
+            for (size_t uu = 0; uu < uniq.size(); ++uu) {
+                while (staged < uniq.size() && staged <= uu + (size_t) STAGE - 1) {
+                    if (!stage_one(staged)) return false;
+                    ++staged;
+                }
+                const int32_t e = uniq[uu];
+                if (stage_of[uu] < 0) {
+                    blob_dev = m.cache->device_slot(m.host_res[(size_t) l * NE + e]);
+                    ++stats_.experts_resident;
+                    ++lm_resident;
+                } else {
+                    pt.mark(kPfWaitCopy, cs);
+                    cudaStreamWaitEvent(cs, m.copied[stage_of[uu]], 0);
+                    blob_dev = m.stage_dev[stage_of[uu]];
+                }
+                const int c = cls_of(e);
+                if (c < 0 || (size_t) c >= cls.size() || c >= mpl.classes_max || efirst[(size_t) e] < 0) {
+                    err = "prefill (layer-major): a mixed expert's class or rows are out of range";
+                    return false;
+                }
+                const auto& fe = lay.fmt_of(l, e);   // = cls[c]
+                const size_t gub = mmq::matrix_bytes(fe.gu_type, 1280, N), db = mmq::matrix_bytes(fe.d_type, N, 640);
+                uint8_t* bgu = m.grp_gu + (size_t) c * grp_gu_region(mpl);
+                uint8_t* bd = m.grp_d + (size_t) c * grp_d_region(mpl);
+                pt.mark(kPfDequant, cs);
+                for (int32_t j = efirst[(size_t) e]; j <= elast[(size_t) e]; ++j) {   // its entries (more than one past G rows)
+                    const int32_t g2 = grp_of_ent[(size_t) j];
+                    const size_t q = (size_t) j - grps[(size_t) g2].j0;
+                    if (fe.r1q2)   // QuantLab (10/31): an R1Q2 blob, expanded to the old blocks
+                        mmq::gather_r1q2(blob_dev, ql_tq_kbits(fe.gu_type), ql_tq_kbits(fe.d_type), N, 640, fe.up_off,
+                                         fe.down_off, fe.sc_off, fe.p2, bgu + q * gub, bd + q * db, cs, 0);
+                    else
+                        mmq::gather_native(blob_dev, blob_dev + fe.up_off, gub / 2, blob_dev + fe.down_off, db, bgu + q * gub,
+                                           bd + q * db, cs);
+                    if (++gfill[(size_t) g2] == (int32_t) (grps[(size_t) g2].j1 - grps[(size_t) g2].j0))
+                        if (!launch((size_t) g2)) return false;
+                }
+                if (stage_of[uu] >= 0) {   // every entry of the blob is gathered: its ring slot is free
+                    cudaEventRecord(m.used[stage_of[uu]], cs);
+                    m.used_of[stage_of[uu]] = stage_of[uu];
+                }
+            }
+            if (launched != grps.size()) {
+                err = "prefill (layer-major): a mixed layer's class group was left unlaunched";
+                return false;
+            }
+            ms_experts += ms_since(th0);
+            return true;
+        }
         for (size_t j = 0; j < ents.size(); ++j) {
             const int32_t e = ents[j].e;
             if (j == 0 || ents[j - 1].e != e) {   // the next expert: staged ahead, waited for, its blob located
