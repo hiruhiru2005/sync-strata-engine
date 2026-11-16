@@ -503,8 +503,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   # PR #3943: STRATA_PATTN_SM60's score and value kernels against the decode kernels' output (the Daily's chunk kernel and
   # the merge), bitwise, on random int8 K/V (GPU, synthetic, no model).  Only in the experimental sm_60 build; it skips
-  # (77) on a build without the kernels.
-  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
+  # (77) on a build without the kernels.  QuantLab (11/16): or alone with -DSTRATA_PARITY_PATTN=ON.
+  if((STRATA_BUILD_TESTS OR STRATA_PARITY_PATTN) AND STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
     add_executable(qsa_pattn_parity src/kernels/qsa_pattn_parity.cpp)
     target_include_directories(qsa_pattn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_pattn_parity PRIVATE strata_kernels CUDA::cudart)
