@@ -6399,7 +6399,13 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
             if (l < (int64_t) mp.wmma_only.size() && mp.wmma_only[(size_t) l]) { why = "a layer needs the WMMA tiles"; return 0; }
             if (!lay.native) continue;
             const auto& f = lay.fmt[(size_t) l];
-            if (f.had_gu || f.had_d) { why = "an APR (Hadamard-folded) layer"; return 0; }
+            // pf-smooth: APR (Hadamard-folded) layers are rotated as run_impl rotates them (x before its q8_1 / FP16 rows,
+            // H before the down product); the sign vectors are the ones init resolved for run_impl
+            if (f.had_gu || f.had_d) {
+                const bool sx_ok = !f.had_gu || ((size_t) l < m.had_sx.size() && m.had_sx[(size_t) l] != nullptr);
+                const bool sh_ok = !f.had_d || ((size_t) l < m.had_sh.size() && m.had_sh[(size_t) l] != nullptr);
+                if (!sx_ok || !sh_ok || f.had_block <= 0) { why = "an APR (Hadamard-folded) layer without its sign vectors"; return 0; }
+            }
             if (f.tail_off || mmq::fp4_activations(f.gu_type)) { why = "an NVFP4 layer"; return 0; }
             // pf-smooth: a QuantLab mixed (per-expert K) layer's experts differ in format.  Every format of the layer is
             // checked, not just fmt[l] (its largest); the MMQ pass below takes one type per launch, so a mixed layer on
@@ -6875,6 +6881,17 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         // two FP16 GEMMs into the group's Dm rows; the group's rows are added per token as on the MMQ path
         const bool fp16_l = !mmq_plan().layer[(size_t) l];
         const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, 1280, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, 640);
+        // pf-smooth: APR (prism.hadamard) as run_impl takes it - a folded gate/up reads x rotated (MMQ: the q8_1 rows come
+        // from the rotated FP32 rows, as run_impl's Xr; FP16: the gathered FP16 rows rotated in place, as its Xs), a
+        // folded down reads H rotated (MMQ: FP32 H before its q8_1; FP16: the FP16 H in place).  The FFN input rows of
+        // the super-chunk (lb.mixed) have no reader after this layer's experts (the shared expert ran with the
+        // attention passes; the next layer writes them anew), so the MMQ path rotates them in place, once per layer.
+        const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
+        const bool had_d = lay.native && lay.fmt[(size_t) l].had_d;
+        const int had_block = lay.native ? lay.fmt[(size_t) l].had_block : 0;
+        const float* had_sx = had_gu ? m.had_sx[(size_t) l] : nullptr;
+        const float* had_sh = had_d ? m.had_sh[(size_t) l] : nullptr;
+        if (had_gu && !fp16_l) strata::kernels::hadamard_rows(lb.mixed, lb.mixed, Sn, N, had_block, had_sx, cs);
         size_t staged = 0, u = 0;
         const uint8_t* blob_dev = nullptr;
         size_t gi = 0;
@@ -6926,9 +6943,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 // this entry's rows (group-relative offset o): FP16 inputs, gate/up, SwiGLU, down
                 const int64_t o = ents[j].r0 - gp.r0, nr = ents[j].nr;
                 gather_rows16(lb.mixed_h, d_row_tok + ents[j].r0, m.Xs + o * N, nr, N, cs);
+                if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs + o * N, nr, N, had_block, had_sx, cs);   // pf-smooth: APR
                 pt.mark(kPfGemmGU, cs);
                 m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
                 swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
+                if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o * 640, nr, 640, had_block, had_sh, cs);   // pf-smooth: APR
                 pt.mark(kPfGemmD, cs);
                 m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
                 if (j + 1 < gp.j1) continue;
@@ -6965,6 +6984,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             gu.total_rows = gp.nr; gu.max_rows = gp.maxr; gu.dst = m.GU; gu.ld_dst = 1280;
             m.mmq_ctx->run(gu, cs);
             mmq::swiglu(m.GU, m.H, gp.nr, 640, !lay.native, cs);
+            if (had_d) strata::kernels::hadamard_rows(m.H, m.H, gp.nr, 640, had_block, had_sh, cs);   // pf-smooth: APR
             pt.mark(kPfGemmD, cs);
             mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, gp.nr, cs);
             mmq::Product dn;
