@@ -6401,6 +6401,17 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
             const auto& f = lay.fmt[(size_t) l];
             if (f.had_gu || f.had_d) { why = "an APR (Hadamard-folded) layer"; return 0; }
             if (f.tail_off || mmq::fp4_activations(f.gu_type)) { why = "an NVFP4 layer"; return 0; }
+            // pf-smooth: a QuantLab mixed (per-expert K) layer's experts differ in format.  Every format of the layer is
+            // checked, not just fmt[l] (its largest); the MMQ pass below takes one type per launch, so a mixed layer on
+            // MMQ (STRATA_QL_MMQ_MIXED=1) is declined here until the walk groups it by class (never a wrong type)
+            if (lay.layer_mixed(l)) {
+                for (const auto& c : lay.cls_fmt[(size_t) l])
+                    if (c.tail_off || mmq::fp4_activations(c.gu_type)) { why = "an NVFP4 class in a mixed layer"; return 0; }
+                if (mp.layer[(size_t) l]) { why = "a mixed (per-expert K) layer on MMQ (STRATA_QL_MMQ_MIXED)"; return 0; }
+            } else if (mp.layer[(size_t) l] && f.r1q2) {
+                why = "an R1Q2 layer outside a mixed layer's MMQ groups";
+                return 0;
+            }
         }
     }
     if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
