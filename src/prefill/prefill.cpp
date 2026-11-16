@@ -6411,8 +6411,16 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
             // checked, not just fmt[l] (its largest); the MMQ pass below takes one type per launch, so a mixed layer on
             // MMQ (STRATA_QL_MMQ_MIXED=1) is declined here until the walk groups it by class (never a wrong type)
             if (lay.layer_mixed(l)) {
-                for (const auto& c : lay.cls_fmt[(size_t) l])
+                for (const auto& c : lay.cls_fmt[(size_t) l]) {
                     if (c.tail_off || mmq::fp4_activations(c.gu_type)) { why = "an NVFP4 class in a mixed layer"; return 0; }
+                    // the walk rotates by the layer's fold (fmt[l], as run_impl does); the loader gives every class the
+                    // layer's fold (expert_layout.cpp: "a mixed layer's formats rotate exactly like the layer's own"), so
+                    // a class that differs is a layout this walk was not written for
+                    if (c.had_gu != f.had_gu || c.had_d != f.had_d || ((f.had_gu || f.had_d) && c.had_block != f.had_block)) {
+                        why = "a mixed layer whose classes fold differently";
+                        return 0;
+                    }
+                }
                 // on MMQ (STRATA_QL_MMQ_MIXED=1): the walk groups its experts by class (one type per launch), each class
                 // in its own region of grp_gu / grp_d, as run_impl's MixedGroups
                 if (mp.layer[(size_t) l] && (mp.mixed.size() <= (size_t) l || !mp.mixed[(size_t) l] ||
