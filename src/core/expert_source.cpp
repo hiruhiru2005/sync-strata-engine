@@ -4810,10 +4810,19 @@ bool FileExpertSource::pin_cache_complement(
                     // cut at an expert boundary: a blob that runs past the registered range would be refused by a
                     // cudaMemcpyAsync as not page-locked
                     uint64_t w = got;
+                    // QuantLab (11/16): the paced path that STRATA_QL_RAM_ELASTIC takes on Linux (see above) registers at
+                    // most STRATA_PARTIAL_PIN_GIB, as the partial path below does: the rest of the copy (the launcher's band)
+                    // stays resident but not registered, the part ELASTIC may give back.  Without ELASTIC, as before.
+                    static const bool el_cap = [] {
+                        const char* e = std::getenv("STRATA_QL_RAM_ELASTIC");
+                        return e != nullptr && e[0] == '1';
+                    }();
+                    if (el_cap && partial_on && w > pin_cap) w = pin_cap;
+                    const uint64_t cut_at = w;
                     for (size_t i = 0; i < offsets.size() && w < bytes; ++i) {
                         if (offsets[i] == kNoComplement) continue;
                         const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
-                        if (offsets[i] < got && offsets[i] + b > got) { w = offsets[i]; break; }
+                        if (offsets[i] < cut_at && offsets[i] + b > cut_at) { w = offsets[i]; break; }
                     }
                     if (w > 0) {
                         if (cudaHostRegister(arena, (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable) ==
