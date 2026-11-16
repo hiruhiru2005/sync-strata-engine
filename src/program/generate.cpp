@@ -6571,8 +6571,9 @@ int main(int argc, char** argv) {
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
 #if defined(STRATA_HAVE_DFLASH2)
-    strata::core::Dflash2Drafter df2;   // --draft dflash2 (CLI spec loop only)
+    strata::core::Dflash2Drafter df2;   // --draft dflash2 (the CLI spec loop, and the serve loop on one card without --batch: QuantLab 11/16)
     bool use_df2 = false;
+    int df2_cap = 0;   // serve: the widest DFlash2 window (--draft-cap, else by card; 0 = --spec, at most 8)
 #endif
     // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
     // slots' draft-KV copies use this one too
@@ -6625,9 +6626,11 @@ int main(int argc, char** argv) {
         mtp.set_ple_session(&ss);
 #if defined(STRATA_HAVE_DFLASH2)
         if (o.draft == "dflash2") {
+            // QuantLab (11/16): --serve takes it too, on one card without --batch (the single-slot loop; df2_serve below)
             const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
                               : !native_pack ? "it needs a native pack"
-                              : multi_gpu || o.batch > 0 || o.serve ? "it is for one card and the CLI run (not --serve, --batch or a layer split) in this build"
+                              : multi_gpu || o.batch > 0 ? "it is for one card without --batch or a layer split in this build"
+                              : o.serve && o.prefill_head_alias ? "--prefill-head-alias lends the output head it reads to the prompt"
                               : o.draft_model.empty() ? "it needs --draft-model PACK (tools/dflash2_pack.py)" : nullptr;
             if (why == nullptr) {
                 if (df2.load(o.draft_model, 0, err)) {
@@ -6648,7 +6651,10 @@ int main(int argc, char** argv) {
                         const int cc_major = dp.major;
 #endif
                         const int cap = o.draft_cap > 0 ? o.draft_cap : strata::core::dflash2_auto_cap(uma, cc_major);
-                        if (cap > 0 && o.spec > cap) {
+                        // QuantLab (11/16): the server keeps --spec (the lookup and suffix windows go up to it) and caps only the
+                        // DFlash2 windows (df2_cap, used by the serve loop); the CLI lowers --spec as before
+                        if (o.serve) df2_cap = cap;
+                        else if (cap > 0 && o.spec > cap) {
                             std::fprintf(stderr, "strata generate: --draft dflash2: windows capped at %d tokens (%s; --draft-cap N changes it)\n", cap,
                                          o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
                             o.spec = cap;
@@ -7024,6 +7030,8 @@ int main(int argc, char** argv) {
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
                         if (use_df2 && native_head.loaded()) mtp_b += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits
+                        // QuantLab (11/16) serve: the prompt path's tap staging (2048 rows x 5 x n_embd floats) and the drafter's own 8 rows
+                        if (use_df2 && o.serve) mtp_b += (int64_t) (2048 + 8) * 5 * (int64_t) g.n_embd * 4;
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
@@ -7283,6 +7291,9 @@ int main(int argc, char** argv) {
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2 && native_head.loaded()) mtp_bind += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits, bound after this
+        // QuantLab (11/16) serve: the prompt path's tap staging (2048 rows x 5 x n_embd floats, allocated at the first tapped read) and the
+        // drafter's own 8 rows (prepare_own)
+        if (use_df2 && o.serve) mtp_bind += (int64_t) (2048 + 8) * 5 * (int64_t) g.n_embd * 4;
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
@@ -10861,6 +10872,10 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+#if defined(STRATA_HAVE_DFLASH2)
+        // QuantLab (11/16): DFlash2 in the serve loop reads the completed outputs of its 5 layers for every window row (one stage only)
+        if (use_df2 && n_stages == 1 && !pipe && o.batch == 0) ver.set_taps(df2.tap_layers());
+#endif
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -10870,6 +10885,28 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+#if defined(STRATA_HAVE_DFLASH2)
+        if (use_df2) {   // QuantLab (11/16): the serve loop's DFlash2 (the CLI's order: taps, init, bind, graphs on the drafter's own taps)
+            const char* df2_mem = "It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, a draft head 0.2 GiB); "
+                                  "--vram-reserve-mib 1900 keeps it. The MTP drafts instead.";
+            if (n_stages != 1 || pipe || o.batch > 0 || !ver.tapping()) {
+                std::fprintf(stderr, "strata serve: --draft dflash2: the verifier keeps no taps here (one card, no --batch); the MTP drafts instead\n");
+                use_df2 = false;
+            } else if (!df2.bind(wt, &native_head, o.mtp_draft_vocab.empty() ? o.mtp + "/draft_vocab.bin" : o.mtp_draft_vocab, err)) {
+                std::fprintf(stderr, "strata serve: --draft dflash2: %s. %s\n", err.c_str(), df2_mem);
+                use_df2 = false;
+            } else if (!df2.prepare_own(err)) {
+                std::fprintf(stderr, "strata serve: --draft dflash2: %s. %s\n", err.c_str(), df2_mem);
+                use_df2 = false;
+            } else {
+                std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms, %.0f MiB of VRAM), windows up to %d tokens, "
+                                     "%s; the MTP layer stays as the fallback\n", o.draft_model.c_str(), df2.ms_capture,
+                             (double) df2.vram_bytes() / 1048576.0, df2_cap > 0 ? std::min(df2_cap, o.spec) : std::min(o.spec, 8),
+                             o.draft_conf > 0.0 ? "the window ends where the product of the selector's probabilities falls below --draft-conf"
+                                                : "each draft kept while its probability reaches --spec-min-p");
+            }
+        }
+#endif
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
@@ -11056,6 +11093,13 @@ int main(int argc, char** argv) {
         // shares that prefix mounts through it instead of reading it again.
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
+#if defined(STRATA_HAVE_DFLASH2)
+        // QuantLab (11/16) DFlash2 in the serve loop: the tokens (and images) of the conversation whose rows the drafter's ring holds, as `live`
+        // was when the last request ended, and the end of the rows fed without a gap (the ring is valid in [df2.floor(), df2_end))
+        std::vector<int32_t> df2_live;
+        std::vector<ImgKey> df2_live_imgs;
+        int64_t df2_end = 0;
+#endif
         bool live_ok = false;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
@@ -15797,6 +15841,31 @@ int main(int argc, char** argv) {
             if (use_mtp && mtp.cell_floor_enabled())
                 mtp.set_cell_floor(resume > 0 && reread_to <= 0 ? kva_floors.floor_for(ids.data(), resume) : 0);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+#if defined(STRATA_HAVE_DFLASH2)
+            // QuantLab (11/16) DFlash2: the ring goes on only when this request continues the very conversation it was fed last (the live
+            // session, the same tokens, no row missing up to read_from); anything else - a fresh read, a checkpoint, a parked conversation,
+            // a session file, a re-read - starts its context at read_from (the floor keeps the older slots out of the attention).  The
+            // prompt rows the first draft looks back on, [df2_from, n - 1), are fed as they are read; the last prompt token's row comes with
+            // the first window, as in the CLI.
+            const int64_t df2_from = use_df2 ? std::max<int64_t>(read_from, n - 2047) : INT64_MAX;
+            if (use_df2) {
+                const bool keep = from_live && reread_to <= 0 && read_from > 0 && read_from <= df2_end && live == df2_live &&
+                                  live_imgs == df2_live_imgs;
+                if (!keep) { df2.reset(); df2.set_floor(read_from); }
+                df2_end = read_from;   // (kept: the rows from read_from on are this request's, fed again below)
+            }
+            // the rows [pos0, pos0 + rows) of device taps ([rows][5][n_embd]): the ones at df2_from or later go into the ring
+            auto df2_feed = [&](const float* taps, int64_t rows, int64_t pos0, std::string& e) -> bool {
+                if (!use_df2) return true;
+                const int64_t lo = std::max(pos0, df2_from);
+                if (lo >= pos0 + rows) return true;
+                if (lo > df2_end) df2.set_floor(lo);   // a gap (rows the ring never saw): the context starts here
+                const size_t row = df2.tap_layers().size() * (size_t) df2.n_embd();
+                if (!df2.context(taps + (size_t) (lo - pos0) * row, pos0 + rows - lo, lo, e)) return false;
+                df2_end = pos0 + rows;
+                return true;
+            };
+#endif
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -16010,6 +16079,9 @@ int main(int argc, char** argv) {
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (use_df2 && !df2_feed(ver.tap_dev(), T, q, e)) return false;   // QuantLab (11/16): the window's rows into the ring
+#endif
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -16441,6 +16513,17 @@ int main(int argc, char** argv) {
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             int64_t req_chunk = 0, req_chunk_len = 0;   // the DONE line's chunk=: the longest batched segment's first chunk
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+#if defined(STRATA_HAVE_DFLASH2)
+                // QuantLab (11/16): the prompt taps only on a part that reaches df2_from (the cut there keeps every part before it on the
+                // layer-major walk, which reads no taps); 2048 staging rows hold any chunk's rows from df2_from to n - 1
+                if (use_df2 && b0 > df2_from) {
+                    sp.set_taps(df2.tap_layers(), std::max(a0, df2_from), 2048);
+                    sp.on_taps = [&](const float* taps, int64_t rows, int64_t pos0, std::string& te) -> bool { return df2_feed(taps, rows, pos0, te); };
+                } else if (use_df2) {
+                    sp.set_taps({}, INT64_MAX, 2048);
+                    sp.on_taps = nullptr;
+                }
+#endif
                 // --prefill-pipe on a layer split: the segment's chunk is planned ONCE, on its whole length (or taken
                 // from the read it goes on from: resume_plan), and every run of it reads in that chunk (force_chunk) -
                 // the same chunks whether it is read in one run, in pieces beside decoding slots, or goes on after a
@@ -16965,7 +17048,12 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
-            const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
+#if defined(STRATA_HAVE_DFLASH2)
+            const bool req_df2 = use_df2;   // QuantLab (11/16): this request drafts with DFlash2 (no gated proposals, no MTP q)
+#else
+            const bool req_df2 = false;
+#endif
+            const bool gated_proposal = !req_df2 && use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
                 gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && n_stages == 1 && !multi_gpu && drive.d.remote_count == 0,
                                       o.lookup_chain, o.adapt_swaps, req_pcie_frac != 0.0 || o.pcie_frac_auto, spec_cost, S,
                                       req_spec_min_p);
@@ -17076,6 +17164,15 @@ int main(int argc, char** argv) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            // QuantLab (11/16) DFlash2: a cut at df2_from (no checkpoint there): the read before it stays on the layer-major walk, the
+            // last part (at most 2047 tokens) is the one that carries the prompt taps
+            if (use_df2 && df2_from > read_from && df2_from < n - 1 &&
+                std::find(cuts.begin(), cuts.end(), df2_from) == cuts.end()) {
+                cuts.push_back(df2_from);
+                std::sort(cuts.begin(), cuts.end());
+            }
+#endif
             int64_t at = read_from;
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
@@ -17957,6 +18054,28 @@ int main(int argc, char** argv) {
                     if (first_window && merge_T > 0) T = merge_T;   // STRATA_ADMIT_MERGE_FIRST: the prompt's last tokens ride in this window
                 } else {
                     T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (req_df2 && !first_window) {
+                        // QuantLab (11/16): DFlash2's drafts (up to 7): its own cap (--draft-cap, else by card, else --spec, at most 8 rows),
+                        // the window ending where the product of the selector's probabilities falls below --draft-conf (the CLI's rule),
+                        // else each draft kept while its probability reaches spec_min_p
+                        const int S_df2 = std::max(1, std::min({S, (int) strata::core::Dflash2Drafter::kDrafts + 1, df2_cap > 0 ? df2_cap : S}));
+                        T = 1;
+                        if (o.draft_conf > 0.0) {
+                            double chain = 1.0;
+                            while (T < S_df2 && (chain *= (double) dprob[(size_t) T - 1]) >= o.draft_conf) ++T;
+                        } else if (req_spec_min_p > 0.0) {
+                            while (T < S_df2 && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                        } else {
+                            T = S_df2;
+                        }
+                        // --lookup-max-t: the window sizes are a set (the MTP's, MTP+1, MTP+2, --spec); the largest allowed one whose graph fits
+                        if (o.lookup_max_t > 0 && T > 1) {
+                            T = graph_fits(policy.fit(T));
+                            if (T < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        }
+                    } else
+#endif
                     if (use_mtp && spec_cost && !first_window) {
                         T = std::clamp(chain_rows, 1, S_mtp);
                     } else if (use_mtp && req_spec_min_p > 0.0) {
@@ -18251,8 +18370,8 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
-                else if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                else if (!req_df2 && use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                const auto decode_pool_fn = use_mtp && mtp.prob() && !req_df2 ? invariant_win_pool_fn : win_pool_fn;
                 // QuantLab (11/12) STRATA_QL_PROFILE_WIN=A:B: cudaProfilerStart before decode window A and cudaProfilerStop
                 // after window B (served decode windows since the engine started, first windows of a request not
                 // counted), for ncu --profile-from-start off.  Unset: nothing.
@@ -18397,9 +18516,54 @@ int main(int argc, char** argv) {
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
+#if defined(STRATA_HAVE_DFLASH2)
+                // QuantLab (11/16) DFlash2: the window's a + 1 committed rows (their taps) go into the ring and the block anchored on the new
+                // token drafts the next window (the CLI's draft_next).  A window that ends the answer goes into the ring too, so the next
+                // request of this conversation continues from a ring with no row missing.  The PLE rows of the next window's tokens are read
+                // ahead as the MTP does while it drafts.
+                const bool drafted = req_df2 ? [&]() -> bool {
+                    const int rows = a + 1;
+                    if (p > df2_end) df2.set_floor(p);   // a gap (should not happen: the prompt and every window are fed)
+                    if (eos || produced_n >= max_new) {
+                        if (!df2.context_from(ver.tap_dev(), rows, p, err)) return false;
+                        df2_end = p + rows;
+                        return true;
+                    }
+                    int32_t dd[strata::core::Dflash2Drafter::kDrafts];
+                    float pp[strata::core::Dflash2Drafter::kDrafts];
+                    if (!df2.draft_from(ver.tap_dev(), rows, p, outv[(size_t) a], dd, pp, err)) return false;
+                    df2_end = p + rows;
+                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
+                    for (size_t i = (size_t) strata::core::Dflash2Drafter::kDrafts; i < dprob.size(); ++i) dprob[i] = 0.0f;
+                    if (ss.ple.ready() && ss.ple.table != nullptr) {
+                        const int cap = std::min<int>({S, (int) strata::core::Dflash2Drafter::kDrafts + 1, df2_cap > 0 ? df2_cap : S});
+                        int n_pf = 0;
+                        double chain = 1.0;
+                        for (int t = 1; t < cap; ++t) {
+                            if (o.draft_conf > 0.0) { if ((chain *= (double) dprob[(size_t) t - 1]) < o.draft_conf) break; }
+                            else if (req_spec_min_p > 0.0 && dprob[(size_t) t - 1] < (float) req_spec_min_p) break;
+                            ++n_pf;
+                        }
+                        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+                        auto pf = [&](int32_t tok) {
+                            uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                            strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts, rows16);
+                            prev[0] = prev[1];
+                            prev[1] = tok;
+                            ss.ple.table->prefetch_rows(rows16);
+                        };
+                        pf(outv[(size_t) a]);
+                        for (int i = 0; i < n_pf; ++i) pf(drafts[(size_t) i]);
+                    }
+                    return true;
+                }() : (!use_mtp || eos || produced_n >= max_new ||
+                       mtp.draft_long(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
+                                      nullptr, gated_proposal ? &generation : nullptr));
+#else
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft_long(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
                                                     nullptr, gated_proposal ? &generation : nullptr);
+#endif
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -18599,6 +18763,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            // QuantLab (11/16): the conversation the DFlash2 ring was fed (the next request keeps the ring only for this one, up to df2_end)
+            if (use_df2) {
+                if (live_ok) { df2_live = live; df2_live_imgs = live_imgs; }
+                else { df2_live.clear(); df2_live_imgs.clear(); df2_end = 0; }
+            }
+#endif
             if (nib::config().recheck && nib::any_on() && !cancelled) {
                 // STRATA_EXPERT_NIBBLE_RECHECK=1 (debug): every converted slot's hash again on its own device, against the
                 // hash recorded at load - a path that wrote a slot after the seal is found here

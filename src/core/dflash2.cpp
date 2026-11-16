@@ -49,7 +49,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
     fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
-    fr(dvocab_); fr(dhead_);
+    fr(dvocab_); fr(dhead_); fr(own_taps_);
     if (h_meta_) cudaFreeHost(h_meta_);
     if (h_out_) cudaFreeHost(h_out_);
     if (cs_) cudaStreamDestroy(cs_);
@@ -245,6 +245,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     if (!mapped(32 * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
     h_meta_ = (int32_t*) hd;
     m_meta_ = (int32_t*) dd;
+    std::memset(h_meta_, 0, 32 * 4);   // [18] the context floor starts at 0 (the whole window)
     if (!mapped(64 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
     h_out_ = (int32_t*) hd;
     out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
@@ -486,6 +487,39 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     return true;
 }
 
+bool Dflash2Drafter::prepare_own(std::string& err) {
+    if (!bound_) { err = "dflash2: not bound"; return false; }
+    const OnDevice on_device(device_);
+    if (!own_taps_) {
+        const size_t n = (size_t) kRows * taps_.size() * (size_t) N_;
+        if (cudaMalloc((void**) &own_taps_, n * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            own_taps_ = nullptr;
+            err = "dflash2: the drafter's own taps buffer does not fit in VRAM";
+            return false;
+        }
+        cudaMemset(own_taps_, 0, n * sizeof(float));
+        own_taps_bytes_ = n * sizeof(float);
+        vram_ += own_taps_bytes_;
+    }
+    return prepare(own_taps_, err);
+}
+
+bool Dflash2Drafter::draft_from(const float* src, int rows, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err) {
+    if (!own_taps_) { err = "dflash2: draft_from before prepare_own"; return false; }
+    if (rows < 1) { err = "dflash2: draft rows out of range"; return false; }
+    const OnDevice on_device(device_);
+    const size_t tap_n = taps_.size() * (size_t) N_;
+    const int lead = rows > kRows ? rows - kRows : 0;   // the rows before the last 8: context only
+    if (lead > 0 && !context(src, lead, pos0, err)) return false;
+    const int n_new = rows - lead;
+    if (cudaMemcpyAsync(own_taps_, src + (size_t) lead * tap_n, (size_t) n_new * tap_n * sizeof(float), cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = std::string("dflash2: taps copy: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return draft(own_taps_, n_new, pos0 + lead, anchor, drafts, probs, err);   // (stream-ordered after the copy: the graph runs on cs_)
+}
+
 bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
     const int tap_n = (int) taps_.size() * N_;
@@ -517,6 +551,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
     h_meta_[16] = anchor;
     h_meta_[17] = (int32_t) s;
+    h_meta_[18] = (int32_t) std::max<int64_t>(0, std::min<int64_t>(floor_, s));   // the context floor (set_floor; the attention kernel reads it)
     h_meta_[24] = anchor;
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
     for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }

@@ -107,8 +107,13 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
     __shared__ float Sc[32 * 33];
     __shared__ float m_s[32], l_s[32], corr_s[32];
     const int kvh = blockIdx.x, chunk = blockIdx.y, tid = threadIdx.x;
-    const int s = *anchor_pos;
-    const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+    const int s = anchor_pos[0];
+    // QuantLab (11/16): anchor_pos[1] is the context floor (Dflash2Drafter::set_floor): the first position whose ring slot holds a row of
+    // this context.  A server request that mounts a conversation the ring never saw (a checkpoint, a parked conversation, a session file)
+    // starts the ring there, so the slots below it (another conversation's rows, or zeros) are not attended to.  0 = the whole window.
+    const int floor_pos = anchor_pos[1] < s ? anchor_pos[1] : s;
+    const int lo0 = s - (window - 1) > 0 ? s - (window - 1) : 0;
+    const int lo = floor_pos > lo0 ? floor_pos : lo0;
     const int nctx = s - lo;
     const int nkeys = nctx + kDf2Rows;
     const int k_begin = chunk * kDf2Chunk;

@@ -50,7 +50,14 @@ public:
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
 
     /// A new request: the ring is empty again.
-    void reset() { have_ctx_ = 0; }
+    void reset() { have_ctx_ = 0; floor_ = 0; }
+    /// QuantLab (11/16): the context floor.  The attention reads ring slots from max(s - window + 1, floor) only: a server request that mounts
+    /// a conversation whose rows below `pos` never reached the ring (a checkpoint, a parked conversation, a session file) sets it to the first
+    /// position it feeds, so the older slots (another conversation's rows, or zeros) are not attended to.  0 = the whole window.
+    void set_floor(int64_t pos) { floor_ = pos < 0 ? 0 : pos; }
+    int64_t floor() const { return floor_; }
+    /// The end of the rows fed so far (context() and draft()), for the caller's bookkeeping.
+    int64_t fed_end() const { return have_ctx_; }
     /// Context rows without a draft: `n` rows of taps (device, [n][5 * n_embd]) for positions pos0 ... pos0 + n - 1.
     bool context(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
@@ -60,6 +67,18 @@ public:
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
+
+    /// QuantLab (11/16, the server path): the round graphs captured on the drafter's own 8-row taps buffer (allocated here), so the caller's
+    /// taps can live anywhere and a window can be wider than 8 rows.  Use draft_from() afterwards, never draft().
+    bool prepare_own(std::string& err);
+    /// One round from any device taps `src` ([rows][5 * n_embd], rows >= 1, positions pos0 ...; the window's committed rows): the rows past
+    /// the last 8 go to context(), the last min(rows, 8) are copied (on the drafter's stream) into its own buffer and drafted from, the block
+    /// anchored at pos0 + rows.  The caller has the window's result on the host already, so the verifier wrote `src` before this call.
+    bool draft_from(const float* src, int rows, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
+    /// The same rows into the ring with no draft (a window that ends the answer: the next request of the conversation continues from them).
+    bool context_from(const float* src, int rows, int64_t pos0, std::string& err) { return context(src, rows, pos0, err); }
+    /// Bytes of the own taps buffer (0 before prepare_own).
+    uint64_t own_taps_bytes() const { return own_taps_bytes_; }
 
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
@@ -134,6 +153,9 @@ private:
     cudaGraphExec_t exec_[kRows + 1] = {};
     const float* graph_taps_ = nullptr;
     int64_t have_ctx_ = 0;
+    int64_t floor_ = 0;   ///< set_floor: h_meta_[18] at each draft
+    float* own_taps_ = nullptr;      ///< prepare_own: [8][taps][N_], the round graphs' taps
+    uint64_t own_taps_bytes_ = 0;
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr;
     bool timing_ = false;
 };
