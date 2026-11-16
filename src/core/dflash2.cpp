@@ -487,6 +487,19 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     return true;
 }
 
+uint64_t Dflash2Drafter::bind_bytes_for(const std::string& vocab_file, uint64_t head_row_bytes, int64_t n_vocab) {
+    int64_t rows = 0;
+    if (!vocab_file.empty())
+        if (std::FILE* f = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            const long size = std::ftell(f);
+            std::fclose(f);
+            if (size >= 4 && size % 4 == 0) rows = size / 4;
+        }
+    if (rows > 0) return (uint64_t) rows * head_row_bytes + (uint64_t) rows * 4 + (uint64_t) kDrafts * (uint64_t) rows * 4;
+    return (uint64_t) kDrafts * (uint64_t) std::max<int64_t>(0, n_vocab) * 4;
+}
+
 bool Dflash2Drafter::prepare_own(std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     const OnDevice on_device(device_);

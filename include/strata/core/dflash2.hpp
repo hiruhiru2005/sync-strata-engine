@@ -79,6 +79,10 @@ public:
     bool context_from(const float* src, int rows, int64_t pos0, std::string& err) { return context(src, rows, pos0, err); }
     /// Bytes of the own taps buffer (0 before prepare_own).
     uint64_t own_taps_bytes() const { return own_taps_bytes_; }
+    /// QuantLab (11/16): the VRAM bind() will take for a native head of `head_row_bytes` a row: the draft head over the vocabulary file's
+    /// rows (the whole head, `n_vocab` rows, when the file is missing: then no copy, only the logits), the id map and the 7 rows of logits.
+    /// The expert cache is sized before bind(), so it reserves this (it needs no MTP layer, unlike MtpDrafter::bind_bytes).
+    static uint64_t bind_bytes_for(const std::string& vocab_file, uint64_t head_row_bytes, int64_t n_vocab);
 
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }

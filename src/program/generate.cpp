@@ -6603,31 +6603,15 @@ int main(int argc, char** argv) {
             mtp.enable_cell_floor(kc.wants_cell_floor(ke, !o.mtp.empty() && o.spec >= 2));
         }
     }
-    if (!o.mtp.empty()) {
-        if (o.spec < 2) {
-            std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
-            o.mtp.clear();
-        }
-        if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        mtp.set_hnorm_per_stream(o.mtp_hnorm_stream);   // --mtp-hnorm stream (opt-in), before any capture
-        mtp.set_q4(o.mtp_q4 == "all" || o.mtp_q4 == "proj", o.mtp_q4 == "all" || o.mtp_q4 == "head");   // before load
-        if (!o.mtp_draft_vocab.empty()) mtp.set_draft_vocab(o.mtp_draft_vocab);
-        // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
-        // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
-        // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
-        const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
-        // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
-        // the next window's drafts), and the round/step graphs carry the forcing kernel
-        // (--lookup-max-t past kVerifyMaxT: the drafter keeps kVerifyMaxT rows, MtpDrafter::draft_long catches a longer
-        // window up in parts)
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : std::min(o.spec, strata::kernels::kVerifyMaxT);
-        if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
-        mtp.set_ple_session(&ss);
 #if defined(STRATA_HAVE_DFLASH2)
+    // QuantLab (11/16): the DFlash2 load, with --mtp (CLI and serve: the MTP layer stays as the fallback) and, in the serve loop only,
+    // without it (--mtp-draft-vocab names the draft vocabulary; no MTP layer in VRAM: about 0.8 GiB more for the expert cache)
+    auto df2_try_load = [&]() {
         if (o.draft == "dflash2") {
             // QuantLab (11/16): --serve takes it too, on one card without --batch (the single-slot loop; df2_serve below)
-            const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
+            const char* why = o.spec < 2 ? "it needs --spec 2 or more"
+                              : o.mtp.empty() && !o.serve ? "it needs --mtp (the fallback)"
+                              : o.mtp.empty() && o.mtp_draft_vocab.empty() ? "without --mtp it needs --mtp-draft-vocab FILE (the MTP folder's draft_vocab.bin)"
                               : !native_pack ? "it needs a native pack"
                               : multi_gpu || o.batch > 0 ? "it is for one card without --batch or a layer split in this build"
                               : o.serve && o.prefill_head_alias ? "--prefill-head-alias lends the output head it reads to the prompt"
@@ -6668,12 +6652,37 @@ int main(int argc, char** argv) {
                 } else {
                     std::fprintf(stderr, "strata generate: --draft dflash2: %s. DFlash2 needs about 1.2 GiB of VRAM (the pack 0.76 GiB, its buffers and K/V ring "
                                          "0.25 GiB, a draft head 0.2 GiB); start with --vram-reserve-mib 1900 to keep it (the expert cache then gives up about 2.5%% "
-                                         "of its experts to the CPU), or a smaller --max-context. The MTP drafts instead.\n", err.c_str());
+                                         "of its experts to the CPU), or a smaller --max-context. %s.\n", err.c_str(), o.mtp.empty() ? "Only the lookup drafts" : "The MTP drafts instead");
                 }
             } else {
-                std::fprintf(stderr, "strata generate: --draft dflash2 is off: %s; the MTP drafts instead\n", why);
+                std::fprintf(stderr, "strata generate: --draft dflash2 is off: %s; %s\n", why, o.mtp.empty() ? "only the lookup drafts" : "the MTP drafts instead");
             }
         }
+    };
+#endif
+    if (!o.mtp.empty()) {
+        if (o.spec < 2) {
+            std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
+            o.mtp.clear();
+        }
+        if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
+        mtp.set_hnorm_per_stream(o.mtp_hnorm_stream);   // --mtp-hnorm stream (opt-in), before any capture
+        mtp.set_q4(o.mtp_q4 == "all" || o.mtp_q4 == "proj", o.mtp_q4 == "all" || o.mtp_q4 == "head");   // before load
+        if (!o.mtp_draft_vocab.empty()) mtp.set_draft_vocab(o.mtp_draft_vocab);
+        // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
+        // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
+        // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
+        const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
+        // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
+        // the next window's drafts), and the round/step graphs carry the forcing kernel
+        // (--lookup-max-t past kVerifyMaxT: the drafter keeps kVerifyMaxT rows, MtpDrafter::draft_long catches a longer
+        // window up in parts)
+        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : std::min(o.spec, strata::kernels::kVerifyMaxT);
+        if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        mtp.set_ple_session(&ss);
+#if defined(STRATA_HAVE_DFLASH2)
+        df2_try_load();
 #endif
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
@@ -6704,6 +6713,9 @@ int main(int argc, char** argv) {
             }
         }
     }
+#if defined(STRATA_HAVE_DFLASH2)
+    else if (o.serve && o.draft == "dflash2") df2_try_load();   // QuantLab (11/16): DFlash2 alone (no MTP layer)
+#endif
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
     // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
@@ -7029,7 +7041,10 @@ int main(int argc, char** argv) {
                         int64_t mtp_b = (!o.mtp.empty() && native_head.loaded())
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
-                        if (use_df2 && native_head.loaded()) mtp_b += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits
+                        // DFlash2's own draft head and logits (QuantLab 11/16: counted from its vocabulary file, which needs no MTP layer)
+                        if (use_df2 && native_head.loaded())
+                            mtp_b += (int64_t) strata::core::Dflash2Drafter::bind_bytes_for(o.mtp_draft_vocab.empty() ? (o.mtp.empty() ? std::string() : o.mtp + "/draft_vocab.bin") : o.mtp_draft_vocab,
+                                                                                         native_head.row_bytes(), n_vocab) + (48 << 20);
                         // QuantLab (11/16) serve: the prompt path's tap staging (2048 rows x 5 x n_embd floats) and the drafter's own 8 rows
                         if (use_df2 && o.serve) mtp_b += (int64_t) (2048 + 8) * 5 * (int64_t) g.n_embd * 4;
 #endif
@@ -7290,7 +7305,10 @@ int main(int argc, char** argv) {
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
 #if defined(STRATA_HAVE_DFLASH2)
-        if (use_df2 && native_head.loaded()) mtp_bind += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits, bound after this
+        // DFlash2's own draft head and logits, bound after this (QuantLab 11/16: counted from its vocabulary file, which needs no MTP layer)
+        if (use_df2 && native_head.loaded())
+            mtp_bind += (int64_t) strata::core::Dflash2Drafter::bind_bytes_for(o.mtp_draft_vocab.empty() ? (o.mtp.empty() ? std::string() : o.mtp + "/draft_vocab.bin") : o.mtp_draft_vocab,
+                                                                             native_head.row_bytes(), n_vocab) + (48 << 20);
         // QuantLab (11/16) serve: the prompt path's tap staging (2048 rows x 5 x n_embd floats, allocated at the first tapped read) and the
         // drafter's own 8 rows (prepare_own)
         if (use_df2 && o.serve) mtp_bind += (int64_t) (2048 + 8) * 5 * (int64_t) g.n_embd * 4;
@@ -10887,10 +10905,13 @@ int main(int argc, char** argv) {
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) {   // QuantLab (11/16): the serve loop's DFlash2 (the CLI's order: taps, init, bind, graphs on the drafter's own taps)
-            const char* df2_mem = "It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, a draft head 0.2 GiB); "
-                                  "--vram-reserve-mib 1900 keeps it. The MTP drafts instead.";
+            const char* df2_mem = use_mtp ? "It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, a draft head 0.2 GiB); "
+                                            "--vram-reserve-mib 1900 keeps it. The MTP drafts instead."
+                                          : "It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, a draft head 0.2 GiB); "
+                                            "--vram-reserve-mib 1900 keeps it. Only the lookup drafts.";
             if (n_stages != 1 || pipe || o.batch > 0 || !ver.tapping()) {
-                std::fprintf(stderr, "strata serve: --draft dflash2: the verifier keeps no taps here (one card, no --batch); the MTP drafts instead\n");
+                std::fprintf(stderr, "strata serve: --draft dflash2: the verifier keeps no taps here (one card, no --batch); %s\n",
+                             use_mtp ? "the MTP drafts instead" : "only the lookup drafts");
                 use_df2 = false;
             } else if (!df2.bind(wt, &native_head, o.mtp_draft_vocab.empty() ? o.mtp + "/draft_vocab.bin" : o.mtp_draft_vocab, err)) {
                 std::fprintf(stderr, "strata serve: --draft dflash2: %s. %s\n", err.c_str(), df2_mem);
@@ -10900,10 +10921,11 @@ int main(int argc, char** argv) {
                 use_df2 = false;
             } else {
                 std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms, %.0f MiB of VRAM), windows up to %d tokens, "
-                                     "%s; the MTP layer stays as the fallback\n", o.draft_model.c_str(), df2.ms_capture,
+                                     "%s; %s\n", o.draft_model.c_str(), df2.ms_capture,
                              (double) df2.vram_bytes() / 1048576.0, df2_cap > 0 ? std::min(df2_cap, o.spec) : std::min(o.spec, 8),
                              o.draft_conf > 0.0 ? "the window ends where the product of the selector's probabilities falls below --draft-conf"
-                                                : "each draft kept while its probability reaches --spec-min-p");
+                                                : "each draft kept while its probability reaches --spec-min-p",
+                             use_mtp ? "the MTP layer stays as the fallback" : "no MTP layer (its VRAM went to the expert cache)");
             }
         }
 #endif
@@ -18091,7 +18113,7 @@ int main(int argc, char** argv) {
                         // a probabilistic window must not condition the source on the draw: the policy copy fixed at the request's start
                         // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
                         const bool probabilistic = use_mtp && mtp.prob();
-                        if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == drafts[0])) {
+                        if (k > 0 && (probabilistic || (!use_mtp && !req_df2) || sbuf[0] == drafts[0])) {   // (QuantLab 11/16: DFlash2's first draft agrees)
                             const strata::spec::DraftPolicy::Pick pk = probabilistic
                                 ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                             if (pk.lookup) { T = pk.t; from_sfx = true; }
