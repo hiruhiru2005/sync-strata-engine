@@ -272,6 +272,33 @@ public:
         return p->lm_mid_;
     }
 
+    /// QuantLab pf-smooth (11/17): the layer-major walk asked for by the serve path's loan (one GPU, a small card's long
+    /// prompt) instead of STRATA_PREFILL_LAYER_MAJOR.  `on`: the next runs try the walk (STRATA_PREFILL_LAYER_MAJOR=0
+    /// still keeps it off), with super-chunks of up to `tokens` (0: the walk's default target).  The super-chunk's
+    /// buffers then come from the loan's room (the borrowed region past the chunk's buffers, and the ring slots the
+    /// walk leaves unused), not new VRAM.  Set per loan; off until set.
+    /// `room` / `room_bytes` (optional): the loan's room for the super-chunk when this path OWNS its chunk buffers (a cache
+    /// too small to lend them: the request lends cache slots for the super-chunk alone); null with a borrowed layout,
+    /// whose room is the borrowed region past its carve.
+    void set_layer_major_auto(bool on, int64_t tokens, void* room = nullptr, uint64_t room_bytes = 0) {
+        lm_auto_ = on;
+        lm_auto_tokens_ = tokens;
+        lm_room_ = on ? room : nullptr;
+        lm_room_bytes_ = on && room != nullptr ? room_bytes : 0;
+    }
+    bool layer_major_auto() const { return lm_auto_; }
+    /// The formats and buffers the layer-major walk needs, independent of a prompt (the start-up test of the auto walk):
+    /// false with the reason in `why`.  One GPU without a peer only (a layer split has its own rule).
+    bool layer_major_supported(std::string& why);
+    /// The device bytes the walk's super-chunk of `s` tokens takes for chunks of `chunk` tokens, the residual rows in
+    /// VRAM (`r_dev`) or in pinned RAM (two sub-chunks' rows on the device) - what lm_prepare carves.
+    static uint64_t layer_major_bytes(int64_t s, int64_t chunk, bool r_dev);
+    /// The ring bytes a borrowed layout for chunks of `chunk` tokens holds past the slots the walk uses (its room too).
+    static uint64_t layer_major_ring_room(int64_t chunk);
+    /// The bytes a loan must hold past a chunk's buffers (bytes_needed) for a super-chunk of `s` tokens, the ring's spare
+    /// span (layer_major_ring_room) holding what fits there - lm_prepare places the buffers by the same rule.
+    static uint64_t layer_major_tail_bytes(int64_t s, int64_t chunk, bool r_dev);
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
@@ -286,6 +313,10 @@ private:
     void lm_release();
     bool lm_mid_ = false;
     bool lm_by_default_ = false;   ///< the walk is on because nothing was set (a wider VRAM margin, the measured super-chunk size)
+    bool lm_auto_ = false;         ///< QuantLab pf-smooth: set_layer_major_auto
+    int64_t lm_auto_tokens_ = 0;
+    void* lm_room_ = nullptr;      ///< its explicit room (an owned layout's super-chunk loan)
+    uint64_t lm_room_bytes_ = 0;
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

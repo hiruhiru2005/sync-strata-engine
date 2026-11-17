@@ -10063,6 +10063,9 @@ int main(int argc, char** argv) {
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
+            bool lent_lm = false;          // QuantLab pf-smooth: the loan holds a layer-major super-chunk too
+            int32_t lm_first = -1;         // ... and holds the slots [lm_first, lm_end) (an owned layout's: the super-chunk's
+            int32_t lm_end = -1;           //     alone, below the elastic K/V when it took the top slots)
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
@@ -10548,6 +10551,32 @@ int main(int argc, char** argv) {
             }
         }
         mem_mark("the head and the prompt path");
+        // QuantLab pf-smooth (11/17): a small card reads its long prompts layer-major (Prefill::run_layer_major: each
+        // layer's experts once per super-chunk of the prompt instead of once per chunk), the super-chunk's buffers in the
+        // request's loan (lend, below), so the walk takes no VRAM beside the expert cache.  On when the start-up chunk is at
+        // most STRATA_PREFILL_LM_AUTO_CHUNK tokens (default 2048: an 8 GB card picks 1024-1280; a 12 GB card's 8192 keeps
+        // the chunk walk exactly as before), on one GPU with a loan, and when the walk runs this model's experts.  An
+        // explicit STRATA_PREFILL_LAYER_MAJOR (1: the opt-in walk as before, 0: off) or STRATA_PREFILL_LM_AUTO_CHUNK=0 turns
+        // it off.  Measured on an RTX 3080 held to 7 GiB, Sync-S, 19.6K prompt: 381 -> 1,607 tok/s (pf-smooth-1117.md).
+        bool pf_lm_auto = false;
+        {
+            const char* lv = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
+            const char* cv = std::getenv("STRATA_PREFILL_LM_AUTO_CHUNK");
+            const int64_t lm_max_chunk = cv != nullptr ? (int64_t) std::atoll(cv) : (int64_t) 2048;
+            if ((lv == nullptr || lv[0] == '\0') && lm_max_chunk > 0 && o.prefill_chunk <= lm_max_chunk) {
+                std::string why;
+                if (pf_parts.size() != 1) why = "no expert cache to lend from on one GPU";
+                else if (multi_gpu || peer.valid()) why = "more than one GPU";
+                else if (sp.layer_major_supported(why)) pf_lm_auto = true;
+                if (pf_lm_auto)
+                    std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts of 2 chunks or more read layer-major (the "
+                                         "start-up chunk is %lld tokens, at most %lld): each layer's experts once per "
+                                         "super-chunk, its buffers in the prompt's loan (STRATA_PREFILL_LAYER_MAJOR=0: off)\n",
+                                 (long long) o.prefill_chunk, (long long) lm_max_chunk);
+                else
+                    std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts stay on the chunk walk: %s\n", why.c_str());
+            }
+        }
         // #340: STRATA_SPLIT_SMALL_OWN=S (tokens): on a layer split, every stage that borrows keeps the slots for an
         // S-token chunk's buffers for the whole session (0.1.29's own buffers, carved from the tail of its cache):
         // a request of at most S prompt tokens then lends, streams and refills nothing, a longer one lends (and
@@ -16150,6 +16179,8 @@ int main(int argc, char** argv) {
 #endif
                 p.lent.clear();
                 p.lent_chunk = 0;
+                p.lent_lm = false;
+                p.sp->set_layer_major_auto(false, 0);   // (its super-chunk lived in the loan: no walk without one)
                 return true;
             };
             auto refill_one = [&](PfPart& p, std::string& e) -> bool {
@@ -16205,8 +16236,114 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 bool any = false;
+                // QuantLab pf-smooth (11/17): with pf_lm_auto, a segment of 2 chunks or more reads layer-major.  Its loan
+                // holds the T-token chunk's buffers and, past them, the super-chunk's (Prefill::layer_major_tail_bytes; the
+                // ring slots the walk leaves unused hold what fits there): the whole segment in one super-chunk with its
+                // rows in VRAM when the lendable slots allow it, else the most the walk can take (rows in pinned RAM).  T is
+                // the chunk walk's chunk up to 1024, or 512 when that takes fewer super-chunks.  The slots lendable are the
+                // auto scan's (at most kAutoLendPct %, 128 kept) above the elastic K/V (which grew for this prompt first).
+                // Anything else (a short segment, a picture, too few slots) reads in chunks as before.
+                // A cache too small to lend the chunk's buffers (the prompt path owns them, p.first < 0) lends slots for the
+                // super-chunk alone, at the buffers' own chunk.
+                sp.set_layer_major_auto(false, 0);
+                if (pf_lm_auto && pf_parts.size() == 1 && exact <= 0 && !o.prefill_head_alias && req_imgs.empty()) {
+                    using strata::prefill::Prefill;
+                    PfPart& p = pf_parts[0];
+                    const bool owned = p.first < 0;
+                    const int64_t slots = p.cache->slots();
+                    // the loan ends at the cache's end - or, for an owned layout beside the elastic K/V (whose cells then
+                    // take the top slots, kvg_start(slots)), where the K/V begins: the super-chunk's slots lie just below it
+                    const bool kv_q = kvg.on && kvg.ql && p.cache == &xcache && kvg.lo < kvg.top;
+                    const int64_t end = owned && kv_q ? kvg.lo : slots;
+                    auto bytes_between = [&](int64_t a, int64_t b) -> uint64_t {   // slots [a, b)
+                        return part_bytes(p, (int32_t) a) - (b < slots ? part_bytes(p, (int32_t) b) : 0);
+                    };
+                    int64_t budget = std::max<int64_t>(0, std::min(end - 128, kAutoLendPct * slots / 100));
+                    if (!owned && kv_q) budget = std::min<int64_t>(budget, slots - kvg.top);
+                    const uint64_t avail = budget > 0 ? bytes_between(end - budget, end) : 0;
+                    int64_t best_T = 0, best_k = 0;
+                    uint64_t best_need = 0;
+                    const int64_t t_max = owned ? p.sp->chunk()
+                                                : std::min<int64_t>(std::min<int64_t>(want, o.prefill_chunk), 1024) / 256 * 256;
+                    for (const int64_t T : {t_max, (int64_t) 512}) {
+                        if (T < 256 || T > t_max || tokens < 2 * T || (T == 512 && t_max == 512 && best_T == 512)) continue;
+                        if (owned && T != t_max) continue;
+                        const uint64_t base = owned ? 0 : Prefill::bytes_needed(g, *p.ses, T, srcp != nullptr) + (1ull << 20);
+                        if (base >= avail) continue;
+                        const uint64_t room = avail - base;
+                        const int64_t target = (tokens + T - 1) / T * T;
+                        int64_t k = 0;
+                        uint64_t need = 0;
+                        if (Prefill::layer_major_tail_bytes(target, T, true) <= room) {   // one super-chunk, rows in VRAM
+                            k = 1;
+                            need = base + Prefill::layer_major_tail_bytes(target, T, true);
+                        } else {   // the walk's other mode: the largest super-chunk with its rows in pinned RAM
+                            int64_t s = target - T;
+                            while (s >= 2 * T && Prefill::layer_major_tail_bytes(s, T, false) > room) s -= T;
+                            if (s < 2 * T) continue;
+                            k = (tokens + s - 1) / s;
+                            need = base + Prefill::layer_major_tail_bytes(s, T, false);
+                        }
+                        if (best_T == 0 || k < best_k) { best_T = T; best_k = k; best_need = need; }
+                    }
+                    if (best_T > 0) {
+                        int64_t need_p = 0;   // the slots below `end` that hold best_need bytes
+                        while (need_p < budget && bytes_between(end - need_p, end) < best_need) ++need_p;
+                        if (bytes_between(end - need_p, end) < best_need) need_p = budget + 1;
+                        const int32_t first = (int32_t) (end - need_p);
+                        if (need_p > 0 && need_p <= budget) {
+                            if (!p.lent.empty() && !(p.lent_lm && p.lent_chunk == best_T && p.lm_first <= first))
+                                if (!refill_one(p, e)) return false;
+                            if (p.lent.empty()) {
+                                const strata::core::OnDevice on(p.dev);
+                                if (!owned && (best_T != p.sp->chunk() || first != p.first_now)) {
+                                    if (!p.sp->relayout(best_T, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                                    p.first_now = first;
+                                }
+                                p.lm_first = owned ? first : p.first_now;
+                                p.lm_end = (int32_t) end;
+                                for (int64_t l = p.lb; l < p.le; ++l)
+                                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                                        const size_t i = (size_t) (l * g.n_expert + ex);
+                                        if (host_res[i] >= p.lm_first && host_res[i] < p.lm_end) {
+                                            p.lent.emplace_back((int32_t) i, host_res[i]);
+                                            host_res[i] = strata::core::kNotResident;
+                                            any = true;
+                                        }
+                                    }
+                                p.lent_chunk = best_T;
+                                p.lent_lm = true;
+                            }
+                            p.sp->set_layer_major_auto(true, (tokens + best_T - 1) / best_T * best_T,
+                                                       owned ? p.cache->device_slot(p.lm_first) : nullptr,
+                                                       owned ? bytes_between(p.lm_first, p.lm_end) : 0);
+                            seg_lend = p.lent_chunk;
+                            if (any) res_upload();
+                            static int64_t said_T = -1, said_k = -1;
+                            if (said_T != best_T || said_k != best_k) {
+                                said_T = best_T;
+                                said_k = best_k;
+                                std::fprintf(stderr, "strata serve: QuantLab pf-smooth: a %lld-token prompt reads layer-major in "
+                                                     "%lld-token chunks, %lld super-chunk(s); the loan is %lld slots (%.2f GiB) of "
+                                                     "%lld lendable\n", (long long) tokens, (long long) best_T, (long long) best_k,
+                                             (long long) (p.lm_end - p.lm_first),
+                                             (double) bytes_between(p.lm_first, p.lm_end) / 1073741824.0, (long long) budget);
+                            }
+                            if (trace) {
+                                std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens (layer-major) in %.1f ms\n",
+                                             (long long) p.lent.size(), (long long) tokens,
+                                             std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
+                                std::fflush(stderr);
+                            }
+                            return true;
+                        }
+                    }
+                }
                 for (PfPart& p : pf_parts) {
-                    if (p.first < 0) continue;
+                    if (p.first < 0) {   // (QuantLab pf-smooth: an owned layout's super-chunk loan goes back first)
+                        if (p.lent_lm && !p.lent.empty() && !refill_one(p, e)) return false;
+                        continue;
+                    }
                     if (!p.lent.empty()) {
                         if (want <= p.lent_chunk) continue;            // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
