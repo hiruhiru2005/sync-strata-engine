@@ -9151,6 +9151,9 @@ int main(int argc, char** argv) {
     // fit, the cache simply holds fewer experts while a long one is live.
     struct KvGrow {
         bool on = false;
+        // QuantLab (11/17, I-16): the K/V was made elastic at start, but the cache has no slot to give (kvg_start): it grows
+        // into new VRAM only, and nothing shrinks
+        bool fresh_only = false;
         int64_t top = 0, lo = 0;          // slots [lo, top) hold no expert; their whole chunks may be with the K/V
         int64_t floor = 128;              // the cache keeps at least these slots
         int64_t step = 8192;              // the K/V grows in whole steps of cells
@@ -9172,7 +9175,26 @@ int main(int argc, char** argv) {
     auto kvg_start = [&](int64_t top, int64_t top_cap = -1) {
         kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
                  !host_res.empty() && srcp != nullptr && top > kvg.floor;
-        if (!kvg.on) return;
+        if (!kvg.on) {
+            // QuantLab (11/17, I-16): qsa_set_kv_elastic made the K/V elastic (STRATA_KV_GROW_INIT cells, 16,384) before
+            // the cache was sized.  A cache at or below the floor (an 8 GB card with the resident RAM mode: 45-79 slots)
+            // left kvg off, every grower is behind `if (kvg.on)`, and a prompt past those cells read unmapped VRAM
+            // ("dequant launch: an illegal memory access was encountered" at 16,384 tokens, 0.1.52 and A alike).  Such a
+            // K/V now grows into new VRAM only; a prompt it cannot fit stops with "the K/V cannot grow".
+            if (!strata::core::qsa_kv_elastic()) return;
+            kvg.on = kvg.fresh_only = true;
+            kvg.top = kvg.lo = kvg.top0 = kvg.top_cap = top;
+            kvg.cells = strata::core::qsa_kv_elastic_cells();
+            if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::atoll(v) > 0) kvg.step = std::atoll(v);
+            std::fprintf(stderr, "strata generate: elastic K/V: %lld of %lld cells in VRAM (%.2f of %.2f GiB); the expert "
+                                 "cache (%lld slots, the K/V's place from slot %lld) has none to give (it keeps %lld): the "
+                                 "K/V grows into new VRAM only, and a prompt it cannot fit stops (\"the K/V cannot grow\")\n",
+                         (long long) kvg.cells, (long long) o.max_context,
+                         (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                         (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0, (long long) xcache.slots(),
+                         (long long) top, (long long) kvg.floor);
+            return;
+        }
         kvg.top = kvg.lo = kvg.top0 = top;
         kvg.top_cap = std::max<int64_t>(top, top_cap);
         kvg.cells = strata::core::qsa_kv_elastic_cells();
@@ -9269,6 +9291,26 @@ int main(int argc, char** argv) {
         const int64_t need = strata::core::qsa_kv_elastic_need(target);
         if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); return true; }
         quiesce();
+        if (kvg.fresh_only) {   // QuantLab (11/17, I-16): no slot to give (kvg_start): new VRAM only
+            int64_t fresh = 0;
+            auto take_new = [&]() -> strata::core::VmmChunk { ++fresh; return 0; };
+            bool ok = strata::core::qsa_kv_elastic_grow(target, take_new);
+            if (!ok && strata::core::conversation_park_vram_release_all() > 0) {
+                (void) cudaGetLastError();
+                ok = strata::core::qsa_kv_elastic_grow(target, take_new);
+            }
+            kvg.fresh += fresh;
+            kvg.cells = strata::core::qsa_kv_elastic_cells();
+            ++kvg.grows;
+            if (ok)
+                std::fprintf(stderr, "strata: K/V grown to %lld cells (%.2f GiB) in new VRAM (the expert cache has no slot to "
+                                     "give)\n", (long long) kvg.cells,
+                             (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0);
+            else
+                std::fprintf(stderr, "strata: the K/V could not grow to %lld cells in new VRAM (%s)\n", (long long) target,
+                             cudaGetErrorString(cudaGetLastError()));
+            return ok;
+        }
         strata::core::VmmRange& r = *xcache.vmm_range();
         const uint64_t G = strata::core::vmm_granularity();
         std::vector<int32_t> owner;   // slot -> residency index
@@ -9513,7 +9555,7 @@ int main(int argc, char** argv) {
     // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
     // profile's hottest experts the GPU does not hold.  Run on a quiet device (as kvg_ensure's `quiesce`).
     auto kvg_trim = [&](int64_t cells, int64_t hold) -> bool {   // `hold`: the cells a parked conversation could need
-        if (!kvg.on) return true;
+        if (!kvg.on || kvg.fresh_only) return true;   // (QuantLab 11/17: fresh_only gives nothing back)
         // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
         // size is grown again (its experts shuffled again) after every short request in between: the K/V keeps the
         // longest parked conversation's cells while it is parked
