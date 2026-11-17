@@ -636,6 +636,74 @@ def start_log_marks(log: str | None, offset: int) -> list:
 TRANSIENT_START_MARKS = ("hsa_exception", "HSA_STATUS_ERROR", "hsaKmt")
 START_RETRIES = max(0, int(os.environ.get("STRATA_START_RETRIES", "3") or 0))
 
+# QuantLab F (11/17): StrataEngine.restart() after an engine died mid-conversation, one step per try, cumulative from the
+# command the engine was started with (design: release/friend-test-1116/design-GF-1117.md 2.2).  "wait_vram": wait for
+# the dead engine's VRAM to come back first (RESTART_VRAM_WAIT_S at most); "vram_reserve_mib": "+N" more than the
+# start's --vram-reserve-mib (at most RESTART_RESERVE_MAX_MIB); "resident_budget_gib": "xF" times the start's
+# --resident-budget-gib (and its STRATA_PARTIAL_PIN_GIB), down to 0.25 steps.  Never the context or the K/V format (the
+# owner's rule).  The config's "restart_steps" replaces the list ([] or false: the same command every try, as before).
+RESTART_STEPS_DEFAULT = [{}, {"wait_vram": True}, {"wait_vram": True, "vram_reserve_mib": "+512"},
+                         {"wait_vram": True, "vram_reserve_mib": "+1024", "resident_budget_gib": "x0.8"}]
+RESTART_VRAM_WAIT_S = 90.0
+RESTART_RESERVE_MAX_MIB = 2048
+# a start that ran but got fewer expert-cache slots than this, on a card of RESTART_SLOW_CARD_MIB or more, is a slow start
+# (a friend's 8 GB PC came back with 56 and 0 slots after a stall, at 10-15 tok/s): the next step is tried, unless it was
+# the last one (a slow engine beats none)
+RESTART_SLOW_SLOTS = 100
+RESTART_SLOW_CARD_MIB = 6144
+
+
+def restart_steps_of(cfg: dict) -> list:
+    """The config's "restart_steps" (see RESTART_STEPS_DEFAULT): absent -> the default; [] / false -> none (the same
+    command); else a list of dicts with only the keys above."""
+    v = cfg.get("restart_steps", None)
+    if v is None:
+        return [dict(s) for s in RESTART_STEPS_DEFAULT]
+    if v is False or v == []:
+        return []
+    if not isinstance(v, list) or not all(isinstance(s, dict) for s in v):
+        raise ValueError('"restart_steps" must be a list of objects (wait_vram, vram_reserve_mib "+N", '
+                         'resident_budget_gib "xF"), [] or false')
+    for s in v:
+        bad = set(s) - {"wait_vram", "vram_reserve_mib", "resident_budget_gib"}
+        if bad:
+            raise ValueError(f'"restart_steps": unknown key(s) {sorted(bad)} (the context and the K/V format are never '
+                             'changed by a restart)')
+    return [dict(s) for s in v]
+
+
+def restart_loosened(args: list, env: dict | None, step: dict) -> tuple[list, dict | None, list]:
+    """`args` / `env` of the engine's first start with one restart step applied; also the plain words of what changed."""
+    args, env = list(args), (dict(env) if env is not None else None)
+    said = []
+    r = str(step.get("vram_reserve_mib") or "")
+    if r.startswith("+") and "--vram-reserve-mib" in args:
+        i = args.index("--vram-reserve-mib") + 1
+        try:
+            old = int(args[i])
+            new = min(RESTART_RESERVE_MAX_MIB, old + int(r[1:]))
+            if new > old:
+                args[i] = str(new)
+                said.append(f"the VRAM reserve {old} -> {new} MiB")
+        except ValueError:
+            pass
+    b = str(step.get("resident_budget_gib") or "")
+    if b.startswith("x") and "--resident-budget-gib" in args:
+        i = args.index("--resident-budget-gib") + 1
+        try:
+            f = float(b[1:])
+            old = float(args[i])
+            new = max(0.25, int(old * f * 4) / 4)
+            if new < old:
+                args[i] = f"{new:g}"
+                said.append(f"the RAM budget {old:g} -> {new:g} GiB")
+                if env is not None and env.get("STRATA_PARTIAL_PIN_GIB"):
+                    pin = float(env["STRATA_PARTIAL_PIN_GIB"])
+                    env["STRATA_PARTIAL_PIN_GIB"] = f"{max(0.25, int(pin * f * 4) / 4):g}"
+        except ValueError:
+            pass
+    return args, env, said
+
 
 def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: int | None = None) -> bool:
     """True when the start that wrote the log from `offset` failed the transient way above: within 30 s, and its lines
@@ -1304,33 +1372,122 @@ class StrataEngine:
             if not done:
                 out.put(None)
 
+    # QuantLab F (11/17): the steps restart() loosens the command by (restart_steps_of; None = the default), and the
+    # Service's VRAM reader, () -> (free MiB, total MiB) or None.  Both are set from outside (main / Service) and survive
+    # restart(), as silence_s does.
+    restart_steps = None
+    vram_now = None
+
+    def _wait_vram_back(self, limit_s: float = None) -> tuple:
+        """After an engine died: wait until the free VRAM stops rising (3 readings 2 s apart within 64 MiB), at most
+        `limit_s` (RESTART_VRAM_WAIT_S).  -> (seconds waited, free MiB or None)."""
+        limit_s = RESTART_VRAM_WAIT_S if limit_s is None else limit_s
+        read = self.vram_now
+        t0 = time.monotonic()
+        if read is None:
+            time.sleep(min(limit_s, self.RESTART_RETRY_S))
+            return time.monotonic() - t0, None
+        last, same = None, 0
+        while time.monotonic() - t0 < limit_s:
+            try:
+                now = read()
+            except Exception:                                # noqa: BLE001 - a reading must never stop a restart
+                now = None
+            free = now[0] if now else None
+            if free is None:
+                time.sleep(min(limit_s, self.RESTART_RETRY_S))
+                return time.monotonic() - t0, None
+            same = same + 1 if last is not None and abs(free - last) <= 64 else 0
+            last = free
+            if same >= 2:
+                break
+            time.sleep(2.0)
+        return time.monotonic() - t0, last
+
     def restart(self, tries: int = 3):
-        """Start the engine again (the same command) after it died; the new process has its own line queue.
-        close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
-        exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
-        (PR #637)."""
+        """Start the engine again after it died; the new process has its own line queue.  close() ends and waits for
+        the old process first (EngineStuck when it cannot be ended).  A start that still exits before READY - a dead
+        engine's VRAM can take a while to come back, notably on ROCm - is retried (PR #637).
+
+        QuantLab F (11/17): not the same command every try.  With restart steps (the default, RESTART_STEPS_DEFAULT),
+        each try is one step: it waits for the dead engine's VRAM to come back, then starts with the step's looser
+        settings (more VRAM reserve, a smaller RAM budget - never a shorter context or another K/V format).  A start
+        whose expert cache came back with fewer than RESTART_SLOW_SLOTS slots on a card of RESTART_SLOW_CARD_MIB or
+        more counts as failed, except on the last step.  The command that started stays for later restarts.  Without
+        steps (the config's "restart_steps": [] ) it is the same command `tries` times, as before."""
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
+        steps = self.restart_steps if self.restart_steps is not None else RESTART_STEPS_DEFAULT
+        base = self.__dict__.setdefault("_restart_base", (list(self.spawn[1]),
+                                                           dict(self.spawn[4]) if self.spawn[4] is not None else None))
+        n = len(steps) if steps else tries
+        # a later restart goes on from the step that last started (not from the first start's command, which already
+        # failed once, and not compounding: each step is relative to the first start)
+        first = min(self.__dict__.get("_restart_from", 0), n - 1) if steps else 0
+        tried = []
         try:
             self.close()
-            for i in range(tries):
+            for i in range(first, n):
+                step = steps[i] if steps else {}
+                spawn = self.spawn
+                waited = ""
+                if steps:
+                    if step.get("wait_vram"):
+                        print(f"[strata] restart {i + 1} of {n}: waiting for the GPU memory the stopped engine held to come "
+                              f"back (at most {RESTART_VRAM_WAIT_S:.0f} s)", flush=True)
+                        w_s, free = self._wait_vram_back()
+                        waited = f"waited {w_s:.0f} s" + (f", {free} MiB free" if free is not None else "")
+                    args, env, said = restart_loosened(base[0], base[1], step)
+                    spawn = (self.spawn[0], args, self.spawn[2], self.spawn[3], env, self.spawn[5], self.spawn[6])
+                    if said:
+                        print(f"[strata] restart {i + 1} of {n}: starting with looser settings: {'; '.join(said)} "
+                              "(the context and the K/V format stay)", flush=True)
+                    tried.append("; ".join([x for x in [waited, *said] if x]) or "the same settings")
                 # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
                 # READY, and a request that saw alive() in that window skipped load() and failed with "context
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)
-                    break
+                    self.__init__(*spawn)
                 except RuntimeError:
                     try:
                         self.proc.wait(timeout=60)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
-                    if i == tries - 1:
+                    if i == n - 1:
+                        if steps:
+                            print(f"[strata] the engine did not start in {n} tries; tried: {' | '.join(tried)}",
+                                  flush=True)
                         raise
-                    print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in "
-                          f"{self.RESTART_RETRY_S:g} s", flush=True)
-                    time.sleep(self.RESTART_RETRY_S)
+                    if steps:
+                        print(f"[strata] the engine did not start (restart {i + 1} of {n}); the next try loosens the "
+                              "settings", flush=True)
+                    else:
+                        print(f"[strata] the engine did not start (try {i + 1} of {n}); again in "
+                              f"{self.RESTART_RETRY_S:g} s", flush=True)
+                        time.sleep(self.RESTART_RETRY_S)
+                    continue
+                # a start that runs but slowly: its expert cache came back nearly empty (the GPU memory was still held)
+                slots = self.info.get("expert_slots")
+                card = None
+                if steps and i < n - 1 and isinstance(slots, int) and self.vram_now is not None:
+                    try:
+                        now = self.vram_now()
+                        card = now[1] if now else None
+                    except Exception:                        # noqa: BLE001
+                        card = None
+                if card is not None and card >= RESTART_SLOW_CARD_MIB and slots < RESTART_SLOW_SLOTS:
+                    print(f"[strata] restart {i + 1} of {n}: the engine started with {slots} expert-cache slots (a "
+                          f"{card} MiB card: it would run slowly); trying the next step", flush=True)
+                    tried[-1] += f" ({slots} slots: slow)"
+                    self.close()
+                    continue
+                if steps and i > 0:
+                    print(f"[strata] restart {i + 1} of {n} started ({slots if slots is not None else '?'} expert-cache "
+                          f"slots); a later restart begins at this step", flush=True)
+                if steps:
+                    self._restart_from = i
+                break
         finally:
             self.starting = False
             # a lazy first start never reached the post-READY __init__ where slot_cv is made (#1527)
@@ -3946,6 +4103,8 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        if isinstance(engine, StrataEngine):          # QuantLab F (11/17): restart() waits for the VRAM through this reader
+            engine.vram_now = self.vram_now_mib
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -4378,6 +4537,11 @@ class Service:
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
         IOKit on macOS (Metal backend); None when it can't be read (then nothing is refused)."""
+        now = self.vram_now_mib()
+        return now[0] if now else None
+
+    def vram_now_mib(self) -> tuple | None:
+        """(free, total) MiB of the engine's (first) GPU, as free_vram_mib reads it; None when it can't be read."""
         try:
             from serve.telemetry import gpu_reader
             g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0), amd=getattr(self, "backend", None) == "hip")
@@ -4386,7 +4550,7 @@ class Service:
             r = g.read()
             if r.get("mem_total") is None or r.get("mem_used") is None:
                 return None
-            return int((r["mem_total"] - r["mem_used"]) >> 20)
+            return int((r["mem_total"] - r["mem_used"]) >> 20), int(r["mem_total"] >> 20)
         except Exception:
             return None
 
@@ -8957,6 +9121,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        if isinstance(engine, StrataEngine):            # QuantLab F (11/17): how a restart after a crash loosens the start
+            try:
+                engine.restart_steps = restart_steps_of(cfg)
+            except ValueError as e:
+                raise SystemExit(f"[strata] config {e}")
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups and not split else None
