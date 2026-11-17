@@ -13,6 +13,21 @@ class _Proc:
         return 1
 
 
+_SEAT_LOG = None
+
+
+def _seat_log():
+    """A log whose start says what the engine says when its expert cache gets no VRAM."""
+    global _SEAT_LOG
+    if _SEAT_LOG is None:
+        import tempfile
+        fd, _SEAT_LOG = tempfile.mkstemp(suffix=".log")
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write("strata generate: no VRAM is left for the expert cache: it needs at least 461 slots (706 MiB)\n"
+                    "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache)\n")
+    return _SEAT_LOG
+
+
 class _Fake(S.StrataEngine):
     plan: list = []
     calls: list = []
@@ -25,6 +40,10 @@ class _Fake(S.StrataEngine):
         _Fake.calls.append((list(args), dict(env or {})))
         mode = _Fake.plan.pop(0) if _Fake.plan else "ok"
         self.proc = _Proc()
+        self.log_path, self.log_start = None, 0
+        if mode == "seat":                       # the start fails for want of expert-cache slots (the engine's words)
+            self.log_path = _seat_log()
+            raise S.EngineDied("fake: did not start (no VRAM for the expert cache)")
         if mode == "fail":
             raise S.EngineDied("fake: did not start")
         self.info["expert_slots"] = 56 if mode == "slow" else 1121
@@ -107,6 +126,50 @@ class RestartSteps(unittest.TestCase):
         _Fake.plan = ["fail", "fail", "ok"]
         e.restart()
         self.assertEqual([a for a, _ in _Fake.calls], [ARGS, ARGS, ARGS])
+
+    # 11/17 case A: a start short of expert-cache slots lowers the reserve instead (1024 -> 512 -> 256), the RAM budget
+    # stays; after the last try the reason is seat_short (the chat screen can suggest a lighter model)
+    def test_seat_short_lowers_the_reserve(self, _p):
+        e = self.engine()
+        _Fake.plan = ["seat", "seat", "ok"]
+        e.restart()
+        self.assertEqual([_arg(a, "--vram-reserve-mib") for a, _ in _Fake.calls], ["1024", "1024", "512"])
+        self.assertTrue(all(_arg(a, "--resident-budget-gib") == "16" for a, _ in _Fake.calls))
+        self.assertIsNone(e.restart_reason)
+        _Fake.plan = ["ok"]                      # a later restart goes on in the same direction
+        e.restart()
+        self.assertEqual(_arg(_Fake.calls[-1][0], "--vram-reserve-mib"), "512")
+
+    def test_seat_short_every_try_says_why(self, _p):
+        e = self.engine()
+        _Fake.plan = ["seat"] * 4
+        with self.assertRaises(S.EngineDied) as cm:
+            e.restart()
+        self.assertIn("seat_short", str(cm.exception))
+        self.assertEqual(e.restart_reason, "seat_short")
+        self.assertEqual([_arg(a, "--vram-reserve-mib") for a, _ in _Fake.calls], ["1024", "1024", "512", "256"])
+        for a, _ in _Fake.calls:
+            self.assertEqual(_arg(a, "--max-context"), "65536")
+            self.assertEqual(_arg(a, "--kv"), "k8v4")
+
+    def test_slow_starts_lower_the_reserve_and_the_last_is_noted(self, _p):
+        e = self.engine()
+        _Fake.plan = ["slow"] * 4
+        e.restart()
+        self.assertEqual([_arg(a, "--vram-reserve-mib") for a, _ in _Fake.calls], ["1024", "1024", "512", "256"])
+        self.assertEqual(e.restart_reason, "seat_short")
+        self.assertEqual(e.info.get("restart_note"), "seat_short")
+
+    def test_other_failure_then_seat_short(self, _p):
+        e = self.engine()
+        _Fake.plan = ["fail", "seat", "ok"]
+        e.restart()
+        self.assertEqual([_arg(a, "--vram-reserve-mib") for a, _ in _Fake.calls], ["1024", "1024", "512"])
+
+    def test_lowering_never_raises_a_small_reserve(self, _p):
+        args, _, said = S.restart_loosened(["--vram-reserve-mib", "200"], None, {"vram_reserve_mib": "-512"})
+        self.assertEqual(args, ["--vram-reserve-mib", "200"])
+        self.assertEqual(said, [])
 
 
 class RestartStepsConfig(unittest.TestCase):

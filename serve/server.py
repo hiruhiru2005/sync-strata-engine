@@ -644,8 +644,16 @@ START_RETRIES = max(0, int(os.environ.get("STRATA_START_RETRIES", "3") or 0))
 # owner's rule).  The config's "restart_steps" replaces the list ([] or false: the same command every try, as before).
 RESTART_STEPS_DEFAULT = [{}, {"wait_vram": True}, {"wait_vram": True, "vram_reserve_mib": "+512"},
                          {"wait_vram": True, "vram_reserve_mib": "+1024", "resident_budget_gib": "x0.8"}]
+# ... but when the try before failed for want of expert-cache slots (SEAT_SHORT_MARKS in its log, or it started with
+# fewer than RESTART_SLOW_SLOTS), more reserve only takes more slots away: those tries lower the reserve instead
+# (1,024 -> 512 -> 256, never below RESTART_RESERVE_MIN_MIB) and leave the RAM budget alone (it gives no slot) - the
+# owner's "start at the edge of what fits" (11/17, strata-desktop: case A; the launcher's loosen does the same)
+RESTART_STEPS_SEAT = [{}, {"wait_vram": True}, {"wait_vram": True, "vram_reserve_mib": "-512"},
+                      {"wait_vram": True, "vram_reserve_mib": "-768"}]
+SEAT_SHORT_MARKS = re.compile(r"needs the profile-filled VRAM expert tier|needs at least \d+ slots")
 RESTART_VRAM_WAIT_S = 90.0
 RESTART_RESERVE_MAX_MIB = 2048
+RESTART_RESERVE_MIN_MIB = 256
 # a start that ran but got fewer expert-cache slots than this, on a card of RESTART_SLOW_CARD_MIB or more, is a slow start
 # (a friend's 8 GB PC came back with 56 and 0 slots after a stall, at 10-15 tok/s): the next step is tried, unless it was
 # the last one (a slow engine beats none)
@@ -677,12 +685,13 @@ def restart_loosened(args: list, env: dict | None, step: dict) -> tuple[list, di
     args, env = list(args), (dict(env) if env is not None else None)
     said = []
     r = str(step.get("vram_reserve_mib") or "")
-    if r.startswith("+") and "--vram-reserve-mib" in args:
+    if r[:1] in ("+", "-") and "--vram-reserve-mib" in args:
         i = args.index("--vram-reserve-mib") + 1
         try:
             old = int(args[i])
-            new = min(RESTART_RESERVE_MAX_MIB, old + int(r[1:]))
-            if new > old:
+            new = (min(RESTART_RESERVE_MAX_MIB, old + int(r[1:])) if r[0] == "+" else
+                   min(old, max(RESTART_RESERVE_MIN_MIB, old - int(r[1:]))))
+            if new != old:
                 args[i] = str(new)
                 said.append(f"the VRAM reserve {old} -> {new} MiB")
         except ValueError:
@@ -1377,6 +1386,7 @@ class StrataEngine:
     # restart(), as silence_s does.
     restart_steps = None
     vram_now = None
+    restart_reason = None                # "seat_short" after a restart short of expert-cache slots (GET /v1/status)
 
     def _wait_vram_back(self, limit_s: float = None) -> tuple:
         """After an engine died: wait until the free VRAM stops rising (3 readings 2 s apart within 64 MiB), at most
@@ -1416,19 +1426,23 @@ class StrataEngine:
         more counts as failed, except on the last step.  The command that started stays for later restarts.  Without
         steps (the config's "restart_steps": [] ) it is the same command `tries` times, as before."""
         info = dict(self.info)
+        info.pop("restart_note", None)           # (a note of an earlier restart: this one says its own)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         steps = self.restart_steps if self.restart_steps is not None else RESTART_STEPS_DEFAULT
         base = self.__dict__.setdefault("_restart_base", (list(self.spawn[1]),
                                                            dict(self.spawn[4]) if self.spawn[4] is not None else None))
         n = len(steps) if steps else tries
         # a later restart goes on from the step that last started (not from the first start's command, which already
-        # failed once, and not compounding: each step is relative to the first start)
+        # failed once, and not compounding: each step is relative to the first start), in the same direction
         first = min(self.__dict__.get("_restart_from", 0), n - 1) if steps else 0
+        seat = bool(self.__dict__.get("_restart_seat")) if steps else False   # the last failure: too few cache slots
+        self.restart_reason = None
         tried = []
         try:
             self.close()
             for i in range(first, n):
-                step = steps[i] if steps else {}
+                table = RESTART_STEPS_SEAT if seat else steps
+                step = table[min(i, len(table) - 1)] if steps else {}
                 spawn = self.spawn
                 waited = ""
                 if steps:
@@ -1440,8 +1454,10 @@ class StrataEngine:
                     args, env, said = restart_loosened(base[0], base[1], step)
                     spawn = (self.spawn[0], args, self.spawn[2], self.spawn[3], env, self.spawn[5], self.spawn[6])
                     if said:
-                        print(f"[strata] restart {i + 1} of {n}: starting with looser settings: {'; '.join(said)} "
-                              "(the context and the K/V format stay)", flush=True)
+                        how = ("a smaller VRAM reserve (the last try had too few expert-cache slots)" if seat
+                               else "looser settings")
+                        print(f"[strata] restart {i + 1} of {n}: starting with {how}: {'; '.join(said)} (the context "
+                              "and the K/V format stay)", flush=True)
                     tried.append("; ".join([x for x in [waited, *said] if x]) or "the same settings")
                 # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
                 # READY, and a request that saw alive() in that window skipped load() and failed with "context
@@ -1449,44 +1465,64 @@ class StrataEngine:
                 self.ended = True
                 try:
                     self.__init__(*spawn)
-                except RuntimeError:
+                except RuntimeError as err:
                     try:
                         self.proc.wait(timeout=60)
-                    except (subprocess.TimeoutExpired, OSError):
+                    except (subprocess.TimeoutExpired, OSError, AttributeError):
                         pass
+                    if steps:   # the engine's own words: no VRAM for its expert cache (this start's part of its log)
+                        seat = bool(SEAT_SHORT_MARKS.search(start_log_text(getattr(self, "log_path", None),
+                                                                            getattr(self, "log_start", 0)) or ""))
+                        if seat:
+                            tried[-1] += " (too few expert-cache slots)"
                     if i == n - 1:
                         if steps:
                             print(f"[strata] the engine did not start in {n} tries; tried: {' | '.join(tried)}",
                                   flush=True)
+                        if seat:
+                            self.restart_reason = "seat_short"
+                            raise EngineDied(f"{err} [seat_short: the GPU has too little free memory for this model's "
+                                             "expert cache after every try; a lighter model (Sync-XS) may start]") from err
                         raise
                     if steps:
-                        print(f"[strata] the engine did not start (restart {i + 1} of {n}); the next try loosens the "
-                              "settings", flush=True)
+                        what = ": too few expert-cache slots" if seat else ""
+                        nxt = "lowers the VRAM reserve" if seat else "loosens the settings"
+                        print(f"[strata] the engine did not start (restart {i + 1} of {n}{what}); the next try {nxt}",
+                              flush=True)
                     else:
                         print(f"[strata] the engine did not start (try {i + 1} of {n}); again in "
                               f"{self.RESTART_RETRY_S:g} s", flush=True)
                         time.sleep(self.RESTART_RETRY_S)
                     continue
-                # a start that runs but slowly: its expert cache came back nearly empty (the GPU memory was still held)
+                # a start that runs but slowly: its expert cache came back nearly empty (the GPU memory was still held,
+                # or the card is too full for this model)
                 slots = self.info.get("expert_slots")
                 card = None
-                if steps and i < n - 1 and isinstance(slots, int) and self.vram_now is not None:
+                if steps and isinstance(slots, int) and self.vram_now is not None:
                     try:
                         now = self.vram_now()
                         card = now[1] if now else None
                     except Exception:                        # noqa: BLE001
                         card = None
-                if card is not None and card >= RESTART_SLOW_CARD_MIB and slots < RESTART_SLOW_SLOTS:
+                slow = card is not None and card >= RESTART_SLOW_CARD_MIB and slots < RESTART_SLOW_SLOTS
+                if slow and i < n - 1:
                     print(f"[strata] restart {i + 1} of {n}: the engine started with {slots} expert-cache slots (a "
-                          f"{card} MiB card: it would run slowly); trying the next step", flush=True)
+                          f"{card} MiB card: it would run slowly); the next try lowers the VRAM reserve", flush=True)
                     tried[-1] += f" ({slots} slots: slow)"
+                    seat = True
                     self.close()
                     continue
+                if slow:                                     # the last step: a slow engine beats none - say so
+                    print(f"[strata] restart {i + 1} of {n}: the engine runs with only {slots} expert-cache slots and "
+                          "will be slow (seat_short: a lighter model, Sync-XS, would fit the GPU better)", flush=True)
+                    self.restart_reason = "seat_short"
+                    self.info["restart_note"] = "seat_short"
                 if steps and i > 0:
                     print(f"[strata] restart {i + 1} of {n} started ({slots if slots is not None else '?'} expert-cache "
-                          f"slots); a later restart begins at this step", flush=True)
+                          "slots); a later restart begins at this step", flush=True)
                 if steps:
                     self._restart_from = i
+                    self._restart_seat = seat
                 break
         finally:
             self.starting = False
@@ -5004,6 +5040,9 @@ class Service:
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
+            # QuantLab F (11/17): why the last restart after a crash ended as it did ("seat_short": the GPU had too little
+            # free memory for the expert cache even with the reserve lowered - a lighter model may fit; None: nothing to say)
+            "restart_note": getattr(self.engine, "restart_reason", None),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
