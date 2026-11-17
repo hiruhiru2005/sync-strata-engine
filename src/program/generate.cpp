@@ -16312,6 +16312,9 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            // QuantLab (11/17) DFlash2 on pf-smooth: the part being lent reads the drafter's prompt taps (read_part's set_taps), which
+            // layer-major does not take (lm_prepare refuses it), so its loan is the chunk walk's, not pf_lm_auto's super-chunk
+            bool lend_taps = false;
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
@@ -16340,7 +16343,7 @@ int main(int argc, char** argv) {
                 // A cache too small to lend the chunk's buffers (the prompt path owns them, p.first < 0) lends slots for the
                 // super-chunk alone, at the buffers' own chunk.
                 sp.set_layer_major_auto(false, 0);
-                if (pf_lm_auto && pf_parts.size() == 1 && exact <= 0 && !o.prefill_head_alias && req_imgs.empty()) {
+                if (pf_lm_auto && !lend_taps && pf_parts.size() == 1 && exact <= 0 && !o.prefill_head_alias && req_imgs.empty()) {
                     using strata::prefill::Prefill;
                     PfPart& p = pf_parts[0];
                     const bool owned = p.first < 0;
@@ -17230,6 +17233,9 @@ int main(int argc, char** argv) {
                 // another, and the loan decides which experts are read in place: bits)
                 const int64_t plan_lend = resume_plan.chunk > 0 && at == resume_plan_at && to == resume_plan_end
                                               ? resume_plan.lend : 0;
+#if defined(STRATA_HAVE_DFLASH2)
+                lend_taps = use_df2 && to > df2_from;   // the same test as read_part's set_taps (b0 > df2_from)
+#endif
                 if (!win && !lend(to - at, err, plan_lend)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
