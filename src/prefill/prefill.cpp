@@ -6400,6 +6400,11 @@ void Prefill::lm_release() {
     } else if (m.lm.loan) {   // QuantLab pf-smooth: the loan goes back (refilled) after this: nothing may still write it
         cudaStreamSynchronize(m.cs);
         cudaStreamSynchronize(m.copy);
+        // ... and the pinned RAM it took goes back too (the auto walk keeps none of it between prompts: on Windows the RAM
+        // copy has page-locked about all it may)
+        if (m.lm.R_host) cudaFreeHost(m.lm.R_host);
+        m.lm.R_host = nullptr;
+        m.lm.R_host_n = 0;
     }
     m.lm.dev = nullptr;
     m.lm.loan = false;
@@ -6571,7 +6576,15 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     int64_t s_use = 0;
     if (mode == 1) { s_use = fit(true); r_dev = true; }
     else if (mode == 2) { s_use = fit(false); }
-    else {   // auto: VRAM when the whole target fits there, else pinned host (the bigger super-chunk wins)
+    else if (use_loan) {
+        // QuantLab pf-smooth (11/17): the auto walk keeps its rows in VRAM, in more super-chunks when it must: pinned rows
+        // move 80 KB a token and layer over PCIe (a 7K super-chunk 26 GB, more than a pass of the experts), and on Windows
+        // the RAM copy has page-locked about all it may - an extra 0.3 GB pinned there left the next request's decode
+        // stalled (Sync-XS, 8 GB: 2 of 3 runs; the chunk walk 0 of 3).  Pinned rows only when no VRAM super-chunk fits.
+        s_use = fit(true);
+        if (s_use > 0) r_dev = true;
+        else s_use = fit(false);
+    } else {   // auto: VRAM when the whole target fits there, else pinned host (the bigger super-chunk wins)
         const int64_t sv = fit(true);
         if (sv == S) { s_use = sv; r_dev = true; } else s_use = fit(false);
     }

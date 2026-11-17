@@ -16274,11 +16274,15 @@ int main(int argc, char** argv) {
                         const int64_t target = (tokens + T - 1) / T * T;
                         int64_t k = 0;
                         uint64_t need = 0;
-                        if (Prefill::layer_major_tail_bytes(target, T, true) <= room) {   // one super-chunk, rows in VRAM
-                            k = 1;
-                            need = base + Prefill::layer_major_tail_bytes(target, T, true);
-                        } else {   // the walk's other mode: the largest super-chunk with its rows in pinned RAM
-                            int64_t s = target - T;
+                        // the largest super-chunk with its rows in VRAM (the auto walk's mode, lm_prepare); pinned rows only
+                        // when not even 2 chunks fit so
+                        int64_t sv = target;
+                        while (sv >= 2 * T && Prefill::layer_major_tail_bytes(sv, T, true) > room) sv -= T;
+                        if (sv >= 2 * T) {
+                            k = (tokens + sv - 1) / sv;
+                            need = base + Prefill::layer_major_tail_bytes(sv, T, true);
+                        } else {
+                            int64_t s = target;
                             while (s >= 2 * T && Prefill::layer_major_tail_bytes(s, T, false) > room) s -= T;
                             if (s < 2 * T) continue;
                             k = (tokens + s - 1) / s;
