@@ -45,11 +45,11 @@ Dflash2Drafter::~Dflash2Drafter() {
     for (cudaGraphExec_t& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     auto fr = [](void* p) { if (p) cudaFree(p); };
-    fr(blob_); fr(d_meta_); fr(xq_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_blk_);
+    fr(blob_); fr(d_meta_); fr(xq_); fr(xil_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rope_inv_);   // (rt_blk_ lies in rt_ctx_)
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
     fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
-    fr(dvocab_); fr(dhead_);
+    fr(dvocab_); fr(dhead_); fr(own_taps_);
     if (h_meta_) cudaFreeHost(h_meta_);
     if (h_out_) cudaFreeHost(h_out_);
     if (cs_) cudaStreamDestroy(cs_);
@@ -187,6 +187,13 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
             if (cudaMemcpy(tmp, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
             kernels::df2_q8_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols, (int) t.cols, t.rows * t.cols / 32, nullptr);
             if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash2: weight conversion failed"; return false; }
+        } else if (t.dtype == "q4_0" && t.name.find("_codebook") != std::string::npos) {   // the selector's Q4_0 rows stay in block order (read row by row)
+            if (cudaMemcpy(blob_ + t.off, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
+        } else if (t.dtype == "q4_0") {   // GGML Q4_0 blocks -> the tiled nibble plane at the tensor's offset, then the d plane (same total bytes)
+            if (cudaMemcpy(tmp, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
+            kernels::df2_q4_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols / 2, (int) t.cols, t.rows * t.cols / 32, nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash2: weight conversion failed"; return false; }
+            q4_ = true;
         } else if (cudaMemcpy(blob_ + t.off, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
             err = "dflash2: weight upload failed";
             return false;
@@ -209,6 +216,7 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         err = "dflash2: stream";
         return false;
     }
+    for (auto& e : ev_hs_) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
     if (cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "dflash2: events";
         return false;
@@ -232,7 +240,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
         return true;
     };
     const size_t B = kRows;
-    bool ok = dev(&d_meta_, 32) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) && dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&rt_ctx_, B * 128) && dev(&rt_blk_, B * 128) &&
+    bool ok = dev(&d_meta_, 32) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) && dev(&xil_, kernels::native_q8_1_il_bytes(N_, kRows) + 4096) && dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&rt_ctx_, 2 * B * 128) && dev(&rope_inv_, 64) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
@@ -245,11 +253,14 @@ bool Dflash2Drafter::alloc(std::string& err) {
     if (!mapped(32 * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
     h_meta_ = (int32_t*) hd;
     m_meta_ = (int32_t*) dd;
+    std::memset(h_meta_, 0, 32 * 4);   // [18] the context floor starts at 0 (the whole window)
     if (!mapped(64 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
     h_out_ = (int32_t*) hd;
     out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
     out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
-    cudaMemset(rt_ctx_, 0, B * 128 * 4);
+    rt_blk_ = rt_ctx_ + B * 128;
+    cudaMemset(rt_ctx_, 0, 2 * B * 128 * 4);
+    kernels::df2_rope_inv(theta_, rope_inv_, nullptr);
     cudaMemset(xqp_, 0, (size_t) 5 * N_ * 8 + 4096);
     cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
     cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
@@ -294,7 +305,9 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         }
     };
     std::vector<int32_t> vocab;
-    if (!vocab_file.empty()) {
+    // STRATA_DF2_HEAD=native: the drafter runs its head on the target's own resident head (every vocabulary row, no 213 MiB pruned copy, no vocabulary file read)
+    static const bool head_native = [] { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && std::string(e) == "native"; }();
+    if (!vocab_file.empty() && !head_native) {
         if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
             std::fseek(vf, 0, SEEK_END);
             const long size = std::ftell(vf);
@@ -325,8 +338,8 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         head_rows = (int64_t) vocab.size();
     }
     if (!bind_raw(embed, hw, head->type(), head_rows, vocab, err)) return false;
-    std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB), drafter %.0f MiB of VRAM\n", (long long) n_dvocab_,
-                 (double) (n_dvocab_ * row_bytes) / 1048576.0, (double) vram_ / 1048576.0);
+    std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB), drafter %.0f MiB of VRAM (%s weights)\n", (long long) n_dvocab_,
+                 (double) (n_dvocab_ * row_bytes) / 1048576.0, (double) vram_ / 1048576.0, q4_ ? "Q4_0" : "Q8_0");
     return true;
 }
 
@@ -336,19 +349,19 @@ void Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initial
     auto o = outs.begin();
     for (const char* name : names) {
         const Tensor& t = find(name);
-        mats[n] = kernels::Df2Mat{blob_ + t.off, *o++, (int) t.rows};
+        mats[n] = kernels::Df2Mat{blob_ + t.off, *o++, (int) t.rows, t.dtype == "q4_0"};
         if (n == 0) n_in = (int) t.cols;
         ++n;
     }
     kernels::df2_gemm(mats, n, xq, xd, n_in, ncols, cs);
 }
 
-bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, std::string& err) {
+bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope) {
     using namespace kernels;
     if (skip_part("ctx")) return true;
     try {
         const int tap_n = (int) taps_.size() * N_;
-        df2_rope_table(d_meta_ + 0, n, theta_, rt_ctx_, cs);
+        if (rope) df2_rope_table_inv(d_meta_ + 0, n, rope_inv_, rt_ctx_, cs);
         stamp("df2_rope_table");
         df2_quant_rows(taps, tap_n, n, xqc_, xdc_, cs);
         stamp("df2_quant_rows");
@@ -372,11 +385,11 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
     return true;
 }
 
-bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
+bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) {
     using namespace kernels;
     try {
         const int B = kRows;
-        df2_rope_table(d_meta_ + 8, B, theta_, rt_blk_, cs);
+        if (rope) df2_rope_table_inv(d_meta_ + 8, B, rope_inv_, rt_blk_, cs);
         stamp("df2_rope_table");
         embed_(d_meta_ + 24, B, h_, cs);
         stamp("embed_");
@@ -389,6 +402,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             const std::string akp = p + "attention_conv.kernel_projection.weight", mkp = p + "mlp_conv.kernel_projection.weight";
             const std::string qp = p + "self_attn.q_proj.weight", kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
             const std::string gp = p + "mlp.gate_proj.weight", up = p + "mlp.up_proj.weight";
+            const std::string op = p + "self_attn.o_proj.weight";
             if (!skip_part("tiny")) gemm({akp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
             stamp("gemm:akp");
             if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_a, B, N_, group_, xqp_, xdp_, cs);
@@ -400,7 +414,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
             if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs);
             stamp("df2_attention");
-            if (!skip_part("qkvo")) gemm({(p + "self_attn.o_proj.weight").c_str()}, {o_}, B, cs, xqp_, xdp_);
+            if (!skip_part("qkvo")) gemm({op.c_str()}, {o_}, B, cs, xqp_, xdp_);
             stamp("gemm:o_proj");
             if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, group_, eps_, xqp_, xdp_, cs);
             stamp("df2_conv_rms_quant");
@@ -419,17 +433,33 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
             stamp("df2_conv_rms_quant");
         }
-        native_quantize_q8_1(fn_ + N_, xq_, N_, kDrafts, cs);   // rows 1..7, the head's format
-        df2_quant_rows(fn_ + N_, N_, kDrafts, xqp_, xdp_, cs);   // and the selector projection's
-        if (!skip_part("head")) native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, kDrafts, cs);
+        native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
+        df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_, xdp_, cs);   // and the selector projection's
+        const bool hs_fork = fork_ && cs2_ != nullptr && ev_hs_[0] != nullptr;   // the selector's projection beside the head, the top-k and their launches
+        if (hs_fork) {
+            cudaEventRecord(ev_hs_[0], cs);
+            cudaStreamWaitEvent(cs2_, ev_hs_[0], 0);
+            gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs2_, xqp_, xdp_);
+            cudaEventRecord(ev_hs_[1], cs2_);
+        }
+        if (!skip_part("head")) {
+            // the verify window's head kernel (interleaved activations, rows a warp by the card's table): bitwise native_mmvq's output, so the drafts are the same
+            static const bool il_on = [] { const char* e = std::getenv("STRATA_DF2_HEAD_IL"); return !(e && e[0] == '0'); }();
+            if (il_on && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
+                native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
+                native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+            } else
+                native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+        }
         stamp("native_mmvq");
-        df2_topk(logits_, (int) n_dvocab_, dvocab_, kDrafts, topscratch_, topval_, toptok_, cs);
+        df2_topk(logits_, (int) n_dvocab_, dvocab_, ndraft_, topscratch_, topval_, toptok_, cs);
         stamp("df2_topk");
-        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, kDrafts, cs, xqp_, xdp_);
+        if (hs_fork) cudaStreamWaitEvent(cs, ev_hs_[1], 0);
+        else gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs, xqp_, xdp_);
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
-                   reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, kDrafts, d_meta_ + 16, out_tok_,
-                   out_prob_, cs);
+                   reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0");
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -441,6 +471,7 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     if (exec_[n]) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
     kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+    kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);   // the context rows' and the block rows' tables in one launch, before the branches split
     // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
     // measured: -0.3 ms a round on an RTX 3060, +0.0..0.7 on a Strix Halo (gfx1151), so the HIP builds keep one stream (STRATA_DF2_FORK=1 / 0 overrides)
 #if defined(STRATA_USE_HIP)
@@ -454,9 +485,9 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
         cudaEventRecord(ev_fork_, cs_);
         cudaStreamWaitEvent(cs2_, ev_fork_, 0);
     }
-    bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err);
+    bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err, false);
     if (fork_) cudaEventRecord(ev_join_, cs2_);
-    if (ok) ok = record_block(cs_, err);
+    if (ok) ok = record_block(cs_, err, false);
     if (fork_) cudaStreamWaitEvent(cs_, ev_join_, 0);
     fork_ = false;
     cudaGraph_t graph = nullptr;
@@ -473,6 +504,17 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     return true;
 }
 
+void Dflash2Drafter::set_max_drafts(int n) {
+    n = std::max(1, std::min(n, (int) kDrafts));
+    if (n == ndraft_) return;
+    const OnDevice on_device(device_);
+    cudaDeviceSynchronize();
+    for (auto& e : exec_)
+        if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    graph_taps_ = nullptr;
+    ndraft_ = n;
+}
+
 bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     if (prof_ != nullptr) return true;   // the profile runs without graphs
@@ -484,6 +526,54 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     graph_taps_ = taps;
     ms_capture = ms_since(t0);
     return true;
+}
+
+uint64_t Dflash2Drafter::bind_bytes_for(const std::string& vocab_file, uint64_t head_row_bytes, int64_t n_vocab) {
+    // QuantLab (11/17, upstream 8ec2c8a9): STRATA_DF2_HEAD=native binds no head copy (the target's head, every row's logits)
+    if (head_native()) return (uint64_t) kDrafts * (uint64_t) std::max<int64_t>(0, n_vocab) * 4;
+    int64_t rows = 0;
+    if (!vocab_file.empty())
+        if (std::FILE* f = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            const long size = std::ftell(f);
+            std::fclose(f);
+            if (size >= 4 && size % 4 == 0) rows = size / 4;
+        }
+    if (rows > 0) return (uint64_t) rows * head_row_bytes + (uint64_t) rows * 4 + (uint64_t) kDrafts * (uint64_t) rows * 4;
+    return (uint64_t) kDrafts * (uint64_t) std::max<int64_t>(0, n_vocab) * 4;
+}
+
+bool Dflash2Drafter::prepare_own(std::string& err) {
+    if (!bound_) { err = "dflash2: not bound"; return false; }
+    const OnDevice on_device(device_);
+    if (!own_taps_) {
+        const size_t n = (size_t) kRows * taps_.size() * (size_t) N_;
+        if (cudaMalloc((void**) &own_taps_, n * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            own_taps_ = nullptr;
+            err = "dflash2: the drafter's own taps buffer does not fit in VRAM";
+            return false;
+        }
+        cudaMemset(own_taps_, 0, n * sizeof(float));
+        own_taps_bytes_ = n * sizeof(float);
+        vram_ += own_taps_bytes_;
+    }
+    return prepare(own_taps_, err);
+}
+
+bool Dflash2Drafter::draft_from(const float* src, int rows, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err) {
+    if (!own_taps_) { err = "dflash2: draft_from before prepare_own"; return false; }
+    if (rows < 1) { err = "dflash2: draft rows out of range"; return false; }
+    const OnDevice on_device(device_);
+    const size_t tap_n = taps_.size() * (size_t) N_;
+    const int lead = rows > kRows ? rows - kRows : 0;   // the rows before the last 8: context only
+    if (lead > 0 && !context(src, lead, pos0, err)) return false;
+    const int n_new = rows - lead;
+    if (cudaMemcpyAsync(own_taps_, src + (size_t) lead * tap_n, (size_t) n_new * tap_n * sizeof(float), cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = std::string("dflash2: taps copy: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return draft(own_taps_, n_new, pos0 + lead, anchor, drafts, probs, err);   // (stream-ordered after the copy: the graph runs on cs_)
 }
 
 bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
@@ -517,6 +607,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
     h_meta_[16] = anchor;
     h_meta_[17] = (int32_t) s;
+    h_meta_[18] = (int32_t) std::max<int64_t>(0, std::min<int64_t>(floor_, s));   // the context floor (set_floor; the attention kernel reads it)
     h_meta_[24] = anchor;
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
     for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
@@ -537,8 +628,9 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     (void) cudaStreamQuery(cs_);
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     for (int i = 0; i < kDrafts; ++i) {
-        drafts[i] = ((volatile int32_t*) h_out_)[i];
-        if (probs) probs[i] = ((volatile float*) h_out_)[16 + i];
+        const bool made = i < ndraft_;
+        drafts[i] = made ? ((volatile int32_t*) h_out_)[i] : 0;
+        if (probs) probs[i] = made ? ((volatile float*) h_out_)[16 + i] : 0.0f;
     }
     if (timing_) {
         float ms = 0;

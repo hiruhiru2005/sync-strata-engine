@@ -6,6 +6,7 @@
 // the given stream, allocate nothing and are graph-capturable.  Layouts are row-major f32 unless noted.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {
@@ -49,10 +50,14 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
 /// xq is int8 [col][n_in] (8 columns of n_in bytes), xd float [col][n_in / 32].  Up to 3 matrices that share the input run in one launch; y (matrix i)
 /// is [ncols][n_out].  n_in a multiple of 512, n_out of 16, ncols 1..8 (the other columns of xq are read and dropped).
 /// Bench only: pick a GEMM kernel variant (0 = the default).
+/// df2_rope_table with the inverse frequencies computed once (df2_rope_inv: the same double-precision pow per i), so a round pays no pow: the same table, bitwise.
+void df2_rope_inv(float theta, double* inv, void* stream);
+void df2_rope_table_inv(const int32_t* pos, int rows, const double* inv, float* table, void* stream);
 void df2_gemm_variant(int v);
 /// Bench only: attention variants (bit 0 skips Q K^T, bit 1 skips P V).
 void df2_attention_variant(int v);
-struct Df2Mat { const void* w; float* y; int n_out; };
+/// q4: the weights are the Q4_0 nibble plane (n_out * n_in / 2 bytes, see gemm4_kernel in dflash2.cu) then the fp16 scale plane (df2_q4_tile); all matrices of a launch share the format.
+struct Df2Mat { const void* w; float* y; int n_out; bool q4 = false; };
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream);
 /// Planar quantization of rows x[ncols][K].
 void df2_quant_rows(const float* x, int K, int ncols, void* xq, float* xd, void* stream);
@@ -64,6 +69,8 @@ void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const floa
 void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream);
 /// GGUF Q8_0 blocks (34 bytes) of a matrix with rows of n_in -> the tiled qs plane and the tiled d plane (count = rows * n_in / 32 blocks).
 void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
+/// ggml Q4_0 blocks (18 bytes) of a matrix with rows of n_in -> the tiled nibble plane (n_out * n_in / 2 bytes) and the tiled d plane (Df2Mat::q4).
+void df2_q4_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
 
 /// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn (optional) and the planar quantization.
 /// rows <= 8, H <= 3072 (H a multiple of 32).
@@ -83,8 +90,10 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 /// The candidate selector's walk: for row i = 0..rows-1 the 16 candidates' scores are unary[i][j] + dot(succ[tok[i][j]],
 /// pred[prev] * hp[i]) over `rank` values (codebooks are bf16 rows of `rank`), the pick is the argmax, prev = the pick.  Writes
 /// out_tok[i] and out_prob[i] (the softmax probability of the pick among the 16).  `prev0` is read from *anchor_tok on the device.
+/// `cb_q4`: the codebooks are ggml Q4_0 rows in block order (rank / 32 blocks of 18 bytes a row: fp16 d, 16 bytes, value i in the low nibble of byte i,
+/// value i + 16 in the high nibble; NOT tiled like the matrices), dequantized to fp32 ((q - 8) * d) before the same dot; default: bf16 rows.
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream);
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false);
 
 /// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c] / hc)) - the layer output with
 /// its pending FFN write (gr_write) applied, averaged over the streams.  R rows are `R_stride` floats apart, bo rows `bo_stride`, inject rows

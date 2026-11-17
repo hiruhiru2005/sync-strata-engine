@@ -15,6 +15,7 @@
 // it, so a rejected draft leaves nothing to roll back.  One CUDA graph per context-row count n = 1..8 holds the context update and the
 // block; the host stages the positions and the anchor and waits for the 7 drafts.
 #pragma once
+#include <cstdlib>
 
 #include "strata/core/session.hpp"
 
@@ -45,12 +46,21 @@ public:
     bool load(const std::string& pack_path, int device, std::string& err);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err);
+    /// STRATA_DF2_HEAD=native (CUDA / HIP): bind() ignores the vocabulary file and runs the draft head on the target's whole head (no pruned copy).
+    static bool head_native() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'n'; }
     /// Tests: an embedding callback and a head given as raw rows of `head_type` (a native_mmvq type).
     using EmbedFn = std::function<void(const int32_t* tokens_dev, int n, float* out, cudaStream_t)>;
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
 
     /// A new request: the ring is empty again.
-    void reset() { have_ctx_ = 0; }
+    void reset() { have_ctx_ = 0; floor_ = 0; }
+    /// QuantLab (11/16): the context floor.  The attention reads ring slots from max(s - window + 1, floor) only: a server request that mounts
+    /// a conversation whose rows below `pos` never reached the ring (a checkpoint, a parked conversation, a session file) sets it to the first
+    /// position it feeds, so the older slots (another conversation's rows, or zeros) are not attended to.  0 = the whole window.
+    void set_floor(int64_t pos) { floor_ = pos < 0 ? 0 : pos; }
+    int64_t floor() const { return floor_; }
+    /// The end of the rows fed so far (context() and draft()), for the caller's bookkeeping.
+    int64_t fed_end() const { return have_ctx_; }
     /// Context rows without a draft: `n` rows of taps (device, [n][5 * n_embd]) for positions pos0 ... pos0 + n - 1.
     bool context(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
@@ -60,6 +70,26 @@ public:
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
+
+    /// QuantLab (11/16, the server path): the round graphs captured on the drafter's own 8-row taps buffer (allocated here), so the caller's
+    /// taps can live anywhere and a window can be wider than 8 rows.  Use draft_from() afterwards, never draft().
+    bool prepare_own(std::string& err);
+    /// One round from any device taps `src` ([rows][5 * n_embd], rows >= 1, positions pos0 ...; the window's committed rows): the rows past
+    /// the last 8 go to context(), the last min(rows, 8) are copied (on the drafter's stream) into its own buffer and drafted from, the block
+    /// anchored at pos0 + rows.  The caller has the window's result on the host already, so the verifier wrote `src` before this call.
+    bool draft_from(const float* src, int rows, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
+    /// The same rows into the ring with no draft (a window that ends the answer: the next request of the conversation continues from them).
+    bool context_from(const float* src, int rows, int64_t pos0, std::string& err) { return context(src, rows, pos0, err); }
+    /// Bytes of the own taps buffer (0 before prepare_own).
+    uint64_t own_taps_bytes() const { return own_taps_bytes_; }
+    /// QuantLab (11/16): the VRAM bind() will take for a native head of `head_row_bytes` a row: the draft head over the vocabulary file's
+    /// rows (the whole head, `n_vocab` rows, when the file is missing: then no copy, only the logits), the id map and the 7 rows of logits.
+    /// The expert cache is sized before bind(), so it reserves this (it needs no MTP layer, unlike MtpDrafter::bind_bytes).
+    static uint64_t bind_bytes_for(const std::string& vocab_file, uint64_t head_row_bytes, int64_t n_vocab);
+    /// The most drafts a window will use (the engine's widest window - 1, 1..kDrafts; default kDrafts).  The head, the top-k and the selector's walk run for that
+    /// many rows only: the first `n` drafts and probabilities are bitwise the ones a full block makes (every row is its own column, the walk goes left to right);
+    /// draft() returns token 0 with probability 0 for the rest.  Before prepare() / the first draft(); a later change drops the captured graphs.
+    void set_max_drafts(int n);
 
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
@@ -79,8 +109,8 @@ private:
     const float* f32(const std::string& name) const { return reinterpret_cast<const float*>(blob_ + find(name).off); }
     /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
     void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
-    bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err);
-    bool record_block(cudaStream_t cs, std::string& err);
+    bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true);
+    bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
     bool capture(int n, const float* taps, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
@@ -95,6 +125,7 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* blob_ = nullptr;
     uint64_t vram_ = 0;
+    bool q4_ = false;   // the pack's matrices are Q4_0 (tools/dflash2_pack.py --q4_0)
     int N_ = 2560, L_ = 5, NH_ = 32, NKV_ = 8, HD_ = 128, I_ = 7680, window_ = 2048, group_ = 16, rank_ = 256, mask_token_ = 0;
     float theta_ = 10000.0f, eps_ = 1e-6f;
     std::vector<int> taps_;
@@ -116,8 +147,11 @@ private:
     int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
-    float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;
+    float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
+    double* rope_inv_ = nullptr;   ///< theta^(-2 i / 128), once
+    cudaEvent_t ev_hs_[2] = {};     ///< the selector's projection runs beside the head
     uint8_t* xq_ = nullptr;         ///< the head's q8_1 activations
+    uint8_t* xil_ = nullptr;        ///< their interleaved copy (the head's native_mmvq_il kernel, CUDA)
     uint8_t* xqp_ = nullptr;        ///< planar activations of the drafter's own GEMMs (kernels/dflash2.hpp)
     float* xdp_ = nullptr;
     uint8_t* xqc_ = nullptr;        ///< the same for the context update, which runs beside the block
@@ -133,7 +167,11 @@ private:
     uint32_t* topscratch_ = nullptr;
     cudaGraphExec_t exec_[kRows + 1] = {};
     const float* graph_taps_ = nullptr;
+    int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;
+    int64_t floor_ = 0;   ///< set_floor: h_meta_[18] at each draft
+    float* own_taps_ = nullptr;      ///< prepare_own: [8][taps][N_], the round graphs' taps
+    uint64_t own_taps_bytes_ = 0;
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr;
     bool timing_ = false;
 };
