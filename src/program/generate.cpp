@@ -10487,7 +10487,15 @@ int main(int argc, char** argv) {
                                  (long long) (borrowed - kept), (long long) borrowed);
             }
         } else {
-            std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
+            // QuantLab (11/18): what is free before them - they are not in the expert cache's sizing (it priced a loan), so
+            // they come out of the VRAM reserve (an RTX 3080 held to 8 GB, reserve 1024, a 1024-token chunk: 97-401 MiB
+            // left with everything loaded)
+            size_t fb_own = 0, tb_own = 0;
+            if (cudaMemGetInfo(&fb_own, &tb_own) != cudaSuccess) { (void) cudaGetLastError(); fb_own = 0; }
+            fb_own = std::min(fb_own, strata::core::device_free_bytes());
+            std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow): a "
+                                 "%lld-token chunk, %lld MiB of VRAM free before them\n",
+                         (long long) o.prefill_chunk, (long long) (fb_own >> 20));
         }
         rss_probe("the prompt path set up");
         // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
@@ -10622,30 +10630,79 @@ int main(int argc, char** argv) {
             }
         }
         mem_mark("the head and the prompt path");
-        // QuantLab pf-smooth (11/17): a small card reads its long prompts layer-major (Prefill::run_layer_major: each
-        // layer's experts once per super-chunk of the prompt instead of once per chunk), the super-chunk's buffers in the
-        // request's loan (lend, below), so the walk takes no VRAM beside the expert cache.  On when the start-up chunk is at
-        // most STRATA_PREFILL_LM_AUTO_CHUNK tokens (default 2048: an 8 GB card picks 1024-1280; a 12 GB card's 8192 keeps
-        // the chunk walk exactly as before), on one GPU with a loan, and when the walk runs this model's experts.  An
-        // explicit STRATA_PREFILL_LAYER_MAJOR (1: the opt-in walk as before, 0: off) or STRATA_PREFILL_LM_AUTO_CHUNK=0 turns
-        // it off.  Measured on an RTX 3080 held to 7 GiB, Sync-S, 19.6K prompt: 381 -> 1,607 tok/s (pf-smooth-1117.md).
+        // QuantLab pf-smooth (11/17; the gate 11/18): a card whose long prompts wait on the experts it streams reads them
+        // layer-major (Prefill::run_layer_major: each layer's experts once per super-chunk of the prompt instead of once
+        // per chunk), the super-chunk's buffers in the request's loan (lend, below), so the walk takes no VRAM beside the
+        // expert cache.  The gate prices one chunk of the chunk walk as the host-aware plan does (prefill_plan.hpp
+        // price(): the experts the GPU caches do not hold, streamed over PCIe, beside the compute) and turns the walk on
+        // when the stream is at least STRATA_PREFILL_LM_AUTO_SHARE of that chunk's time (default 0.35).  It used to ask
+        // for a start-up chunk of at most 2048 tokens, but the chunk an 8 GB card starts with moves with the VRAM reserve
+        // and the K/V's loan (768 / 256 / 1024 tokens at a reserve of 256 / 512 / 768 MiB, 11/17 night), and at 3328
+        // tokens the chunk walk still waits on the stream.  The share follows the bytes: an RTX 3080 held to 8 GB
+        // (Sync-XS, a 1024-3328-token chunk) prices 0.39-0.67 and reads in layer-major; 10-12 GB (4608-8192 tokens,
+        // 0.20-0.33) keeps the chunk walk exactly as before, as measured (pf-smooth-1117.md).  On one GPU with a loan,
+        // and when the walk runs this model's experts.  An explicit STRATA_PREFILL_LAYER_MAJOR (1: the opt-in walk as
+        // before, 0: off) wins; STRATA_PREFILL_LM_AUTO_CHUNK=N (tokens) is the old rule (a start-up chunk of at most N;
+        // 0: off).  Measured on an RTX 3080 held to 7 GiB, Sync-S, 19.6K prompt: 381 -> 1,607 tok/s.
         bool pf_lm_auto = false;
         {
             const char* lv = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
             const char* cv = std::getenv("STRATA_PREFILL_LM_AUTO_CHUNK");
-            const int64_t lm_max_chunk = cv != nullptr ? (int64_t) std::atoll(cv) : (int64_t) 2048;
-            if ((lv == nullptr || lv[0] == '\0') && lm_max_chunk > 0 && o.prefill_chunk <= lm_max_chunk) {
+            const char* shv = std::getenv("STRATA_PREFILL_LM_AUTO_SHARE");
+            // the start-up chunk (not the host-aware plan's smaller one for a file tier the page cache cannot hold: with it a
+            // 12 GB card's walk would change, and the plan's chunk is only for the prompts past the start-up one)
+            const int64_t walk_chunk = o.prefill_chunk;
+            double share = -1.0, stream_gib = 0.0, h2d = 12.0;
+            if (pf_parts.size() == 1 && walk_chunk > 0) {
+                const auto& lay = strata::kernels::cpu::expert_layout();
+                uint64_t total = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l) total += lay.layer_bytes(l);
+                const uint64_t gc = (uint64_t) std::max<int64_t>(0, (int64_t) pf_parts[0].cache->bytes());
+                h2d = g_last_h2d_gbps > 0.0 ? g_last_h2d_gbps : 12.0;
+                double toks = 1200.0;   // the plan's compute rate (STRATA_PREFILL_PLAN_TOKS)
+                if (const char* e = std::getenv("STRATA_PREFILL_PLAN_TOKS"); e != nullptr && std::atof(e) > 0.0)
+                    toks = std::atof(e);
+                const double stream_b = total > gc ? (double) (total - gc) : 0.0;
+                stream_gib = stream_b / 1073741824.0;
+                const double stream_s = stream_b / (h2d * 1e9);
+                const double compute_s = (double) walk_chunk / toks;
+                share = stream_s + compute_s > 0.0 ? stream_s / (stream_s + compute_s) : 0.0;
+            }
+            double min_share = 0.35;
+            if (shv != nullptr && shv[0] != '\0') min_share = std::atof(shv);
+            const bool by_chunk = cv != nullptr && cv[0] != '\0';
+            const int64_t lm_max_chunk = by_chunk ? (int64_t) std::atoll(cv) : 0;
+            char said[200];
+            std::snprintf(said, sizeof said, "a %lld-token chunk streams %.1f GiB at %.1f GB/s, %.0f%% of its time",
+                          (long long) walk_chunk, stream_gib, h2d, share >= 0.0 ? 100.0 * share : 0.0);
+            const bool want = by_chunk ? (lm_max_chunk > 0 && o.prefill_chunk <= lm_max_chunk)
+                                       : (share >= 0.0 && min_share > 0.0 && share >= min_share);
+            if (lv != nullptr && lv[0] != '\0') {
+                std::fprintf(stderr, "strata serve: QuantLab pf-smooth: STRATA_PREFILL_LAYER_MAJOR=%s decides (%s)\n", lv, said);
+            } else if (want) {
                 std::string why;
                 if (pf_parts.size() != 1) why = "no expert cache to lend from on one GPU";
                 else if (multi_gpu || peer.valid()) why = "more than one GPU";
                 else if (sp.layer_major_supported(why)) pf_lm_auto = true;
-                if (pf_lm_auto)
+                if (pf_lm_auto && by_chunk)
                     std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts of 2 chunks or more read layer-major (the "
-                                         "start-up chunk is %lld tokens, at most %lld): each layer's experts once per "
-                                         "super-chunk, its buffers in the prompt's loan (STRATA_PREFILL_LAYER_MAJOR=0: off)\n",
-                                 (long long) o.prefill_chunk, (long long) lm_max_chunk);
+                                         "start-up chunk is %lld tokens, STRATA_PREFILL_LM_AUTO_CHUNK %lld; %s): each layer's "
+                                         "experts once per super-chunk, its buffers in the prompt's loan (STRATA_PREFILL_LAYER_MAJOR=0: off)\n",
+                                 (long long) o.prefill_chunk, (long long) lm_max_chunk, said);
+                else if (pf_lm_auto)
+                    std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts of 2 chunks or more read layer-major (%s; "
+                                         "on from %.0f%%): each layer's experts once per super-chunk, its buffers in the "
+                                         "prompt's loan (STRATA_PREFILL_LAYER_MAJOR=0: off)\n",
+                                 said, 100.0 * min_share);
                 else
                     std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts stay on the chunk walk: %s\n", why.c_str());
+            } else if (by_chunk) {
+                std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts stay on the chunk walk (the start-up chunk is "
+                                     "%lld tokens, STRATA_PREFILL_LM_AUTO_CHUNK %lld; %s)\n",
+                             (long long) o.prefill_chunk, (long long) lm_max_chunk, said);
+            } else if (share >= 0.0) {
+                std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts stay on the chunk walk (%s; layer-major "
+                                     "from %.0f%%)\n", said, 100.0 * min_share);
             }
         }
         // #340: STRATA_SPLIT_SMALL_OWN=S (tokens): on a layer split, every stage that borrows keeps the slots for an
