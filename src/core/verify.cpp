@@ -1126,6 +1126,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
+        redo_hist_ = b.take<float>(HS);   // QuantLab (11/18) STRATA_QL_WINDOW_REDO
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
     };
     Bump count;
@@ -3453,6 +3454,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
             !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+        // QuantLab (11/18) STRATA_QL_WINDOW_REDO: the PLE history the window advances in place, kept for a redo (one small
+        // copy on the window's stream; nothing else of the window changes)
+        if (do_ple && ql_window_redo_on())
+            copy_from_mapped(redo_hist_, ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM, cs_);
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
         static const bool threaded_launch = [] {
@@ -3737,6 +3742,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (ql_hostsplit_on()) ql_hostsplit_add(4, ql_hs_ns(ql_hs_s0));
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    // QuantLab (11/18): a window whose GPU waits were released ran on to the end on words nobody wrote: nothing of it is
+    // used (before, the engine always ended right after a release)
+    if (released_.load()) {
+        ++windows;   // (counted: STRATA_TEST_VERIFY_STALL withholds its flag in one window, not in its redo too)
+        err = "verify: the window's GPU waits were released (#267)";
+        return false;
+    }
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
@@ -4017,6 +4029,51 @@ void Verifier::ql_dma_push(const QlDmaJob& j) {
     ql_dma_head_.store(h + 1, std::memory_order_release);
     ql_dma_head_.notify_one();
     copy_used_ = true;
+}
+
+bool ql_window_redo_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QL_WINDOW_REDO");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+bool Verifier::redo_safe(int T) const {
+    return !(T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit());   // run()'s self_commit
+}
+
+bool Verifier::recover_after_release(std::string& err) {
+    if (!released_.load()) return next_ == nullptr || next_->recover_after_release(err);
+    const OnDevice on_device(device_);
+    ql_dma_drain();   // the DMA thread's queued uploads (and their flag-B raises on copy_) land first
+    cudaError_t e = cudaStreamSynchronize(cs_);
+    if (e == cudaSuccess && copy_ != nullptr) e = cudaStreamSynchronize(copy_);
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("verify: after the release the device holds an error: ") + cudaGetErrorString(e);
+        return false;
+    }
+    for (uint32_t* p : {h_seq_, h_flag_, h_flagA_, h_flagB_, hflag_out_h_, herr_h_, hdrop_h_, h_pf_flag_, h_qe_flag_, h_plan_err_})
+        if (p != nullptr) *(volatile uint32_t*) p = 0;
+    copy_used_ = false;
+    prelaunched_ = 0;
+    staged_ = false;
+    // what the released window wrote in place
+    SessionState& ss = *ss_;
+    const strata::kernels::QsaShapes s = shapes_of(*g_);
+    const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
+    for (int64_t qi = 0; qi < nQ; ++qi)
+        strata::kernels::copy_from_mapped(ss.qsa_states[qi].idx_tail, tail_snap_ + (size_t) qi * TS, TS, cs_);
+    if (ss.ple.ready() && ple_stage() && ql_window_redo_on())
+        strata::kernels::copy_from_mapped(ss.ple.hist, redo_hist_, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM, cs_);
+    e = cudaStreamSynchronize(cs_);
+    if (e != cudaSuccess) {
+        err = std::string("verify: putting the window's state back failed: ") + cudaGetErrorString(e);
+        return false;
+    }
+    released_.store(false);
+    return next_ == nullptr || next_->recover_after_release(err);
 }
 
 void Verifier::ql_dma_drain() {

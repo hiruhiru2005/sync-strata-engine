@@ -537,6 +537,11 @@ static bool ql_kv_loan() {
     static const bool on = [] { const char* v = std::getenv("STRATA_QL_KV_LOAN"); return v == nullptr || std::atoi(v) != 0; }();
     return on;
 }
+// QuantLab (11/18) STRATA_QL_WINDOW_REDO: until this time (progress_now_ms) a silent verify window is released by the
+// watchdog even on a card that is not full any more - the redo of a window released on a full card can stall the
+// same way after the expert cache gave VRAM back (vq12, 11/18)
+static std::atomic<int64_t> g_ql_redo_armed_ms{0};
+
 static int64_t ql_kv_loan_min_chunk() {
     static const int64_t c = [] {
         const char* v = std::getenv("STRATA_QL_KV_LOAN_MIN_CHUNK");
@@ -13483,8 +13488,16 @@ int main(int argc, char** argv) {
             // same restart, ~50 s sooner.  (Another program taking more VRAM than the card has, at once, 11/18.)
             const char* wfull = std::getenv("STRATA_QL_STALL_FULL_S");
             const int full_limit = wfull ? std::atoi(wfull) : 10;
+            // QuantLab (11/18) STRATA_QL_WINDOW_REDO (default on): a verify window silent for STRATA_QL_REDO_S (default 3) on a
+            // full card (NVML below 128 MiB free; STRATA_QL_REDO_TEST=1: any card, for STRATA_TEST_VERIFY_STALL) has its GPU
+            // waits released - the WDDM paging then finishes - and the decode loop runs that window again
+            // (Verifier::recover_after_release) instead of the engine ending.  Once per silent stretch; if the step still
+            // does not move, the rules above end the engine as before.
+            const char* wredo = std::getenv("STRATA_QL_REDO_S");
+            const int redo_s = strata::core::ql_window_redo_on() ? (wredo ? std::atoi(wredo) : 3) : 0;
+            static const bool redo_test = [] { const char* v = std::getenv("STRATA_QL_REDO_TEST"); return v != nullptr && v[0] == '1'; }();
             if (limit > 0)
-                std::thread([limit, io_limit, full_limit] {
+                std::thread([limit, io_limit, full_limit, redo_s] {
                     strata::platform::name_this_thread("strata-watchdog");
                     strata::aux_cpus::pin_current_thread();
                     strata::core::Progress& p = strata::core::progress();
@@ -13494,11 +13507,31 @@ int main(int argc, char** argv) {
                     uint64_t io_last = file_tier_activity();
                     auto io_active_at = since;   // the last second the file tier was busy
                     bool io_noted = false;
+                    bool redo_done = false;   // QuantLab (11/18): the soft release ran for this silent stretch
                     for (;;) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; io_last = file_tier_activity(); continue; }
+                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; io_last = file_tier_activity(); redo_done = false; continue; }
+                        if (redo_s > 0 && !redo_done && now - since >= std::chrono::seconds(redo_s) &&
+                            stage_text().rfind("verify window", 0) == 0) {
+                            size_t cb = 0;
+                            const bool full = strata::core::card_free_bytes(cb) && (cb >> 20) < 128;
+                            const bool armed = strata::core::progress_now_ms() < g_ql_redo_armed_ms.load();
+                            if (full || redo_test || armed) {
+                                redo_done = true;
+                                g_ql_redo_armed_ms.store(strata::core::progress_now_ms() + 30000);
+                                std::fprintf(stderr, "strata serve: QuantLab: a verify window has not moved for %d s (%s; %s): "
+                                                     "its GPU waits are released and the window runs again "
+                                                     "(STRATA_QL_WINDOW_REDO)\n", redo_s, stage_text().c_str(),
+                                             full ? ("the card's VRAM is full, " + std::to_string((long long) (cb >> 20)) +
+                                                     " MiB free").c_str() : armed ? "a window released within 30 s" : "STRATA_QL_REDO_TEST");
+                                strata::core::release_gpu_waits(stderr);
+                                std::fflush(stderr);
+                                since = now;   // the abort rules count again from here
+                                continue;
+                            }
+                        }
                         {   // sampled every second, also during the first `limit` seconds, so a busy file tier is seen
                             const uint64_t a = file_tier_activity();
                             if (a >= io_last + 16) io_active_at = now;   // 16 = faults + MiB read in a second: busy
@@ -18817,7 +18850,50 @@ int main(int argc, char** argv) {
                     }
                     pa_n = 0;
                 }
-                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                // QuantLab (11/18) STRATA_QL_WINDOW_REDO: the routing counts this window adds (they steer which missed experts
+                // later windows read on the CPU and which over PCIe), kept so a redo does not count the released window twice
+                static std::vector<float> usage_redo;
+                if (strata::core::ql_window_redo_on() && !drive.d.usage.empty()) usage_redo.assign(drive.d.usage.begin(), drive.d.usage.end());
+                bool win_ok = ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) && !drive.d.failed;
+                // QuantLab (11/18) STRATA_QL_WINDOW_REDO: a window the stall watchdog released (the WDDM stall: another
+                // program took more VRAM than the card has) runs again, after its state is put back and the expert cache
+                // gave a step of VRAM back - not a one-token window that committed itself, and at most twice
+                for (int redo = 1; !win_ok && redo <= 2 && strata::core::ql_window_redo_on() && ver.was_released() &&
+                                   ver.redo_safe(T); ++redo) {
+                    std::string rerr;
+                    if (!ver.recover_after_release(rerr)) {
+                        err = rerr;
+                        break;
+                    }
+                    adapt_quiesce();
+                    if (vpr.on) {   // VRAM back first - only when the card is full (else the cache stays: the redo is the window's own arithmetic)
+                        size_t cb = 0;
+                        const bool got = strata::core::card_free_bytes(cb);
+                        const int64_t before_mib = got ? (int64_t) (cb >> 20) : -1;
+                        int steps = 0;
+                        // until a step's room is free again above the low line (another program took more than the card has:
+                        // what WDDM paged out of the engine has to come back), at most 4 steps
+                        while (got && steps < 4 && strata::core::card_free_bytes(cb) &&
+                               (int64_t) (cb >> 20) < vpr.low_mib + vpr.step_mib && kvg_ensure(0, adapt_quiesce, vpr.step_chunks))
+                            ++steps;
+                        if (steps > 0 || (got && before_mib < vpr.low_mib + vpr.step_mib))
+                            std::fprintf(stderr, "strata serve: QuantLab: before the redo the card had %lld MiB free; the expert cache gave %d step(s) back, "
+                                                 "%lld MiB free now\n", (long long) before_mib, steps,
+                                         (long long) (strata::core::card_free_bytes(cb) ? (int64_t) (cb >> 20) : -1));
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));   // the driver's paging settles first
+                    strata::core::progress_beat();   // the watchdog counts this redo's silence afresh (and may release it too)
+                    drive.d.failed = false;
+                    if (usage_redo.size() == drive.d.usage.size() && !usage_redo.empty())
+                        std::copy(usage_redo.begin(), usage_redo.end(), drive.d.usage.begin());
+                    if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+                    else if (!req_df2 && use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                    std::fprintf(stderr, "strata serve: QuantLab: the released %d-token window at position %lld runs again "
+                                         "(%d of 2; it failed with: %s)\n", T, (long long) p, redo, err.c_str());
+                    err.clear();
+                    win_ok = ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) && !drive.d.failed;
+                }
+                if (!win_ok) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }

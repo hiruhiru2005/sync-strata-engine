@@ -8,6 +8,7 @@
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/dp4a.hpp"   // QuantLab (11/18): STRATA_DP4A - __dp4a from sm_61, four vmad below it (sm_60 P100, upstream)
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "s26_tsum.cuh"
@@ -2528,14 +2529,14 @@ __device__ __forceinline__ int i8_tok(int lane) {
     return k;
 }
 __device__ __forceinline__ int i8_dot32(const uint4& w0, const uint4& w1, const uint4& x0, const uint4& x1) {
-    int s = __dp4a((int) w0.x, (int) x0.x, 0);
-    s = __dp4a((int) w0.y, (int) x0.y, s);
-    s = __dp4a((int) w0.z, (int) x0.z, s);
-    s = __dp4a((int) w0.w, (int) x0.w, s);
-    s = __dp4a((int) w1.x, (int) x1.x, s);
-    s = __dp4a((int) w1.y, (int) x1.y, s);
-    s = __dp4a((int) w1.z, (int) x1.z, s);
-    return __dp4a((int) w1.w, (int) x1.w, s);
+    int s = STRATA_DP4A((int) w0.x, (int) x0.x, 0);
+    s = STRATA_DP4A((int) w0.y, (int) x0.y, s);
+    s = STRATA_DP4A((int) w0.z, (int) x0.z, s);
+    s = STRATA_DP4A((int) w0.w, (int) x0.w, s);
+    s = STRATA_DP4A((int) w1.x, (int) x1.x, s);
+    s = STRATA_DP4A((int) w1.y, (int) x1.y, s);
+    s = STRATA_DP4A((int) w1.z, (int) x1.z, s);
+    return STRATA_DP4A((int) w1.w, (int) x1.w, s);
 }
 
 template <int T>

@@ -78,6 +78,10 @@ struct VerifyHits {
     int64_t blob = 0;
 };
 
+/// QuantLab (11/18) STRATA_QL_WINDOW_REDO (default on; 0: off): the serve watchdog releases a verify window stalled on a
+/// full card (the WDDM stall) and the window is run again (Verifier::recover_after_release) instead of ending the engine
+bool ql_window_redo_on();
+
 class Verifier {
 public:
     Verifier() = default;
@@ -109,6 +113,18 @@ public:
     /// graph found no VRAM - nothing else changed, and a smaller window can run instead.  A layer split's stages
     /// keep the capture on first use (true, nothing done).
     bool prepare(int T, bool& no_vram, std::string& err);
+    /// QuantLab (11/18) STRATA_QL_WINDOW_REDO: after release_gpu_waits (the stall watchdog's soft path), let this verifier
+    /// (and the stages after it) run windows again: the DMA thread's uploads and both streams drained, the handshake
+    /// words zeroed, what the released window wrote in place put back (each QSA indexer tail from tail_snap_, which the
+    /// graph took before its append and which the released window ran through; the PLE history from the copy taken
+    /// before the launch), released_ cleared.  The K/V cells it wrote are rewritten by the redo, the recurrent state is
+    /// only written by the commit.  False with `err` when the device holds an error (then the engine must start again).
+    bool recover_after_release(std::string& err);
+    /// QuantLab (11/18): release_gpu_waits ran since the last recover_after_release
+    bool was_released() const { return released_.load(); }
+    /// QuantLab (11/18): a released T-token window can be run again - not a one-token window that commits itself (it
+    /// advances the recurrent state in place)
+    bool redo_safe(int T) const;
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
@@ -766,6 +782,7 @@ private:
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
+    float* redo_hist_ = nullptr;                              // QuantLab (11/18): the PLE history before the window (NG_HIST * NG_HC_DIM)
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
