@@ -1003,6 +1003,12 @@ public:
     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
     bool recheck_unbuffered(std::string& why);
     bool unbuffered() const { return !direct_.empty(); }
+    /// QuantLab 11/18: RAM this process holds that it can give back without losing anything - the file tier's mapped
+    /// pages in its working set (Windows, the file tier read through the file cache): clean pages of the pack, which
+    /// Windows trims to the standby list when another allocation needs them.  The available-RAM reading leaves them
+    /// out, so a check against it alone sees the RAM as gone.  Sampled (QueryWorkingSetEx).  0 when nothing is mapped
+    /// (unbuffered reads) and off Windows.
+    uint64_t reclaimable_mapped_bytes() const;
     /// MODEL-UPDATE round 2 (Linux, opt-in STRATA_PROMPT_DIRECT=1): with the file tier read through the file cache (the
     /// decode's choice: re-routed experts come back from it), the prompt path's batched stager reads (copy_blobs) go
     /// unbuffered instead - the same bytes, read in merged O_DIRECT requests.  False when not opened (and why).

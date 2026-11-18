@@ -61,6 +61,10 @@ std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& path
 
 /// The real files (Windows: GlobalMemoryStatusEx) and the cap set by set_memory_limit_bytes().
 std::optional<HostMemoryReading> sample_host_memory();
+/// QuantLab 11/18: sample_host_memory() with `reclaim_phys` bytes added to the PHYSICAL side only.  On Windows the
+/// reading is min(available RAM, available commit) (#1607): RAM the process can give back (its clean mapped file pages)
+/// adds no commit, so the commit side still bounds it.  Elsewhere: the plain reading (the argument is not used).
+std::optional<HostMemoryReading> sample_host_memory_reclaim(uint64_t reclaim_phys);
 
 std::optional<uint64_t> available_host_bytes();
 

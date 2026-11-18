@@ -291,6 +291,20 @@ std::optional<HostMemoryReading> sample_host_memory() {
 #endif
 }
 
+std::optional<HostMemoryReading> sample_host_memory_reclaim(uint64_t reclaim_phys) {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    if (!GlobalMemoryStatusEx(&status)) return {};
+    // QuantLab 11/18: the RAM side plus what the process gives back; the commit side as it is (#1607)
+    return combine(std::min<uint64_t>(status.ullAvailPhys + reclaim_phys, status.ullAvailPageFile), status.ullTotalPhys,
+                   CgroupScan{}, memory_limit_bytes());
+#else
+    (void) reclaim_phys;
+    return sample_host_memory();
+#endif
+}
+
 std::optional<uint64_t> available_host_bytes() {
     const auto reading = sample_host_memory();
     if (!reading) return {};

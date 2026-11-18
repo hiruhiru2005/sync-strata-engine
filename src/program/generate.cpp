@@ -6891,6 +6891,7 @@ int main(int argc, char** argv) {
     }
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
+    strata::core::FileExpertSource* file_srcp = nullptr;   // QuantLab 11/18: srcp when it is the file source (its mapped pages)
     if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
@@ -6993,6 +6994,7 @@ int main(int argc, char** argv) {
             src.set_io_stats(true);
         }
         srcp = &src;
+        file_srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
         // Under WDDM (Windows, WSL2), a multi-GPU run (a layer split, or remote experts) starts with at most 8 GiB of
@@ -9106,7 +9108,10 @@ int main(int argc, char** argv) {
         if (!hm) return chunk;
         const uint64_t slack = 1200ull << 20;   // MemAvailable overstates what the cache can hold (~1 GiB on the #2824 box)
         pp::Host host;
-        host.page_cache = src.unbuffered() ? 0 : (hm->available > slack ? hm->available - slack : 0);
+        // QuantLab 11/18: the file tier's own mapped pages in this process's working set ARE cached experts, though the
+        // available RAM leaves them out (Windows, read through the file cache; 0 otherwise)
+        const uint64_t own_cached = src.unbuffered() ? 0 : src.reclaimable_mapped_bytes();
+        host.page_cache = src.unbuffered() ? 0 : (hm->available + own_cached > slack ? hm->available + own_cached - slack : 0);
         host.h2d_gbps = g_last_h2d_gbps > 0.0 ? g_last_h2d_gbps : 12.0;
         std::string why;
         host.ssd_gbps = drive_read_gbps(o.native_preset.empty() ? o.pack : o.native_preset, why);   // where the experts live
@@ -11770,10 +11775,33 @@ int main(int argc, char** argv) {
                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
                 size_t evicted = 0;
                 std::optional<strata::core::HostMemoryReading> mem;
+                // QuantLab 11/18: with the file tier read through the file cache (Windows), its mapped pages stay in this
+                // process's working set and the available RAM leaves them out (0.3-0.7 GiB available against 7-9 unbuffered,
+                // measured), so parked conversations were evicted for RAM that Windows gives back from those clean pages on
+                // demand.  Added to the RAM side of the reading when the plain one says no (read once a park; 0 when
+                // nothing is mapped, so an unbuffered file tier and Linux decide as before); the commit side still bounds
+                // it (sample_host_memory_reclaim: min(RAM + these pages, commit), #1607).  The cache's own budget, sized
+                // from the free RAM at the start, still bounds what is parked.
+                uint64_t own_reclaim = 0;
+                bool own_read = false, own_used = false;
                 auto admit = [&] {
                     mem = strata::core::sample_host_memory();
-                    return strata::core::conversation_memory_admit(
-                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
+                    std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                    if (avail && file_srcp != nullptr && srcp == file_srcp &&
+                        !strata::core::conversation_memory_admit(avail, additional, floor)) {
+                        if (!own_read) {
+                            own_reclaim = file_srcp->reclaimable_mapped_bytes();
+                            own_read = true;
+                        }
+                        if (own_reclaim > 0) {
+                            if (auto with = strata::core::sample_host_memory_reclaim(own_reclaim)) {
+                                avail = with->available;
+                                own_used = strata::core::conversation_memory_admit(avail, additional, floor);
+                                if (own_used) mem = with;
+                            }
+                        }
+                    }
+                    return strata::core::conversation_memory_admit(avail, additional, floor);
                 };
                 while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest())
@@ -11784,6 +11812,10 @@ int main(int argc, char** argv) {
                                  evicted, conversations.size());
                     return true;
                 }
+                if (own_used)
+                    std::fprintf(stderr, "strata serve: conversation cache: admitted with %llu MiB of the file tier's mapped pages "
+                                         "counted as RAM Windows gives back (%s)\n",
+                                 (unsigned long long) (own_reclaim >> 20), ram_note(mem).c_str());
                 if (evicted)
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
@@ -11826,7 +11858,17 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
-                const auto mem_after = strata::core::sample_host_memory();
+                auto mem_after = strata::core::sample_host_memory();
+                // QuantLab 11/18: the floor after the capture counts the file tier's mapped pages on the RAM side too (as the
+                // admission above; the commit side still bounds it): measured, 1-2 of 9 parks were skipped here with
+                // 57-251 MiB available beside ~9 GiB of them
+                if (!strata::core::conversation_memory_admit(
+                        mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor) &&
+                    mem_after && file_srcp != nullptr && srcp == file_srcp) {
+                    const uint64_t own_now = file_srcp->reclaimable_mapped_bytes();
+                    if (own_now > 0)
+                        if (auto with = strata::core::sample_host_memory_reclaim(own_now)) mem_after = with;
+                }
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",

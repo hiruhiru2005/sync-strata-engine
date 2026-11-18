@@ -59,6 +59,7 @@ static inline int ql_msvc_popcountll(unsigned long long x) { return (int) __popc
 #define NOMINMAX   // std::numeric_limits<T>::max() below
 #endif
 #include <windows.h>
+#include <psapi.h>   // QuantLab 11/18: K32QueryWorkingSetEx (kernel32's, no psapi.lib)
 #else
 #include <fcntl.h>
 #if defined(__APPLE__)
@@ -3323,6 +3324,42 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
 #else
     why = "through the file cache (no unbuffered reads on this platform)";
     return false;
+#endif
+}
+
+uint64_t FileExpertSource::reclaimable_mapped_bytes() const {
+#if defined(_WIN32)
+    // QuantLab 11/18: with the file tier read through the mapping, the pages it touched stay in this process's working
+    // set (not on the standby list), so the available RAM shows them as taken (measured: 7-9 GiB available unbuffered,
+    // 0.3-0.7 buffered, on a 32 GB PC with a 12.5 GiB RAM copy).  A page every 256 KiB of each open view is asked
+    // (an expert of ~1 MiB gets about four): ~100k entries for a 24 GiB pack, one call, a few ms.  Pages locked into
+    // the working set do not count (they are not given back on a trim).
+    if (!direct_.empty() || unmapped_) return 0;
+    std::vector<std::pair<const uint8_t*, uint64_t>> views;
+    if (maps_.empty()) {
+        if (base_ != nullptr && mapped_bytes_ > 0) views.emplace_back(base_, mapped_bytes_);
+    } else {
+        for (const Map& m : maps_)
+            if (!m.closed && m.base != nullptr && m.bytes > 0) views.emplace_back(m.base, m.bytes);
+    }
+    constexpr uint64_t kPage = 4096, kStride = 64 * kPage;
+    uint64_t total = 0;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> w;
+    for (const auto& v : views) {
+        const uint64_t n = (v.second + kStride - 1) / kStride;
+        if (n == 0 || n * sizeof(PSAPI_WORKING_SET_EX_INFORMATION) > 0x7fffffffull) continue;
+        w.assign((size_t) n, PSAPI_WORKING_SET_EX_INFORMATION{});
+        for (uint64_t i = 0; i < n; ++i)
+            w[(size_t) i].VirtualAddress = (PVOID) (((uintptr_t) v.first + (uintptr_t) (i * kStride)) & ~(uintptr_t) (kPage - 1));
+        if (!K32QueryWorkingSetEx(GetCurrentProcess(), w.data(), (DWORD) (n * sizeof(PSAPI_WORKING_SET_EX_INFORMATION))))
+            continue;
+        uint64_t valid = 0;
+        for (const auto& e : w) valid += (e.VirtualAttributes.Valid && !e.VirtualAttributes.Locked) ? 1 : 0;
+        total += std::min<uint64_t>(v.second, valid * kStride);
+    }
+    return total;
+#else
+    return 0;
 #endif
 }
 
