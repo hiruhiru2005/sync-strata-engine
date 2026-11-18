@@ -66,14 +66,27 @@ bool nvml_device_free(size_t& out) {
     static const Lib lib;
     if (lib.mem == nullptr) return false;
     int dev = 0;
-    cudaDeviceProp prop{};
-    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-    char bus[32];
-    std::snprintf(bus, sizeof bus, "%08X:%02X:%02X.0", (unsigned) prop.pciDomainID, (unsigned) prop.pciBusID,
-                  (unsigned) prop.pciDeviceID);
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    // QuantLab (11/18): the device's NVML handle once (the VRAM pressure reads this every 0.5 s between decode windows)
+    static std::mutex mu;
+    static void* handles[16] = {};
     void* handle = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        handle = handles[dev];
+    }
+    if (handle == nullptr) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+        char bus[32];
+        std::snprintf(bus, sizeof bus, "%08X:%02X:%02X.0", (unsigned) prop.pciDomainID, (unsigned) prop.pciBusID,
+                      (unsigned) prop.pciDeviceID);
+        if (lib.by_bus(bus, &handle) != 0 || handle == nullptr) return false;
+        std::lock_guard<std::mutex> lk(mu);
+        handles[dev] = handle;
+    }
     Memory m{};
-    if (lib.by_bus(bus, &handle) != 0 || lib.mem(handle, &m) != 0) return false;
+    if (lib.mem(handle, &m) != 0) return false;
     out = (size_t) m.free;
     return true;
 }
@@ -158,6 +171,16 @@ size_t device_free_bytes() {
     }
 #endif
     return free_b;
+}
+
+// QuantLab (11/18): see the header
+bool card_free_bytes(size_t& out) {
+#if defined(STRATA_EC_NVML_FREE)
+    return nvml_device_free(out);
+#else
+    (void) out;
+    return false;
+#endif
 }
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,

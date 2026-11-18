@@ -80,6 +80,11 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 /// cudaMemGetInfo does not count what other processes hold.  It can only make the figure smaller.
 size_t device_free_bytes();
 
+/// QuantLab (11/18): the whole card's free VRAM - NVML on Windows with an NVIDIA card (what every process holds counted;
+/// under WDDM cudaMemGetInfo answers for this process alone), for the VRAM pressure's reading.  False where NVML cannot
+/// answer, and on every other platform (the caller keeps cudaMemGetInfo's figure).
+bool card_free_bytes(size_t& out);
+
 /// One piece of an expert blob that lives contiguously in a source's own memory: `n` bytes at `p`, to land `at` bytes into the blob.
 struct BlobPart { const uint8_t* p; uint64_t n; uint64_t at; };
 

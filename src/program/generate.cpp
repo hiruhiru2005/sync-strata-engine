@@ -9200,6 +9200,13 @@ int main(int argc, char** argv) {
         // halving), down to the chunk `top_cap` keeps room for.  `top0`: where the loan started; kvg_trim moves back to it.
         bool loan = false;
         int64_t top0 = 0, top_cap = 0, loan_min_chunk = 0, loan_taken = 0;
+        // QuantLab (11/18): the chunks the VRAM pressure gave back to the driver (kvg_ensure's `release`; kvg_trim's `back`
+        // maps them again)
+        int64_t vram_out = 0;
+        // QuantLab (11/18): how far the VRAM pressure (only it) may go into the loan: room for a 256-token chunk, not
+        // top_cap's STRATA_QL_KV_LOAN_MIN_CHUNK (1024).  An 8 GB card gave 316 of the 768 MiB another program took and
+        // stalled at top_cap; a prompt read then halves its chunk down to 256 until the pressure eases.
+        int64_t top_cap_vpr = 0;
     } kvg;
     auto kvg_start = [&](int64_t top, int64_t top_cap = -1) {
         kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
@@ -9314,10 +9321,15 @@ int main(int argc, char** argv) {
     };
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
-    auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
-        if (!kvg.on || cells <= kvg.cells) return true;
-        const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
-        const int64_t need = strata::core::qsa_kv_elastic_need(target);
+    // QuantLab (11/18): `release` > 0 (the VRAM pressure, vpr below): that many chunks go back to the driver instead of
+    // into the K/V - the spare ones first, then the slots the K/V would give (below the loan, then the loan's lowest).
+    // False when nothing could go.
+    auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce, int64_t release = 0) -> bool {
+        if (release > 0 && (!kvg.on || kvg.fresh_only)) return false;
+        if (release <= 0 && (!kvg.on || cells <= kvg.cells)) return true;
+        const int64_t target = release > 0 ? kvg.cells
+                                           : std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
+        const int64_t need = release > 0 ? release : strata::core::qsa_kv_elastic_need(target);
         if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); return true; }
         quiesce();
         if (kvg.fresh_only) {   // QuantLab (11/17, I-16): no slot to give (kvg_start): new VRAM only
@@ -9503,7 +9515,9 @@ int main(int argc, char** argv) {
         }
         // QuantLab (10/31), STRATA_QL_KV_LOAN: past the floor, the loan's lowest slots (it starts higher: `top` moves up)
         int64_t took = 0;
-        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.loan && kvg.top < kvg.top_cap) {
+        // (QuantLab 11/18: the VRAM pressure may go further, to a 256-token chunk's room - kvg.top_cap_vpr)
+        const int64_t loan_cap = release > 0 ? std::max<int64_t>(kvg.top_cap, kvg.top_cap_vpr) : kvg.top_cap;
+        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.loan && kvg.top < loan_cap) {
             init_owner();
             const int32_t s = (int32_t) kvg.top;
             if (const int32_t so = owner[(size_t) s]; so >= 0)   // it is no colder slot to move into any more
@@ -9534,6 +9548,26 @@ int main(int argc, char** argv) {
             cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
             std::fprintf(stderr, "strata: the residency table upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
+        }
+        if (release > 0) {   // QuantLab (11/18): the VRAM pressure - the chunks go back to the driver, the K/V stays as it is
+            int64_t freed = 0;
+            while (freed < release && !kvg.spare.empty()) {
+                strata::core::vmm_chunk_free(kvg.spare.back());
+                kvg.spare.pop_back();
+                ++freed;
+            }
+            kvg.vram_out += freed;
+            kvg.loan_taken += took;
+            kvg.ql_demoted += q_demoted;
+            kvg.ql_in_ram += q_in_ram;
+            kvg.ql_on_file += q_on_file;
+            std::fprintf(stderr, "strata: QuantLab: VRAM pressure: the expert cache gave %lld slots (%lld of them out of the "
+                                 "prompt path's loan; %lld hotter experts moved into colder ones' slots) and %lld MiB back to "
+                                 "the driver; %lld of %lld slots hold experts, %lld MiB given back in all\n",
+                         (long long) gave, (long long) took, (long long) moved, (long long) (((uint64_t) freed * G) >> 20),
+                         (long long) (kvg.lo + (xcache.slots() - kvg.top)), (long long) xcache.slots(),
+                         (long long) (((uint64_t) kvg.vram_out * G) >> 20));
+            return freed > 0;
         }
         int64_t fresh = 0;
         auto grow_take = [&]() -> strata::core::VmmChunk {
@@ -9583,30 +9617,50 @@ int main(int argc, char** argv) {
     };
     // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
     // profile's hottest experts the GPU does not hold.  Run on a quiet device (as kvg_ensure's `quiesce`).
-    auto kvg_trim = [&](int64_t cells, int64_t hold) -> bool {   // `hold`: the cells a parked conversation could need
+    // QuantLab (11/18): `back` > 0 (the VRAM pressure eased, vpr below): that many chunks of new VRAM go back into the
+    // cache - first the loan's slots the pressure took (top down to where the loan started), then from the lowest
+    // unmapped chunk up - and those slots refill as here; the K/V stays as it is
+    auto kvg_trim = [&](int64_t cells, int64_t hold, int64_t back = 0) -> bool {   // `hold`: the cells a parked conversation could need
         if (!kvg.on || kvg.fresh_only) return true;   // (QuantLab 11/17: fresh_only gives nothing back)
-        // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
-        // size is grown again (its experts shuffled again) after every short request in between: the K/V keeps the
-        // longest parked conversation's cells while it is parked
-        const int64_t want = std::max<int64_t>(cells, hold);
-        const int64_t target = std::max<int64_t>(kvg.step, (want + kvg.step - 1) / kvg.step * kvg.step);
-        if (kvg.cells < target + 2 * kvg.step || kvg.lo >= kvg.top) return true;
-        strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvg.spare.push_back(h); });
-        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        if (back > 0) {
+            if (kvg.lo >= kvg.top) return true;
+        } else {
+            // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
+            // size is grown again (its experts shuffled again) after every short request in between: the K/V keeps the
+            // longest parked conversation's cells while it is parked
+            const int64_t want = std::max<int64_t>(cells, hold);
+            const int64_t target = std::max<int64_t>(kvg.step, (want + kvg.step - 1) / kvg.step * kvg.step);
+            if (kvg.cells < target + 2 * kvg.step || kvg.lo >= kvg.top) return true;
+            strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvg.spare.push_back(h); });
+            kvg.cells = strata::core::qsa_kv_elastic_cells();
+        }
         strata::core::VmmRange& r = *xcache.vmm_range();
         const uint64_t G = strata::core::vmm_granularity();
+        int64_t newc = 0;   // QuantLab (11/18): chunks of new VRAM asked for (map_range makes one where `take` gives 0)
+        auto take = [&]() -> strata::core::VmmChunk {   // the chunks handed back first
+            if (kvg.spare.empty()) { ++newc; return 0; }
+            const strata::core::VmmChunk h = kvg.spare.back();
+            kvg.spare.pop_back();
+            return h;
+        };
+        const int64_t top_was = kvg.top;
+        while (back > 0 && newc < back && kvg.top > kvg.top0 && kvg.top > kvg.lo) {   // QuantLab (11/18): the loan's first
+            const int64_t s = kvg.top - 1;
+            if (!r.map_range((int64_t) (xcache.slot_offset(s) / G), (int64_t) ((xcache.slot_offset(s + 1) + G - 1) / G),
+                             take)) {
+                std::fprintf(stderr, "strata: QuantLab: the expert cache could not take VRAM back from the driver\n");
+                break;
+            }
+            --kvg.top;
+        }
         const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
         {   // one run from the lowest unmapped chunk, as long as the chunks handed back last (one access call)
             const int64_t c0 = (int64_t) (xcache.slot_offset(kvg.lo) / G);
-            int64_t cend = c0, need = (int64_t) kvg.spare.size();
+            int64_t cend = c0, need = (int64_t) kvg.spare.size() + (back > 0 ? std::max<int64_t>(0, back - newc) : 0);
             while (cend < c1 && need > 0) need -= r.mapped(cend++) ? 0 : 1;
-            if (!r.map_range(c0, cend, [&]() -> strata::core::VmmChunk {
-                    if (kvg.spare.empty()) return 0;
-                    const strata::core::VmmChunk h = kvg.spare.back();
-                    kvg.spare.pop_back();
-                    return h;
-                }))
-                std::fprintf(stderr, "strata: the expert cache could not take its VRAM back from the K/V\n");
+            if (!r.map_range(c0, cend, take))
+                std::fprintf(stderr, back > 0 ? "strata: QuantLab: the expert cache could not take VRAM back from the driver\n"
+                                              : "strata: the expert cache could not take its VRAM back from the K/V\n");
         }
         const int64_t lo0 = kvg.lo;
         while (kvg.lo < kvg.top) {   // a slot whose chunks are all mapped again holds an expert again
@@ -9625,7 +9679,10 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> ql_used;     // ...and the pairs taken (a profile listing a pair twice fills one slot)
         int64_t q_ram = 0, q_file = 0;
         if (kvg.ql) ql_used.assign(host_res.size(), 0);
-        for (int64_t s = lo0; s < kvg.lo; ++s) {
+        std::vector<int64_t> fill_slots;   // QuantLab (11/18): the loan's slots back from the driver (`back`), then [lo0, lo)
+        for (int64_t s = kvg.top; s < top_was; ++s) fill_slots.push_back(s);
+        for (int64_t s = lo0; s < kvg.lo; ++s) fill_slots.push_back(s);
+        for (const int64_t s : fill_slots) {
             const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
             if (kvg.ql) {
                 // QuantLab (10/29): slots sized per expert - a pair too large for this slot is tried again for the next ones
@@ -9690,9 +9747,19 @@ int main(int argc, char** argv) {
         if (res_put(d_res) != cudaSuccess) return false;
         for (const strata::core::VmmChunk h : kvg.spare) strata::core::vmm_chunk_free(h);   // new ones, if any
         kvg.spare.clear();
-        ++kvg.trims;
-        std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
-                             "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+        if (back > 0) {   // QuantLab (11/18)
+            kvg.vram_out = std::max<int64_t>(0, kvg.vram_out - newc);
+            std::fprintf(stderr, "strata: QuantLab: VRAM pressure eased: the expert cache took %lld MiB back from the driver "
+                                 "for %lld slots (%zu refilled from the profile); %lld of %lld slots hold experts, %lld MiB "
+                                 "still given back\n",
+                         (long long) (((uint64_t) newc * G) >> 20), (long long) (kvg.lo - lo0 + top_was - kvg.top),
+                         filled.size(), (long long) (kvg.lo + (xcache.slots() - kvg.top)), (long long) xcache.slots(),
+                         (long long) (((uint64_t) kvg.vram_out * G) >> 20));
+        } else {
+            ++kvg.trims;
+            std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
+                                 "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+        }
         // QuantLab (10/31), STRATA_QL_KV_LOAN: every slot back (the loan's too): the loan starts where it did at start again
         if (kvg.lo >= kvg.top && kvg.top > kvg.top0) {
             std::fprintf(stderr, "strata: QuantLab: the K/V gave the prompt path's loan its %lld slots back: it starts at "
@@ -9703,6 +9770,124 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata: QuantLab: K/V trim: %zu of those slots refilled with the hottest experts the GPU "
                                  "did not hold that fit them, %lld from the RAM copy, %lld from the drive\n",
                          filled.size(), (long long) q_ram, (long long) q_file);
+        return true;
+    };
+    // QuantLab (11/18, the user via strata-desktop): the VRAM pressure.  When another program takes VRAM while the engine
+    // runs (the display, a browser, a game), the free VRAM falls to 0, WDDM pages GPU memory to system RAM and decode
+    // stalls (no progress for 60 s, then a restart: the 11/17 night, a reserve of 512 MiB).  The engine now gives expert
+    // slots back to the driver itself, the way the elastic K/V takes them (kvg_ensure's `release`): below
+    // STRATA_QL_VRAM_PRESSURE_LOW MiB free (default 128) for 2 s - read every 0.5 s between decode windows - or at a
+    // request's start (at once there), one step of STRATA_QL_VRAM_PRESSURE_STEP MiB (default 256) goes, down to the K/V's
+    // floor (128 slots, and the loan's smallest chunk).  Once step + low + 128 MiB (512) stay free for 30 s (10 s for the
+    // steps after), a request's start takes a step back (kvg_trim's `back`: new VRAM, the slots refilled from the
+    // profile) until all of it is back.  Not "the reserve + 512 MiB": an 8 GB card at a reserve of 512 has ~300 MiB free,
+    // so a cache shrunk once would never come back.  Nothing moves while the free VRAM stays above the low line, so a card
+    // that never runs short decodes as before (one cudaMemGetInfo every 0.5 s).  Needs the elastic K/V's slots (--kv-grow
+    // on one NVIDIA GPU, a cache with slots to give).  STRATA_QL_VRAM_PRESSURE=0: off.
+    struct VramPressure {
+        bool on = false, said_floor = false, low_run = false, high_run = false, backing = false;
+        int64_t low_mib = 128, step_mib = 256, back_mib = 512, step_chunks = 0, shrinks = 0, grows = 0;
+        Clock::time_point last{}, low_since{}, high_since{};
+    } vpr;
+    auto vpr_start = [&]() {
+        const char* v = std::getenv("STRATA_QL_VRAM_PRESSURE");
+        if (v != nullptr && v[0] == '0') {
+            std::fprintf(stderr, "strata serve: QuantLab: VRAM pressure: off (STRATA_QL_VRAM_PRESSURE=0)\n");
+            return;
+        }
+        if (!o.serve) return;
+#if defined(STRATA_USE_HIP)
+        // QuantLab (11/18, the owner): on Radeon (HIP: hipMem* virtual memory, ROCm 6+) off by default until it has been
+        // tried there - STRATA_QL_VRAM_PRESSURE=1 turns it on
+        if (v == nullptr || v[0] != '1') {
+            std::fprintf(stderr, "strata serve: QuantLab: VRAM pressure: off on HIP by default (STRATA_QL_VRAM_PRESSURE=1 "
+                                 "turns it on)\n");
+            return;
+        }
+#endif
+        const char* why = !kvg.on || xcache.vmm_range() == nullptr ? "no elastic K/V (--kv-grow on one GPU)"
+                        : kvg.fresh_only ? "the expert cache has no slot to give"
+                        : strata::core::vmm_granularity() == 0 ? "no virtual memory (VMM)" : "";
+        if (why[0] != '\0') {
+            std::fprintf(stderr, "strata serve: QuantLab: VRAM pressure: off (%s): the expert cache does not give VRAM back "
+                                 "when other programs take it\n", why);
+            return;
+        }
+        if (const char* e = std::getenv("STRATA_QL_VRAM_PRESSURE_LOW"); e != nullptr && std::atoll(e) > 0) vpr.low_mib = std::atoll(e);
+        if (const char* e = std::getenv("STRATA_QL_VRAM_PRESSURE_STEP"); e != nullptr && std::atoll(e) >= 16) vpr.step_mib = std::atoll(e);
+        vpr.back_mib = vpr.step_mib + vpr.low_mib + 128;
+        vpr.step_chunks = std::max<int64_t>(1, (int64_t) (((uint64_t) vpr.step_mib << 20) / strata::core::vmm_granularity()));
+        vpr.on = true;
+        size_t cb = 0;
+        const bool card = strata::core::card_free_bytes(cb);
+        std::fprintf(stderr, "strata serve: QuantLab: VRAM pressure: on - below %lld MiB of VRAM free for 2 s (below %lld at "
+                             "once; read between decode windows and at a request's start, %s) the expert cache gives %lld "
+                             "MiB back to the driver, a step at a time down to %lld slots, and takes it back a step at a "
+                             "time once %lld MiB stay free for 30 s (STRATA_QL_VRAM_PRESSURE=0: off)\n",
+                     (long long) vpr.low_mib, (long long) (vpr.low_mib / 2),
+                     card ? "the whole card's figure (NVML)" : "this process's figure (cudaMemGetInfo)",
+                     (long long) vpr.step_mib, (long long) kvg.floor, (long long) vpr.back_mib);
+    };
+    // `at_start`: a request's start (nothing runs on the device; it may take a step back); otherwise between decode
+    // windows.  False: a step back failed on the device (the caller stops, as for kvg_trim).
+    auto vpr_tick = [&](bool at_start, const std::function<void()>& quiesce) -> bool {
+        if (!vpr.on) return true;
+        const auto now = Clock::now();
+        if (!at_start && now - vpr.last < std::chrono::milliseconds(500)) return true;
+        vpr.last = now;
+        for (int k = 0; k < (at_start ? 4 : 1); ++k) {
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return true;
+            }
+            // under WDDM cudaMemGetInfo does not count what other programs hold (a ballast taking every free MiB left it at
+            // ~300 MiB while the card was full, 11/18): the whole card's figure where NVML answers
+            if (size_t cb = 0; strata::core::card_free_bytes(cb)) fb = std::min(fb, cb);
+            const int64_t free_mib = (int64_t) (fb >> 20);
+            if (free_mib >= vpr.low_mib) {
+                vpr.low_run = false;
+                vpr.said_floor = false;
+                if (kvg.vram_out <= 0 || free_mib < vpr.back_mib) {
+                    vpr.high_run = vpr.backing = false;
+                    return true;
+                }
+                if (!vpr.high_run) {
+                    vpr.high_run = true;
+                    vpr.high_since = now;
+                }
+                if (!at_start || now - vpr.high_since < std::chrono::seconds(vpr.backing ? 10 : 30)) return true;
+                quiesce();
+                if (!kvg_trim(0, 0, std::min<int64_t>(vpr.step_chunks, kvg.vram_out))) return false;
+                ++vpr.grows;
+                vpr.backing = true;
+                vpr.high_since = now;
+                return true;
+            }
+            vpr.high_run = vpr.backing = false;
+            if (!vpr.low_run) {
+                vpr.low_run = true;
+                vpr.low_since = now;
+            }
+            // below half the low line it acts at once: the card is about to page (a window that waits on WDDM then
+            // stalls for good, 11/18)
+            if (vpr.said_floor ||
+                (!at_start && free_mib >= vpr.low_mib / 2 && now - vpr.low_since < std::chrono::seconds(2)))
+                return true;
+            std::fprintf(stderr, "strata serve: QuantLab: VRAM pressure: %lld MiB of VRAM free (below %lld MiB %s)\n",
+                         (long long) free_mib, (long long) vpr.low_mib,
+                         at_start ? "at a request's start" : free_mib < vpr.low_mib / 2 ? "- at once" : "for 2 s");
+            if (!kvg_ensure(0, quiesce, vpr.step_chunks)) {
+                vpr.said_floor = true;
+                std::fprintf(stderr, "strata serve: QuantLab: VRAM pressure: the expert cache has no more to give (%lld of "
+                                     "%lld slots hold experts, %lld MiB given back)\n",
+                             (long long) (kvg.lo + (xcache.slots() - kvg.top)), (long long) xcache.slots(),
+                             (long long) (((uint64_t) kvg.vram_out * strata::core::vmm_granularity()) >> 20));
+                return true;
+            }
+            ++vpr.shrinks;
+            vpr.low_since = now;   // between windows the next step waits for the low to last again
+        }
         return true;
     };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
@@ -10640,7 +10825,8 @@ int main(int argc, char** argv) {
         // and the K/V's loan (768 / 256 / 1024 tokens at a reserve of 256 / 512 / 768 MiB, 11/17 night), and at 3328
         // tokens the chunk walk still waits on the stream.  The share follows the bytes: an RTX 3080 held to 8 GB
         // (Sync-XS, a 1024-3328-token chunk) prices 0.39-0.67 and reads in layer-major; 10-12 GB (4608-8192 tokens,
-        // 0.20-0.33) keeps the chunk walk exactly as before, as measured (pf-smooth-1117.md).  On one GPU with a loan,
+        // 0.20-0.33) keeps the chunk walk by the share alone - but a card of at most 12 GiB reads layer-major anyway since
+        // 11/18 (small_card below: measured faster on 12 GB, decode equal).  On one GPU with a loan,
         // and when the walk runs this model's experts.  An explicit STRATA_PREFILL_LAYER_MAJOR (1: the opt-in walk as
         // before, 0: off) wins; STRATA_PREFILL_LM_AUTO_CHUNK=N (tokens) is the old rule (a start-up chunk of at most N;
         // 0: off).  Measured on an RTX 3080 held to 7 GiB, Sync-S, 19.6K prompt: 381 -> 1,607 tok/s.
@@ -10670,13 +10856,27 @@ int main(int argc, char** argv) {
             }
             double min_share = 0.35;
             if (shv != nullptr && shv[0] != '\0') min_share = std::atof(shv);
+            // QuantLab (11/18, the owner: "A on 12 GB too"): a card of at most STRATA_PREFILL_LM_AUTO_GIB GiB (default 12;
+            // 0: off) reads layer-major whatever its share.  Measured on an RTX 3080 12 GB, Sync-S, 262144 k8v4, reserve
+            // 768, A against B 4 times each (share 20%): prefill 1k +25%, 13K +19%, 30K +10%, a 7.2K dsh prompt +21%;
+            // decode equal (jbench R4 142.6 / 142.3 tok/s, the dsh conversation's 400-token answers 91.9 / 91.0).
+            // A larger card keeps the share rule (unmeasured there).
+            double small_gib = 12.0;
+            if (const char* gv = std::getenv("STRATA_PREFILL_LM_AUTO_GIB"); gv != nullptr && gv[0] != '\0') small_gib = std::atof(gv);
+            double card_gib = 0.0;
+            {
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) card_gib = (double) tb / 1073741824.0;
+                else (void) cudaGetLastError();
+            }
+            const bool small_card = small_gib > 0.0 && card_gib > 0.0 && card_gib <= small_gib + 0.25;
             const bool by_chunk = cv != nullptr && cv[0] != '\0';
             const int64_t lm_max_chunk = by_chunk ? (int64_t) std::atoll(cv) : 0;
             char said[200];
             std::snprintf(said, sizeof said, "a %lld-token chunk streams %.1f GiB at %.1f GB/s, %.0f%% of its time",
                           (long long) walk_chunk, stream_gib, h2d, share >= 0.0 ? 100.0 * share : 0.0);
             const bool want = by_chunk ? (lm_max_chunk > 0 && o.prefill_chunk <= lm_max_chunk)
-                                       : (share >= 0.0 && min_share > 0.0 && share >= min_share);
+                                       : (share >= 0.0 && ((min_share > 0.0 && share >= min_share) || small_card));
             if (lv != nullptr && lv[0] != '\0') {
                 std::fprintf(stderr, "strata serve: QuantLab pf-smooth: STRATA_PREFILL_LAYER_MAJOR=%s decides (%s)\n", lv, said);
             } else if (want) {
@@ -10691,9 +10891,10 @@ int main(int argc, char** argv) {
                                  (long long) o.prefill_chunk, (long long) lm_max_chunk, said);
                 else if (pf_lm_auto)
                     std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts of 2 chunks or more read layer-major (%s; "
-                                         "on from %.0f%%): each layer's experts once per super-chunk, its buffers in the "
-                                         "prompt's loan (STRATA_PREFILL_LAYER_MAJOR=0: off)\n",
-                                 said, 100.0 * min_share);
+                                         "on from %.0f%%, or on a card of at most %.0f GiB - this one %.1f GiB): each layer's "
+                                         "experts once per super-chunk, its buffers in the prompt's loan "
+                                         "(STRATA_PREFILL_LAYER_MAJOR=0: off)\n",
+                                 said, 100.0 * min_share, small_gib, card_gib);
                 else
                     std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts stay on the chunk walk: %s\n", why.c_str());
             } else if (by_chunk) {
@@ -10702,7 +10903,8 @@ int main(int argc, char** argv) {
                              (long long) o.prefill_chunk, (long long) lm_max_chunk, said);
             } else if (share >= 0.0) {
                 std::fprintf(stderr, "strata serve: QuantLab pf-smooth: prompts stay on the chunk walk (%s; layer-major "
-                                     "from %.0f%%)\n", said, 100.0 * min_share);
+                                     "from %.0f%%, or on a card of at most %.0f GiB - this one %.1f GiB)\n", said,
+                             100.0 * min_share, small_gib, card_gib);
             }
         }
         // #340: STRATA_SPLIT_SMALL_OWN=S (tokens): on a layer split, every stage that borrows keeps the slots for an
@@ -10754,8 +10956,13 @@ int main(int argc, char** argv) {
                 for (int64_t c = 256; c <= mc; c += 256) keep = std::max<int64_t>(keep, part_slots(pf_parts[0], c));
                 if (keep > 0 && keep + 128 <= xcache.slots()) top_cap = std::max<int64_t>(lend_first, xcache.slots() - keep);
                 kvg.loan_min_chunk = mc;
+                // QuantLab (11/18): the VRAM pressure's own cap, a 256-token chunk's room (kvg.top_cap_vpr)
+                const int64_t keep256 = part_slots(pf_parts[0], 256);
+                if (keep256 > 0 && keep256 + 128 <= xcache.slots())
+                    kvg.top_cap_vpr = std::max<int64_t>(lend_first, xcache.slots() - keep256);
             }
             kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots(), top_cap);
+            vpr_start();   // QuantLab (11/18): the VRAM pressure (after the elastic K/V)
         }
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
@@ -13269,8 +13476,15 @@ int main(int argc, char** argv) {
             // slow, not stuck; it gets up to STRATA_WATCHDOG_IO_S (default 10 x the limit) of such time. 0 = no allowance.
             const char* wio = std::getenv("STRATA_WATCHDOG_IO_S");
             const int io_limit = wio ? std::atoi(wio) : limit * 10;
+            // QuantLab (11/18): with the whole card's VRAM full (NVML: below 128 MiB free - 88 MiB in the stall seen), a step silent for
+            // STRATA_QL_STALL_FULL_S (default 10; 0: off) is the WDDM stall - the driver pages while the GPU spins on the
+            // window's flags, the copies that raise them wait on the paging, and nothing moves until the GPU waits are
+            // released, after which the engine must start again (#267).  It stops then instead of after `limit` s: the
+            // same restart, ~50 s sooner.  (Another program taking more VRAM than the card has, at once, 11/18.)
+            const char* wfull = std::getenv("STRATA_QL_STALL_FULL_S");
+            const int full_limit = wfull ? std::atoi(wfull) : 10;
             if (limit > 0)
-                std::thread([limit, io_limit] {
+                std::thread([limit, io_limit, full_limit] {
                     strata::platform::name_this_thread("strata-watchdog");
                     strata::aux_cpus::pin_current_thread();
                     strata::core::Progress& p = strata::core::progress();
@@ -13290,8 +13504,14 @@ int main(int argc, char** argv) {
                             if (a >= io_last + 16) io_active_at = now;   // 16 = faults + MiB read in a second: busy
                             io_last = a;
                         }
-                        if (now - since < std::chrono::seconds(limit)) continue;
-                        if (io_limit > limit && now - io_since < std::chrono::seconds(io_limit)) {
+                        int64_t full_mib = -1;   // QuantLab (11/18): the card's free VRAM when the full-card rule fired
+                        if (now - since < std::chrono::seconds(limit)) {
+                            if (full_limit <= 0 || full_limit >= limit || now - since < std::chrono::seconds(full_limit)) continue;
+                            size_t cb = 0;
+                            if (!strata::core::card_free_bytes(cb) || (cb >> 20) >= 128) continue;
+                            full_mib = (int64_t) (cb >> 20);
+                        }
+                        if (full_mib < 0 && io_limit > limit && now - io_since < std::chrono::seconds(io_limit)) {
                             // a thrashing host has seconds with almost no reads (one thread waiting on one page while
                             // swap is written): busy within the last 10 s still counts as slow, not stuck (P2003, 46 GB)
                             if (now - io_active_at < std::chrono::seconds(10)) {
@@ -13306,9 +13526,13 @@ int main(int argc, char** argv) {
                         }
                         // a blocking step's explicit allowance (session files): still within it, not yet stuck
                         if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
+                        if (full_mib >= 0)
+                            std::fprintf(stderr, "strata serve: QuantLab: the card's VRAM is full (%lld MiB free, NVML) and no "
+                                                 "step finished for %d s: the WDDM stall (STRATA_QL_STALL_FULL_S)\n",
+                                         (long long) full_mib, full_limit);
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
                                              "the engine so the server starts it again (issue #29)%s\n",
-                                     limit, stage_text().c_str(),
+                                     full_mib >= 0 ? full_limit : limit, stage_text().c_str(),
                                      launch_blocking() ? "; CUDA_LAUNCH_BLOCKING=1 is set, and no verify window can "
                                                          "finish with it (#1341)" : "");
                         stall_report(stderr, p.ticks.load() - ticks_at);
@@ -15867,6 +16091,41 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     return 1;
                 }
+            }
+            // QuantLab (11/18): the VRAM pressure at a request's start: a step down at once when VRAM is short, a step
+            // back once it has stayed free
+            if (vpr.on && !vpr_tick(true, kv_quiesce)) {
+                std::printf("ERR the expert cache could not take its VRAM back\n");
+                std::fflush(stdout);
+                return 1;
+            }
+            // QuantLab (11/18): every window size's graph before the request's first window.  A capture takes VRAM (14-26
+            // MiB a size); one taken mid-answer on a card another program had just filled went past the card: WDDM paged
+            // while the GPU spun on the window's flags, the copies that raise them waited on the paging, and the window
+            // never finished (60 s, a restart - twice on 11/18, 12 GB and 8 GB).  Captured here, a decode window allocates
+            // nothing new.  A size whose graph finds no VRAM is dropped, as on first use.  With the VRAM pressure on only
+            // (the same graphs as before, captured earlier).
+            if (vpr.on && n_stages == 1) {
+                int took = 0;
+                for (int t = 1; t <= S; ++t) {
+                    if (!policy.allowed(t)) continue;
+                    bool no_vram = false;
+                    std::string perr;
+                    if (ver.prepare(t, no_vram, perr)) {
+                        ++took;
+                        continue;
+                    }
+                    if (no_vram) {
+                        policy.disable(t);
+                        std::fprintf(stderr, "strata serve: no VRAM for the %d-token window graph: that size is dropped, "
+                                             "sizes left %s (a larger --vram-reserve-mib keeps it)\n", t,
+                                     size_list(policy.sizes(), S).c_str());
+                    } else {
+                        std::fprintf(stderr, "strata serve: QuantLab: the %d-token window graph was not captured ahead (%s): "
+                                             "it is captured on first use\n", t, perr.c_str());
+                    }
+                }
+                (void) took;
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
@@ -18490,6 +18749,11 @@ int main(int argc, char** argv) {
                 if (kvg.on && p + T + 64 > kvg.cells &&
                     !kvg_ensure(p + T + 64, adapt_quiesce)) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
+                    return 1;
+                }
+                // QuantLab (11/18): the VRAM pressure between windows (a step down when VRAM stays short)
+                if (vpr.on && !vpr_tick(false, adapt_quiesce)) {
+                    std::printf("ERR the expert cache could not take its VRAM back\n");
                     return 1;
                 }
                 tr("window", p, T);
