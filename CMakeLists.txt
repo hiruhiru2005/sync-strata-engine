@@ -663,6 +663,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # QuantLab (11/19) STRATA_HIP_ARENA: how the RAM experts' copy is taken on AMD (src/core/hip_arena.cu).  HIP builds only: the
+  # CUDA build neither compiles nor links it (expert_source.cpp calls it under #if STRATA_USE_HIP / STRATA_HIP_GFX906).  The
+  # src/*.cu globs of both HIP builds (cmake/hip_backend.cmake, the gfx906 block below) give it LANGUAGE HIP.
+  if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)
+    target_sources(strata_engine PRIVATE src/core/hip_arena.cu)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)

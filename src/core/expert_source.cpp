@@ -21,6 +21,9 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <cuda_runtime.h>
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+#include "strata/core/hip_arena.hpp"   // QuantLab (11/19) STRATA_HIP_ARENA: the RAM copy's allocation on AMD
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1705,7 +1708,12 @@ void FileExpertSource::close() {
     io_stop();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
+        if (complement_pinned_ && !complement_registered_)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+            strata::core::hip_arena::free_arena(complement_arena_);   // (STRATA_HIP_ARENA=register: unregistered and released)
+#else
+            (void) cudaFreeHost(complement_arena_);
+#endif
         else {
             if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
             if (complement_locked_ > 0)   // (QuantLab 11/16: the start-up's offset; plan B of RAM_ELASTIC moves lock_off)
@@ -4695,8 +4703,17 @@ bool FileExpertSource::pin_cache_complement(
         }
 #endif
         if (pin && !paced) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+            // QuantLab (11/19) STRATA_HIP_ARENA (strata/core/hip_arena.hpp): coherent as before, or a coarse-grained block the
+            // GPU may cache, picked by a probe on this card (its line above) - the copy is only read by the GPU, and its places
+            // are rewritten only while no published plan names them (hip_arena.cu says why that is enough)
+            int hip_arena_taken = strata::core::hip_arena::kCoherent;
+            const cudaError_t allocated = strata::core::hip_arena::alloc(
+                &arena, (size_t) bytes, strata::core::hip_arena::choose((size_t) bytes), &hip_arena_taken);
+#else
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
+#endif
             if (allocated == cudaSuccess) {
                 void* alias = nullptr;
                 const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
@@ -4704,10 +4721,17 @@ bool FileExpertSource::pin_cache_complement(
                     device = (const uint8_t*) alias;
                     pinned_ok = true;
                     note = "page-locked and mapped";
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+                    note += std::string(" (") + strata::core::hip_arena::mode_name(hip_arena_taken) + ")";
+#endif
                 } else {
                     note = std::string("no device alias (") + cudaGetErrorString(aliased) + ")";
                     (void) cudaGetLastError();
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+                    strata::core::hip_arena::free_arena(arena);
+#else
                     (void) cudaFreeHost(arena);
+#endif
                     arena = nullptr;
                 }
             } else {
