@@ -298,6 +298,33 @@ double gpu_read_gbs(const void* dev, size_t bytes, Ctx& c) {   // --pcie-mode ke
 
 double copy_gbs(const void* host, size_t bytes, Ctx& c) {   // --pcie-mode dma: the copy engine reads the block
     if (c.d_buf == nullptr || c.buf_bytes == 0) return 0;
+#if defined(_WIN32)
+    // QuantLab (11/20, 0.1.3): Windows HIP: the events do not bracket the copies there (an RX 7800 XT read 1,382 GB/s; the
+    // PCIe probe in generate.cpp found the same on an RX 6800), so each pass is timed on the host between two synchronizes
+    // of the stream.  The region (64 MiB by default) takes ~2.5 ms on an x16 PCIe 4 link, so the synchronize hardly counts,
+    // and it can only make a reading slower, never faster than the link.
+    if (hipStreamSynchronize(c.st) != hipSuccess) {
+        (void) hipGetLastError();
+        return 0;
+    }
+    double best_ms = 0;
+    for (int rep = 0; rep < 3; ++rep) {   // the first one warms up
+        const auto t0 = std::chrono::steady_clock::now();
+        bool ok = true;
+        for (size_t off = 0; off < bytes && ok; off += c.buf_bytes)
+            ok = hipMemcpyAsync(c.d_buf, (const uint8_t*) host + off, std::min(c.buf_bytes, bytes - off), hipMemcpyHostToDevice,
+                                c.st) == hipSuccess;
+        if (!ok || hipStreamSynchronize(c.st) != hipSuccess) {
+            (void) hipGetLastError();
+            (void) hipStreamSynchronize(c.st);
+            best_ms = 0;
+            break;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (rep > 0 && ms > 0 && (best_ms == 0 || ms < best_ms)) best_ms = ms;
+    }
+    return best_ms > 0 ? (double) bytes / (best_ms * 1e6) : 0;
+#else
     hipEvent_t e0 = nullptr, e1 = nullptr;
     if (hipEventCreate(&e0) != hipSuccess || hipEventCreate(&e1) != hipSuccess) {
         (void) hipGetLastError();
@@ -324,6 +351,7 @@ double copy_gbs(const void* host, size_t bytes, Ctx& c) {   // --pcie-mode dma: 
     (void) hipEventDestroy(e0);
     (void) hipEventDestroy(e1);
     return best > 0 ? (double) bytes / ((double) best * 1e6) : 0;
+#endif
 }
 
 // The decode's sequence on the block's first kStaleBytes, twice: a kernel reads it (and says so on a coherent flag), the

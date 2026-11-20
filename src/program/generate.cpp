@@ -54,6 +54,23 @@
 // (default 0.8) longer than the other gets 1/32 of the missed experts moved away from the late side, between
 // STRATA_QL_PCIE_AUTO_LO and _HI (0.2 .. 1.0); the share is remembered across requests (a request's own pcie_frac wins).
 // Single GPU only.  STRATA_QL_PCIE_AUTO_VERBOSE=1 prints each move.
+// QuantLab (11/20, 0.1.3) three changes, because every start began again at --pcie-frac and a short request ended before
+// the share got anywhere (GitHub issue #3: an RX 7800 XT's short answers 90-94 -> 54-59 tok/s with a start of 0.4):
+//  (a) STRATA_QL_PCIE_AUTO_STATE=<file>: the share the last requests settled on is kept there, per pack, GPU, CPU and
+//      --pcie-mode, and the first request after a start begins from it (over --pcie-frac; a request's own pcie_frac still
+//      wins).  What is kept is the moving average of the share over the decisions (each decision moves it 1/8 of the way
+//      to the share it measured at), not the last share: on an RTX 3080 the gap hardly changes between 0.2 and 0.7 and
+//      the share wanders there, so the last one can be an end of that range.  Written after a request that moved it (a
+//      temporary file, then renamed over the old one); a file that cannot be read or holds no entry for this pack and
+//      machine leaves --pcie-frac as the start.
+//  (b) the two last measured points (share, gap) give the slope, and the share jumps to where the gap is 0 (the secant):
+//      at most STRATA_QL_PCIE_AUTO_MAXJUMP (default 0.25), and while both points are on one side (an extrapolation) at
+//      most twice the distance between them, so a noisy pair cannot throw it far.  A slope of the wrong sign (the gap
+//      should fall as the share rises), or two gaps less than the band apart, or a point more than 4 decisions old: the
+//      step of before (1/32 x |gap| / band, 1 .. 4).  The dead band is as before.  STRATA_QL_PCIE_AUTO_SECANT=0: off.
+//  (c) the first STRATA_QL_PCIE_AUTO_FAST decisions after the start (default 4; 0 = off) come every
+//      STRATA_QL_PCIE_AUTO_FAST_EVERY windows (default 4) instead of every 16.
+// Only the measured gap is used: upstream's STRATA_PCIE_BALANCE (an estimate from a cost model) lost 4-8%.
 namespace strata::core {   // QuantLab (11/15) E-B2 (expert_source.cpp)
 void ql_apply_priority();   // STRATA_QL_PRIO_CPU / _GPU
 bool ql_hostsplit_on();     // QuantLab (11/15) STRATA_QL_HOSTSPLIT (expert_source.cpp)
@@ -68,6 +85,18 @@ struct QlPcieAuto {
     bool on = false, verbose = false;
     int every = 16, step = 8, lo = 51, hi = 256, num = -1;
     double band = 0.8;
+    // QuantLab (11/20, 0.1.3)
+    bool secant = true;
+    int max_jump = 64;                    // (b) in 1/256 of the missed experts (0.25)
+    int fast_n = 4, fast_every = 4;       // (c)
+    int decisions = 0;                    // since the start
+    int prev_num = -1, prev_dec = 0;      // (b) the last point measured at another share, and the decision it came from
+    double prev_gap = 0;
+    std::string state_path;               // (a) STRATA_QL_PCIE_AUTO_STATE
+    std::string state_key;
+    int saved_num = -1;                   // what the file holds for this key (or was last written to it)
+    double avg = -1.0;                    // (a) the moving average of the share (1/256), what the file gets
+    bool state_warned = false;
 };
 static QlPcieAuto& ql_pcie_auto() {
     static QlPcieAuto a = [] {
@@ -80,9 +109,19 @@ static QlPcieAuto& ql_pcie_auto() {
         if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_HI")) x.hi = std::max(x.lo, std::min(256, (int) (std::atof(e) * 256.0 + 0.5)));
         const char* vb = std::getenv("STRATA_QL_PCIE_AUTO_VERBOSE");
         x.verbose = vb != nullptr && vb[0] == '1';
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_SECANT")) x.secant = e[0] != '0';
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_MAXJUMP"))
+            x.max_jump = std::max(1, std::min(256, (int) (std::atof(e) * 256.0 + 0.5)));
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_FAST")) x.fast_n = std::max(0, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_FAST_EVERY")) x.fast_every = std::max(2, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_QL_PCIE_AUTO_STATE")) x.state_path = e;
         if (x.on)
             std::fprintf(stderr, "strata: QuantLab STRATA_QL_PCIE_AUTO=1: the PCIe share follows the measured lag every %d "
-                                 "windows, band %.2f ms, %.3f .. %.3f, step 1/32\n", x.every, x.band, x.lo / 256.0, x.hi / 256.0);
+                                 "windows (the first %d decisions every %d), band %.2f ms, %.3f .. %.3f, step 1/32%s (at most "
+                                 "%.3f a jump), the settled share %s%s\n", x.every, x.fast_n, std::min(x.every, x.fast_every),
+                         x.band, x.lo / 256.0, x.hi / 256.0, x.secant ? " or the secant of the last two points" : "",
+                         x.max_jump / 256.0, x.state_path.empty() ? "not kept (no STRATA_QL_PCIE_AUTO_STATE)" : "kept in ",
+                         x.state_path.c_str());
         return x;
     }();
     return a;
@@ -210,6 +249,200 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <string>
 #include <set>
 #include <vector>
+#include <ctime>
+
+// QuantLab (11/20, 0.1.3) STRATA_QL_PCIE_AUTO_STATE (QlPcieAuto (a), above): the settled PCIe share, per pack, GPU, CPU and
+// --pcie-mode.  The file is a small JSON object, {"version": 1, "entries": [{"key": "...", "share": 0.7031, "time": ...},
+// ...]}, at most 8 entries and the newest first (one home may run Sync-S and Sync-M on one machine).  It is read by a scan
+// for each entry's "key" and the "share" after it inside the same braces, so anything else is ignored, and a broken or
+// foreign file reads as holding no entry: the share then starts at --pcie-frac as it always did.
+struct QlPcieStateEntry {
+    std::string key;
+    double share = -1.0;
+    long long time = 0;
+};
+
+static bool ql_pcie_state_read(const std::string& path, std::vector<QlPcieStateEntry>& out, std::string& why) {
+    out.clear();
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) { why = "not there yet"; return false; }
+    constexpr size_t kCap = 64u << 10;
+    std::string s;
+    char buf[4096];
+    size_t got = 0;
+    while (s.size() <= kCap && (got = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, got);
+    std::fclose(f);
+    if (s.size() > kCap) { why = "larger than 64 KiB, not this engine's file"; return false; }
+    constexpr size_t npos = std::string::npos;
+    auto skip_ws = [&](size_t i) {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+        return i;
+    };
+    auto read_str = [&](size_t i, std::string& v) -> size_t {   // at the opening quote; past the closing one, or npos
+        if (i >= s.size() || s[i] != '"') return npos;
+        v.clear();
+        for (++i; i < s.size(); ++i) {
+            if (s[i] == '"') return i + 1;
+            if (s[i] == '\\' && ++i >= s.size()) return npos;   // only \" and \\ are ever written
+            v += s[i];
+        }
+        return npos;
+    };
+    auto number_after = [&](const char* name, size_t from, size_t end, double& v) {   // "name": <number> inside [from, end)
+        const size_t at = s.find(name, from);
+        if (at == npos || at >= end) return false;
+        size_t j = skip_ws(at + std::strlen(name));
+        if (j >= end || s[j] != ':') return false;
+        j = skip_ws(j + 1);
+        char* stop = nullptr;
+        v = std::strtod(s.c_str() + j, &stop);
+        return stop != s.c_str() + j && stop <= s.c_str() + end && std::isfinite(v);
+    };
+    for (size_t pos = 0; (pos = s.find("\"key\"", pos)) != npos;) {
+        size_t i = skip_ws(pos + 5);
+        pos += 5;
+        if (i >= s.size() || s[i] != ':') continue;
+        QlPcieStateEntry e;
+        i = read_str(skip_ws(i + 1), e.key);
+        if (i == npos) break;
+        const size_t end = s.find('}', i);
+        if (end == npos) break;
+        double v = -1.0, t = 0.0;
+        if (number_after("\"share\"", i, end, v) && v >= 0.0 && v <= 1.0 && !e.key.empty()) {
+            e.share = v;
+            if (number_after("\"time\"", i, end, t) && t > 0.0) e.time = (long long) t;
+            out.push_back(e);
+        }
+        pos = end;
+    }
+    if (out.empty()) { why = "no entry could be read from it"; return false; }
+    return true;
+}
+
+// The other entries stay (a broken file: none).  A temporary file next to it, then renamed over it: a reader sees the old
+// file or the new one, never half of one.
+static bool ql_pcie_state_write(const std::string& path, const std::string& key, int num, std::string& why) {
+    std::vector<QlPcieStateEntry> old;
+    std::string ignored;
+    (void) ql_pcie_state_read(path, old, ignored);
+    auto esc = [](const std::string& v) {
+        std::string r;
+        for (const char c : v) {
+            if (c == '"' || c == '\\') r += '\\';
+            r += (unsigned char) c < 0x20 ? ' ' : c;
+        }
+        return r;
+    };
+    auto entry = [&](const std::string& k, double share, long long t) {
+        char sh[32];
+        std::snprintf(sh, sizeof sh, "%.4f", share);
+        return "  {\"key\": \"" + esc(k) + "\", \"share\": " + sh + ", \"time\": " + std::to_string(t) + "}";
+    };
+    std::string s = "{\"version\": 1, \"entries\": [\n" + entry(key, num / 256.0, (long long) std::time(nullptr));
+    int kept = 1;
+    for (const auto& e : old)
+        if (e.key != key && kept < 8) {
+            s += ",\n" + entry(e.key, e.share, e.time);
+            ++kept;
+        }
+    s += "\n]}\n";
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { why = "cannot write " + tmp; return false; }
+    const bool wrote = std::fwrite(s.data(), 1, s.size(), f) == s.size();
+    if (std::fclose(f) != 0 || !wrote) {
+        std::remove(tmp.c_str());
+        why = "the write of " + tmp + " failed";
+        return false;
+    }
+#if defined(_WIN32)
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        why = "the rename over it failed (Windows error " + std::to_string((unsigned long) GetLastError()) + ")";
+        std::remove(tmp.c_str());
+        return false;
+    }
+#else
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        why = std::string("the rename over it failed (") + std::strerror(errno) + ")";
+        std::remove(tmp.c_str());
+        return false;
+    }
+#endif
+    return true;
+}
+
+// The pack (its folder's name and its experts file's size), this GPU and CPU, and the PCIe mode: another pack, machine or
+// mode never starts from this one's share.  Empty when there is no pack or its experts file cannot be read.
+static std::string ql_pcie_state_key(const std::string& pack, const std::string& pcie_mode) {
+    if (pack.empty()) return {};
+    try {
+        namespace fs = std::filesystem;
+        const fs::path p(pack);
+        std::string name = p.filename().string();
+        if (name.empty()) name = p.parent_path().filename().string();
+        std::error_code ec;
+        const auto bytes = fs::file_size(fs::path(strata::core::pack_experts_path(pack)), ec);
+        if (ec || name.empty()) return {};
+        int dev = 0;
+        cudaDeviceProp prop{};
+        const std::string gpu = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess
+                                    ? std::string(prop.name) : std::string("?");
+        (void) cudaGetLastError();
+        const char* mode = pcie_mode == "dma" ? "dma" : pcie_mode == "direct" ? "direct" : "kernel";
+        return "pack=" + name + ":" + std::to_string((unsigned long long) bytes) + "|gpu=" + gpu +
+               "|cpu=" + strata::kernels::cpu::cpu_name() + "|mode=" + mode;
+    } catch (...) {   // a path the narrow code page cannot hold
+        return {};
+    }
+}
+
+// (a) The first request after the start (that leaves the share to the engine): the file's share for this key, else `start`.
+static void ql_pcie_state_load(QlPcieAuto& A, const std::string& pack, const std::string& pcie_mode, int start) {
+    A.num = start;
+    A.saved_num = start;   // written only after the share moved (not the start value of a request that left it alone)
+    A.avg = start;
+    if (A.state_path.empty()) return;
+    A.state_key = ql_pcie_state_key(pack, pcie_mode);
+    if (A.state_key.empty()) {
+        std::fprintf(stderr, "strata ql pcie auto: no pack whose experts file can be read, so the settled share is not kept\n");
+        return;
+    }
+    std::vector<QlPcieStateEntry> es;
+    std::string why;
+    if (!ql_pcie_state_read(A.state_path, es, why)) {
+        std::fprintf(stderr, "strata ql pcie auto: %s: %s - the share starts at --pcie-frac %.3f\n", A.state_path.c_str(),
+                     why.c_str(), start / 256.0);
+        return;
+    }
+    for (const auto& e : es)
+        if (e.key == A.state_key) {
+            A.num = std::max(A.lo, std::min(A.hi, (int) (e.share * 256.0 + 0.5)));
+            A.saved_num = A.num;
+            A.avg = A.num;
+            std::fprintf(stderr, "strata ql pcie auto: the share starts at %.3f, where it settled before (%s; --pcie-frac %.3f)\n",
+                         A.num / 256.0, A.state_path.c_str(), start / 256.0);
+            return;
+        }
+    std::fprintf(stderr, "strata ql pcie auto: %s holds no share for this pack, GPU, CPU and PCIe mode (%s) - the share starts "
+                         "at --pcie-frac %.3f\n", A.state_path.c_str(), A.state_key.c_str(), start / 256.0);
+}
+
+// (a) After a request: the share's moving average, when it moved from what the file holds.  A failure is said once and
+// changes nothing else.
+static void ql_pcie_state_save(QlPcieAuto& A) {
+    if (A.state_path.empty() || A.state_key.empty() || A.num < 0) return;
+    const int keep = A.avg >= 0.0 ? std::max(A.lo, std::min(A.hi, (int) std::lround(A.avg))) : A.num;
+    if (keep == A.saved_num) return;
+    std::string why;
+    if (ql_pcie_state_write(A.state_path, A.state_key, keep, why)) {
+        A.saved_num = keep;
+        std::fprintf(stderr, "strata ql pcie auto: the share %.3f kept in %s (the moving average; now %.3f)\n", keep / 256.0,
+                     A.state_path.c_str(), A.num / 256.0);
+    } else if (!A.state_warned) {
+        A.state_warned = true;
+        std::fprintf(stderr, "strata ql pcie auto: the settled share could not be kept: %s\n", why.c_str());
+    }
+}
 
 // logprobs=K / allowed=...: one `LP` line for the token just emitted, from `ver`'s head
 // logits for the window row it came from (before sampling, penalties and temperature).
@@ -17544,8 +17777,12 @@ int main(int argc, char** argv) {
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // QuantLab (11/15) STRATA_QL_PCIE_AUTO=1 (E-B): the share the last request ended with, unless this one sets its own
             if (ql_pcie_auto().on && !req_pcie_set && split_drive.n <= 1) {
-                if (ql_pcie_auto().num < 0) ql_pcie_auto().num = drive.d.pcie_num;
-                drive.d.pcie_num = ql_pcie_auto().num;
+                auto& A = ql_pcie_auto();
+                if (A.num < 0) {   // QuantLab (11/20, 0.1.3) (a): the first such request starts from the settled share
+                    if (strata::core::ql_pcie_layer_on()) A.num = drive.d.pcie_num;   // E-B2: the share stays, its offset moves
+                    else ql_pcie_state_load(A, o.pack, o.pcie_mode, drive.d.pcie_num);
+                }
+                drive.d.pcie_num = A.num;
             }
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -18854,7 +19091,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata: QuantLab profiler range on at decode window %lld\n", ql_pw_n);
                 }
                 strata::kernels::ql_lag_window_begin();   // QuantLab (11/15) STRATA_QL_LAG (nothing when off)
-                if (ql_pcie_auto().on && !req_pcie_set && split_drive.n <= 1 && ++pa_n >= ql_pcie_auto().every) {
+                // QuantLab (11/20, 0.1.3) (c): the first decisions after the start come sooner
+                if (ql_pcie_auto().on && !req_pcie_set && split_drive.n <= 1 &&
+                    ++pa_n >= (ql_pcie_auto().decisions < ql_pcie_auto().fast_n
+                                   ? std::min(ql_pcie_auto().every, ql_pcie_auto().fast_every) : ql_pcie_auto().every)) {
                     // E-B: the GPU's wait for the CPU rows against the host's wait for the GPU's experts over the last
                     // windows (both per window); the slower side gives up 1/32 of the missed experts, inside a dead band
                     if (strata::kernels::QlLag* L = strata::kernels::ql_lag_host()) {
@@ -18870,17 +19110,51 @@ int main(int argc, char** argv) {
                         // takes the CPU or the GPU away is followed within a few decisions (16 windows ~ 0.3-0.4 s each)
                         const double gap = gw - cw;
                         const int mult = A.band > 0.0 ? std::max(1, std::min(4, (int) (std::fabs(gap) / A.band))) : 1;
+                        const int cur = num;
+                        const char* how = "";
                         if (strata::core::ql_pcie_layer_on()) {   // E-B2: the share stays, the per-layer offset moves
                             if (gap > A.band) strata::core::ql_pcie_layer_beta_add(-0.125 * mult);      // the GPU waits: more over PCIe
                             else if (-gap > A.band) strata::core::ql_pcie_layer_beta_add(0.125 * mult);  // the CPU waits: fewer
-                        } else {
-                        if (gap > A.band) num += A.step * mult;        // the CPU is late: more of the missed experts over PCIe
-                        else if (-gap > A.band) num -= A.step * mult;  // the GPU is late: more of them on the CPU
+                        } else if (std::fabs(gap) > A.band) {
+                            int d = 0;
+                            // QuantLab (11/20, 0.1.3) (b): the secant through the last point measured at another share.  The
+                            // gap falls as the share rises (more over PCIe: the GPU waits less for the CPU rows, the CPU more
+                            // for the GPU), so a slope that is not negative, or two gaps less than the band apart (the noise
+                            // of one text: 1-12 ms a window), or a point more than 4 decisions old, leaves the step of before.
+                            if (A.secant && A.prev_num >= 0 && A.prev_num != cur && A.decisions - A.prev_dec <= 4) {
+                                const double dg = gap - A.prev_gap, dn = (double) (cur - A.prev_num);
+                                if (dg / dn < 0.0 && std::fabs(dg) >= A.band) {
+                                    // both points on one side of 0: an extrapolation, at most twice their distance; between
+                                    // them: the interpolated share, which lies between the two
+                                    const bool between = (gap > 0.0) != (A.prev_gap > 0.0);
+                                    const double cap = between ? (double) A.max_jump
+                                                               : std::min((double) A.max_jump, 2.0 * std::fabs(dn));
+                                    const double jump = std::max(-cap, std::min(cap, -gap * dn / dg));
+                                    d = (int) std::lround(jump);
+                                    if (d == 0) d = gap > 0.0 ? 1 : -1;
+                                    how = between ? " (secant, between the last two)" : " (secant)";
+                                }
+                            }
+                            if (d == 0) {
+                                d = (gap > 0.0 ? 1 : -1) * A.step * mult;   // the CPU is late: more over PCIe; the GPU: more on the CPU
+                                how = " (step)";
+                            }
+                            num = cur + d;
                         }
                         num = std::max(A.lo, std::min(A.hi, num));
+                        if (!strata::core::ql_pcie_layer_on()) {   // (a): the share this decision measured at, 1/8 of the way
+                            if (A.avg < 0.0) A.avg = cur;
+                            A.avg += ((double) cur - A.avg) / 8.0;
+                        }
+                        if (num != cur) {   // the next decision measures at the new share: this one is the point before it
+                            A.prev_num = cur;
+                            A.prev_gap = gap;
+                            A.prev_dec = A.decisions;
+                        }
+                        ++A.decisions;
                         if (A.verbose)   // every decision (E-G: the load arms read how the share follows)
                             std::fprintf(stderr, "strata ql pcie auto: GPU waited %.2f, CPU waited %.2f ms/window over %d windows -> "
-                                                 "share %.3f%s%.3f\n", gw, cw, pa_n, num / 256.0,
+                                                 "share %.3f%s%s%.3f\n", gw, cw, pa_n, num / 256.0, num != cur ? how : "",
                                          strata::core::ql_pcie_layer_on() ? ", beta " : "",
                                          strata::core::ql_pcie_layer_on() ? strata::core::ql_pcie_layer_beta() : 0.0);
                         if (num != drive.d.pcie_num) ++pa_moves;
@@ -19143,6 +19417,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             strata::core::ql_pred_end(drive.d);   // QuantLab (11/13) STRATA_QL_PREDICT_STATS: the request's line and the total
+            if (ql_pcie_auto().on && !req_pcie_set && split_drive.n <= 1)   // QuantLab (11/20, 0.1.3) (a): the settled share kept
+                ql_pcie_state_save(ql_pcie_auto());
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
