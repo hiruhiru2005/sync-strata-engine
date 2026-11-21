@@ -1,3 +1,6 @@
+> [!NOTE]
+> This branch is the engine of [Sync-Strata](https://github.com/hiruhiru2005/sync-strata), a fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors, with upstream's history kept. What it is, and its branches and tags: [SYNC-STRATA.md](SYNC-STRATA.md). For Strata itself, see [Niko1221/Strata](https://github.com/Niko1221/Strata).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
